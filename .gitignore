@@ -5,10 +5,30 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
-data/
+
+# macOS / editor metadata
+.DS_Store
+**/.DS_Store
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
 config.json
-.claude/
+config.local.json
+config.prod.json
+config.production.json
+secrets.*
+
+# Runtime state
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
 logs/
+
+.claude/
 strategies/
 tests/
 CLAUDE.md

@@ -24,15 +24,15 @@ def publish_trade_signal_to_redis(context, action, code, amount, price):
     # Redis 配置: 只需要在这里改, 不需要改策略里的函数调用位置。
     # 实盘建议不要把 Redis 暴露在公网 6379 端口, 至少使用安全组白名单或 VPN。
     redis_config = {
-        "host": "47.102.126.24",
+        "host": "xx.xx.xx.xx",
         "port": 6379,
         "password": None,
-        "stream": "tidal_quant_signals",
+        "stream": "join_quant_signals",
         "maxlen": 10000,
         "socket_connect_timeout": 1,
     }
     # strategy_id 会进入 signal_id, Windows 端用它区分不同策略来源。
-    strategy_id = "hunter"
+    strategy_id = "xxxx"
     # expire_at 是给执行端/监控端看的过期时间, 当前聚宽侧只负责写入信号。
     expire_seconds = 20
     # 聚宽回测或补跑时 context.current_dt 会明显早于系统时间, 这里避免旧信号进入实盘。
