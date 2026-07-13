@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -28,8 +29,8 @@ state_db: state.db
 """,
                 encoding="utf-8",
             )
-            os.environ["TEST_REDIS_PASSWORD"] = "secret"
-            config = load_config(config_path)
+            with patch.dict(os.environ, {"TEST_REDIS_PASSWORD": "secret"}):
+                config = load_config(config_path)
         self.assertEqual(config.redis.password, "secret")
         self.assertEqual(config.execution.max_attempts, 5)
 
