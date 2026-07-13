@@ -45,6 +45,7 @@ state_db: state.db
         raw = yaml.safe_load(
             (Path(__file__).parents[1] / "config.example.yaml").read_text(encoding="utf-8")
         )
+        self.assertIsInstance(raw, dict)
         self.assertIn("redis", raw)
         self.assertIn("execution", raw)
         self.assertNotIn("_comment", raw)
