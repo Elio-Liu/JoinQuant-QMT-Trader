@@ -7,17 +7,15 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any
 
 
 class _ColoredFormatter(logging.Formatter):
-    """控制台日志格式器 —— 带中文标签和简洁时间。
+    """控制台日志格式器 —— 只保留简洁时间和结构化消息。
 
-    格式: [HH:MM:SS] [级别标签] [模块] 消息
+    格式: HH:MM:SS 【类别】【事件】消息
     """
 
     # 级别 → 中文短标签
@@ -28,12 +26,22 @@ class _ColoredFormatter(logging.Formatter):
         logging.ERROR: "错误",
         logging.CRITICAL: "严重",
     }
+    LEVEL_EMOJIS: dict[int, str] = {
+        logging.DEBUG: "🔍",
+        logging.INFO: "ℹ️",
+        logging.WARNING: "⚠️",
+        logging.ERROR: "❌",
+        logging.CRITICAL: "🛑",
+    }
 
     def format(self, record: logging.LogRecord) -> str:
-        label = self.LEVEL_LABELS.get(record.levelno, record.levelname)
         ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
-        module = record.name.rsplit(".", 1)[-1] if "." in record.name else record.name
-        return f"[{ts}] [{label}] [{module}] {record.getMessage()}"
+        message = record.getMessage()
+        if not message.startswith("【"):
+            label = self.LEVEL_LABELS.get(record.levelno, record.levelname)
+            emoji = self.LEVEL_EMOJIS.get(record.levelno, "ℹ️")
+            message = f"【{label}】{emoji} {message}"
+        return f"{ts} {message}"
 
 
 class _FileFormatter(logging.Formatter):
@@ -45,9 +53,14 @@ class _FileFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
         ms = f"{record.created % 1:.3f}"[1:]  # ".123"
-        return (
+        formatted = (
             f"[{ts}{ms}] [{record.levelname}] [{record.name}:{record.lineno}] {record.getMessage()}"
         )
+        if record.exc_info:
+            formatted += "\n" + self.formatException(record.exc_info)
+        if record.stack_info:
+            formatted += "\n" + record.stack_info
+        return formatted
 
 
 def setup_logging(level: int | str = logging.INFO, log_dir: str | Path = "logs") -> None:
@@ -61,7 +74,9 @@ def setup_logging(level: int | str = logging.INFO, log_dir: str | Path = "logs")
         level = getattr(logging, level.upper(), logging.INFO)
 
     root = logging.getLogger()
-    root.setLevel(level)
+    # 根 logger 必须放行 DEBUG，具体展示范围由两个 handler 各自控制。
+    # 否则 console=INFO 时，文件 handler 即使设为 DEBUG 也收不到明细。
+    root.setLevel(logging.DEBUG)
 
     # 清空已有 handler，避免重复配置（比如测试中多次调用 setup_logging）
     root.handlers.clear()
@@ -100,8 +115,3 @@ def _silence_noisy_libraries() -> None:
     ]
     for name in noisy:
         logging.getLogger(name).setLevel(logging.WARNING)
-
-
-def get_logger(name: str) -> logging.Logger:
-    """获取模块级 logger 的便捷函数。等价于 logging.getLogger(name)。"""
-    return logging.getLogger(name)

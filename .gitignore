@@ -14,10 +14,13 @@ venv/
 .env
 .env.*
 !.env.example
+scripts/redis_targets.yaml
 config.json
+config.yaml
 config.local.json
 config.prod.json
 config.production.json
+config.yaml
 secrets.*
 
 # Runtime state
@@ -30,5 +33,4 @@ logs/
 
 .claude/
 strategies/
-tests/
 CLAUDE.md

@@ -1,0 +1,38 @@
+# QMT 跟单助手示例配置。复制为 config.yaml 后按你的环境修改。
+redis:
+  # Redis Stream 配置。聚宽侧用 XADD 写入 stream，Windows 端用 consumer group 消费。
+  host: YOUR_REDIS_HOST # Redis 服务地址；实盘建议使用内网、VPN 或安全组白名单。
+  port: 6379 # Redis 端口。
+  password: ${REDIS_PASSWORD} # 本地无密码 Redis 可改为 null。
+  stream: tidal_quant_signals # 必须与聚宽侧函数里的 stream 保持一致。
+  group: qmt_executors # 消费组名称；同一账户建议只运行一个执行端以保持 FIFO。
+  consumer: win-qmt-01 # 当前执行器名称；多台机器必须使用不同名称。
+  block_ms: 20 # 10-50ms 响应较快；数值越小 CPU 空轮询越多。
+
+# 订单执行参数。修改后重启 python main.py 生效。
+execution:
+  buy_slippage_pct: 0.003 # slippage 模式下买入价相对最新价的上浮比例。
+  sell_slippage_pct: 0.003 # slippage 模式下卖出价相对最新价的下浮比例。
+  order_timeout_sec: 3 # 单次委托等待秒数；超时后撤单并等待真实终态。
+  max_attempts: 3 # 单条信号最多下单尝试次数，包含首次和重挂。
+  max_total_duration_sec: 15 # 单条信号从开始到停止的最大总执行时间（秒）。
+  max_deviation_from_signal_price_pct: 0.02 # 行情定价基准相对策略参考价允许的最大偏离。
+  poll_interval_sec: 0.2 # 稳态查单轮询间隔（秒）。
+  pricing_mode: slippage # slippage=最新价加减固定滑点；book=按对手盘加减 tick。
+  book_tick_offset: 2 # 股票 tick=0.01，ETF/基金 tick=0.001。
+
+market_data:
+  # 启动时预订阅的聚宽格式代码列表，例如 000001.XSHE、510300.XSHG。
+  pre_subscribe_codes: []
+
+trading:
+  # false 时 QMT 适配器拒绝启动，防止误下单。
+  enabled: false # 实盘安全开关；必须人工确认后才可设为 true。
+  account_id: YOUR_ACCOUNT_ID # miniQMT 资金账号。
+  miniqmt_path: 'C:\\path\\to\\userdata_mini' # miniQMT 的 userdata_mini 目录。
+  session_id: 0 # miniQMT 会话 ID，通常为 0。
+  strategy_name: tidal_quant # 写入 QMT 委托备注、用于客户端筛选的策略名称。
+
+state_db: data/qmt_follower.db # SQLite 本地执行账本路径，用于幂等与订单状态记录。
+log_level: INFO # 控制台日志级别；文件日志始终记录 DEBUG 明细。
+log_dir: logs # 按天轮转的日志目录。

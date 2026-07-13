@@ -1,241 +1,367 @@
-# JoinQuant miniQMT 跟单助手
+# JoinQuant QMT 跟单助手
 
-一个用于连接聚宽云策略与 Windows 本地 miniQMT 的实盘跟单框架。
+把聚宽云策略产生的交易信号，通过 Redis Stream 可靠地送到 Windows QMT 执行端。
 
-聚宽侧策略只负责把交易信号写入 Redis Stream；Windows 端服务负责消费信号、读取 miniQMT 行情、按配置滑点重新定价，并通过 miniQMT/xtquant 提交订单。系统用 SQLite 执行账本保证同一条信号只处理一次，并在订单进入终态后再确认 Redis 消息。
+聚宽侧只负责表达“买什么、卖什么、数量和参考价”；执行端负责读取实时行情、核对资金或持仓、计算委托价、下单、确认撤单与成交，并在订单进入明确终态后确认 Redis 消息。核心目标是：**尽量不改策略调用方式，同时让真实交易过程可追踪、可去重、可停止。**
 
-> 重要说明：本项目包含真实交易链路代码，但 miniQMT/xtquant 交易适配必须在 Windows + 已登录 miniQMT 的环境中完成验证。默认配置 `trading.enabled=false`，请勿在未验证前直接切换到实盘。
+> [!WARNING]
+> 本项目包含真实交易链路。仓库默认关闭交易开关，macOS/Linux 单元测试也不能替代目标券商 Windows 客户端的仿真验证。首次启用必须使用仿真账户、小额订单，并由人工盯盘。
 
-## 核心能力
+## 选择执行方式
 
-- **聚宽侧低侵入接入**：保留 `publish_trade_signal_to_redis(context, action, code, amount, price)` 五参数签名，已有策略调用点无需改动。
-- **Redis Stream 可靠投递**：相比 Redis Pub/Sub，Stream 可保留未消费消息，并支持消费组与 ACK。
-- **SQLite 幂等账本**：`signal_id` 是唯一键，重复投递不会触发第二次下单。
-- **执行端重新定价**：聚宽传入的是 `reference_price`，Windows 端会用 miniQMT 最新行情和滑点配置计算实际委托价。
-- **超时撤单重挂**：单次委托超时后撤单，对剩余数量重新取价、重新挂单，直到达到次数或总时长上限。
-- **适配器隔离**：核心状态机只依赖 `MarketDataAdapter` / `BrokerAdapter` 协议，便于用 fake adapter 做本地测试。
+仓库提供两条 Windows 执行路径，共用聚宽发送函数、Redis Stream 和交易信号格式，但运行状态与部署方式不同。
 
-## 架构概览
+| 执行方式 | 适用场景 | 状态与可靠性 | 入口 |
+| --- | --- | --- | --- |
+| **独立 miniQMT 服务（推荐）** | 可以在 Windows 单独运行 Python 服务 | SQLite 持久账本、`signal_id` 幂等、全账户 FIFO、完整订单尝试记录 | `python main.py` |
+| **大 QMT 单文件执行器（备用）** | 客户端要求策略只能放在一个 Python 文件中 | FIFO、去重和订单状态仅保存在本次运行的内存中，重启不恢复 | `bigqmt_follower/bigqmt_redis_follower.py` |
+
+两个执行端不能同时连接同一批真实信号。尤其不要因为消费组不同就同时启动：Redis 会把同一条消息分别交给每个消费组，可能造成重复下单。
+
+## 系统架构
 
 ```text
-JoinQuant 云策略
-  └─ publish_trade_signal_to_redis(...)
-       └─ Redis Stream XADD
-            └─ Windows 跟单服务 main.py
-                 ├─ RedisStreamClient.read_forever()
-                 ├─ OrderExecutionEngine.execute()
-                 │    ├─ SQLiteExecutionStore 幂等检查
-                 │    ├─ QmtMarketDataAdapter 获取最新价
-                 │    ├─ pricing 计算滑点与偏离保护
-                 │    └─ QmtBrokerAdapter 下单 / 查单 / 撤单
-                 └─ 订单终态后 XACK
+聚宽云策略
+  ├─ publish_watchlist_to_redis(...)       盘前推送股票池，仅预订阅行情
+  └─ publish_trade_signal_to_redis(...)    发送买卖信号
+                  │
+                  ▼
+          Redis Stream（XADD）
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+独立 miniQMT 服务       大 QMT 单文件执行器
+Redis 消费组            Redis 消费组
+单工作线程 FIFO         内存 FIFO
+SQLite 幂等账本         运行期 signal_id 去重
+xtquant 下单            passorder 下单
+        │                   │
+        └─────────┬─────────┘
+                  ▼
+          Windows QMT / 券商柜台
 ```
 
-执行端遵循一个关键原则：**Redis ACK 只发生在本地执行结果已经写入 SQLite 之后**。如果进程在处理中崩溃，Redis 消息仍会留在 pending 状态；重启后即使消息被重新处理，SQLite 的 `signal_id` 主键也会阻止重复下单。
+独立 miniQMT 服务的主链路：
+
+```text
+RedisStreamClient.read_forever()
+  → 预订阅指令：立即订阅行情并 ACK，不进入交易队列
+  → 交易信号：进入单工作线程 FIFO
+  → SQLite INSERT OR IGNORE：signal_id 幂等门
+  → 获取最新价、买一/卖一、可用资金或可卖持仓
+  → 计算盘口价/滑点价并检查参考价偏离
+  → 提交委托并轮询订单状态
+  → 超时：申请撤单，等待真实终态，核对撤单期间成交
+  → 仍有剩余：刷新行情和账户资源后重挂
+  → 写入最终执行状态
+  → XACK
+```
+
+## 核心保障
+
+- **低侵入接入**：保留 `publish_trade_signal_to_redis(context, action, code, amount, price)` 五参数签名，策略原有调用点无需改造。
+- **可靠传输**：使用 Redis Stream 和消费组；Windows 暂时离线时，新消息仍保留在 Stream 中。
+- **持久幂等**：独立 miniQMT 服务以 `signal_id` 为 SQLite 主键，重复投递不会再次触达券商。
+- **全账户 FIFO**：收信和行情预订阅保持响应，真实交易只由一个工作线程按到达顺序执行。
+- **每次尝试都刷新状态**：重新读取行情、买入可用资金或卖出可用持仓，不使用旧资源快照继续下单。
+- **资源查询失败即停止**：无法确认资金或持仓时不提交委托，不通过默认值继续交易。
+- **撤单必须确认**：撤单请求成功不等于订单已撤；只有查询到已成、已撤或废单后，才处理剩余数量。
+- **不确定状态熔断**：撤单终态长期无法确认时，当前进程锁停后续交易，避免新旧订单同时成交。
+- **ETF tick 精度**：沪市 `5xxxxx`、深市 `1xxxxx` 基金按 `0.001` 报价，其余股票按 `0.01` 报价。
+- **开盘集合竞价保护**：9:15–9:30 收到的信号会把委托等待预算延长到开盘后，避免 9:30 前被普通超时逻辑撤掉。
+- **预约执行**：独立 miniQMT 服务支持可选 `execute_at` 字段；未到时间的消息不提前下单，也不提前 ACK。
+- **可观测性**：控制台保留简洁中文交易进度，文件日志记录 DEBUG 细节；`sent_at_ms` 可用于估算传输和端到端延迟。
+
+> Redis pending 消息当前不会由新进程自动 `XCLAIM`。进程在执行中崩溃时，消息不会被错误 ACK，但恢复前需要人工核对 QMT 委托、SQLite 账本和 Redis pending，不能直接假设重启后会自动续跑。
 
 ## 目录结构
 
 ```text
 .
-├── joinquant_signal_sender.py              # 聚宽侧信号发送函数，可复制到策略内
-├── main.py                                 # Windows 端快捷入口
-├── config.example.json                     # 配置模板，含 JSON-safe 中文说明
+├── main.py                              # 独立 miniQMT 服务入口
+├── joinquant_signal_sender.py           # 可复制到聚宽策略的发送函数
+├── config.example.yaml                  # 独立服务 YAML 配置模板
 ├── qmt_follower/
-│   ├── app.py                              # 配置组装、主循环、线程池执行
-│   ├── executor.py                         # 下单状态机
-│   ├── redis_stream.py                     # Redis Stream 消费组封装
-│   ├── store.py                            # SQLite 执行账本
-│   ├── pricing.py                          # 滑点和价格偏离保护
-│   ├── models.py                           # 数据模型与状态枚举
-│   ├── config.py                           # 配置加载
-│   ├── logging_config.py                   # 控制台与文件日志
-│   └── adapters/qmt.py                     # miniQMT 行情与交易适配
-├── strategies/
-│   └── etf_discount_live_signal_strategy.py # 参考聚宽策略
-├── tests/                                  # 标准库 unittest 测试
+│   ├── app.py                           # 依赖组装、收信、预约调度和全局 FIFO
+│   ├── executor.py                      # 下单、查单、撤单确认、重试状态机
+│   ├── redis_stream.py                  # Redis Stream 消费组与消息解析
+│   ├── store.py                         # SQLite 信号和委托尝试账本
+│   ├── pricing.py                       # 盘口/滑点定价、tick 和偏离保护
+│   ├── models.py                        # 信号、行情、订单与执行状态模型
+│   ├── config.py                        # UTF-8 YAML 配置加载
+│   ├── logging_config.py                # 控制台与按天轮转文件日志
+│   └── adapters/qmt.py                  # miniQMT 行情和交易适配器
+├── scripts/
+│   ├── redis_target_config.py           # 手动脚本的本机 Redis 目标加载器
+│   ├── send_manual_signal.py            # 单笔人工确认发送
+│   └── send_batch_signals.py            # 模拟盘 FIFO 压力信号
+├── bigqmt_follower/
+│   ├── bigqmt_redis_follower.py         # 可直接导入大 QMT 的单文件执行器
+│   └── README.md                        # 大 QMT 部署与仿真验收说明
+├── tests/                               # unittest 测试
 └── docs/
-    └── windows-qmt-adapter-handoff.md      # Windows/QMT 对接与验证说明
+    ├── windows-qmt-adapter-handoff.md   # Windows miniQMT 上线验证清单
+    └── joinquant-community-promo.md     # 项目介绍与社区发布稿
 ```
 
-## 快速开始
+`config.yaml`、`scripts/redis_targets.yaml`、`strategies/`、日志和运行数据库都属于本机部署内容，默认不进入版本控制。`strategies/` 中可能保存带环境配置的聚宽部署副本，不应强制提交。
 
-### 1. 准备 Windows 端环境
+## 快速开始：独立 miniQMT 服务
 
-要求：
+### 1. 准备环境
 
 - Windows 10/11 x64
-- Python 3.8+
-- Redis 可访问
-- miniQMT 已安装、已登录，且可手工下单 / 撤单 / 查委托
-- Python 环境可导入 `xtquant`
+- 已安装并登录的 miniQMT，目标账号可以手工下单、撤单、查委托
+- 能导入 `xtquant` 的 Python 环境
+- 可从 Windows 和聚宽访问的 Redis
+- Python 3.8+（以目标 miniQMT/xtquant 版本实际支持范围为准）
 
-安装依赖：
+在准备运行服务的 Python 环境中安装公共依赖：
 
-```bash
-pip install redis xtquant
+```powershell
+python -m pip install redis PyYAML
 ```
 
-复制配置：
+`xtquant` 通常随 miniQMT 环境提供。先验证当前解释器，不要盲目从其他 Python 环境复制包：
 
-```bash
-copy config.example.json config.json
+```powershell
+python -c "import xtquant; print('xtquant ok')"
+python -c "from xtquant import xtdata; print('xtdata ok')"
+python -c "from xtquant.xttrader import XtQuantTrader; print('xttrader ok')"
 ```
 
-编辑 `config.json`，至少确认：
+### 2. 创建本机配置
 
-| 配置项 | 说明 |
+```powershell
+Copy-Item config.example.yaml config.yaml
+$env:REDIS_PASSWORD="你的 Redis 密码"
+```
+
+编辑 `config.yaml`，至少核对：
+
+| 配置项 | 作用 |
 | --- | --- |
-| `redis.host` / `redis.port` / `redis.password` | Redis 连接信息 |
-| `redis.stream` | 必须与聚宽侧函数里的 stream 一致 |
-| `redis.group` / `redis.consumer` | Windows 执行端消费组和消费者名称 |
-| `execution.buy_slippage_pct` | 买入按最新价上浮的比例 |
-| `execution.sell_slippage_pct` | 卖出按最新价下浮的比例 |
-| `execution.order_timeout_sec` | 单次委托等待多久后撤单重挂 |
-| `execution.max_attempts` | 单条信号最多下单尝试次数 |
-| `execution.max_total_duration_sec` | 单条信号最大执行总时长 |
-| `execution.max_deviation_from_signal_price_pct` | 最新价相对聚宽参考价的最大允许偏离 |
-| `trading.enabled` | 实盘开关，默认 `false` |
-| `trading.account_id` | miniQMT 资金账号 |
-| `trading.miniqmt_path` | miniQMT 的 `userdata_mini` 目录 |
+| `redis.host` / `port` / `password` | Redis 连接；密码可写成 `${REDIS_PASSWORD}` |
+| `redis.stream` | 必须与聚宽发送函数中的 Stream 完全一致 |
+| `redis.group` / `consumer` | 执行端消费组和实例名称 |
+| `execution.pricing_mode` | `slippage` 或 `book` |
+| `execution.max_deviation_from_signal_price_pct` | 行情定价基准相对策略参考价的偏离上限 |
+| `execution.order_timeout_sec` / `max_attempts` | 单次等待和最多委托次数 |
+| `execution.max_total_duration_sec` | 一条信号的总执行预算 |
+| `market_data.pre_subscribe_codes` | 启动时预订阅的聚宽格式代码 |
+| `trading.account_id` / `miniqmt_path` | 资金账号和 `userdata_mini` 路径 |
+| `trading.enabled` | 交易安全门，模板默认 `false` |
+| `state_db` / `log_dir` | SQLite 账本和日志目录 |
 
-启动服务：
+首次运行先保持 `trading.enabled: false`，确认程序会被安全门拒绝。完成只读检查并切到仿真账户后，才改成 `true` 启动完整链路。
 
-```bash
-python main.py
+### 3. 启动服务
+
+```powershell
+python .\main.py --config config.yaml --workers 1
 ```
 
-指定配置文件或线程数：
+`--workers` 当前只允许 `1`，这是全账户 FIFO 的安全约束，不是可调并发参数。完整启动至少应看到：
 
-```bash
-python main.py --config config.prod.json --workers 8
+```text
+【系统】🚀 QMT跟单助手启动中 | 交易线程 1 | FIFO
+【QMT】🔌 交易端已连接
+【系统】🟢 Redis监听已启动
 ```
 
-### 2. 接入聚宽策略
+更完整的 Windows 环境核对、订单状态映射和模拟盘验收步骤见 [Windows miniQMT 部署验证清单](docs/windows-qmt-adapter-handoff.md)。
 
-把 `joinquant_signal_sender.py` 中的 `publish_trade_signal_to_redis(...)` 复制到聚宽策略文件里，然后修改函数内部的 Redis 配置和 `strategy_id`：
+## 接入聚宽策略
+
+将 `joinquant_signal_sender.py` 中以下函数复制进策略：
+
+- `publish_trade_signal_to_redis(...)`
+- `publish_watchlist_to_redis(...)`（如需盘前预订阅）
+- `_cached_redis_client(...)`
+
+把两个发送函数内部的 Redis 占位配置改成同一套真实配置，并保持 `stream` 与 Windows 端一致。不要把修改后的生产策略副本提交回仓库。
+
+交易调用保持五参数：
 
 ```python
-redis_config = {
-    "host": "你的Redis服务器IP",
-    "port": 6379,
-    "password": "你的Redis密码",
-    "stream": "tidal_quant_signals",
-    "maxlen": 10000,
-    "socket_connect_timeout": 1,
-}
-strategy_id = "你的策略ID"
+publish_trade_signal_to_redis(context, "buy", "510300.XSHG", 1000, 3.850)
+publish_trade_signal_to_redis(context, "sell", "159915.XSHE", 500, 1.235)
 ```
 
-在策略需要发出交易信号的位置调用：
+选股完成后可以提前推送股票池，只订阅行情、不产生订单：
 
 ```python
-publish_trade_signal_to_redis(context, "buy", "000001.XSHE", 1000, 10.0)
-publish_trade_signal_to_redis(context, "sell", "600519.XSHG", 500, 1800.0)
+publish_watchlist_to_redis(context, ["510300.XSHG", "159915.XSHE"])
 ```
 
-函数行为：
+发送函数会根据 `context.current_dt` 与当前时间判断运行模式。回测、研究和历史补跑不会写入 Redis；实时模式下 `XADD` 成功也只表示 Redis 已接收，**不表示 Windows 已下单或成交**。
 
-| 场景 | 行为 |
-| --- | --- |
-| 实时运行 | 写入 Redis Stream，返回 `{"sent": True, ...}` |
-| 回测 / 研究 / 补跑 | 跳过发送，返回 `{"sent": False, "mode": "backtest", ...}` |
-| Redis 异常 | 记录错误并返回失败结果，不阻塞策略主流程 |
+## 手动发送与批量验证
 
-## 信号格式
+两个脚本统一从被 Git 忽略的 `scripts/redis_targets.yaml` 读取连接信息。先在本机创建：
 
-Redis Stream 中的消息字段为 `payload`，内容是 JSON 字符串：
+```yaml
+targets:
+  remote_prod:
+    host: YOUR_REDIS_HOST
+    port: 6379
+    password: YOUR_REDIS_PASSWORD
+    stream: tidal_quant_signals
+```
+
+单笔发送前，编辑 `scripts/send_manual_signal.py` 顶部的 `TARGET`、代码、方向、数量和参考价：
+
+```powershell
+python .\scripts\send_manual_signal.py
+```
+
+脚本只有在输入 `yes` 后才会写入 Redis。批量 FIFO 压力测试还会校验 100 股整手、卖出总量上限和动态确认口令：
+
+```powershell
+python .\scripts\send_batch_signals.py
+```
+
+这些脚本发送的是 `mode=live` 信号。只要同一 Stream 上存在已启用的真实执行端，就可能产生真实订单；运行前必须确认消费组、账号和参考价。
+
+## 信号协议
+
+Redis Stream 每条消息使用字段 `payload`，值为 JSON 字符串。交易信号示例：
 
 ```json
 {
-  "signal_id": "hunter-20260608093001-000001XSHE-buy-1000",
+  "signal_id": "hunter-20260713093001-510300XSHG-buy-1000",
   "strategy_id": "hunter",
   "mode": "live",
   "action": "buy",
-  "code": "000001.XSHE",
+  "code": "510300.XSHG",
   "amount": 1000,
-  "reference_price": 10.0,
-  "created_at": "2026-06-08 09:30:01",
-  "expire_at": "2026-06-08 09:30:21",
+  "reference_price": 3.85,
+  "created_at": "2026-07-13 09:30:01",
+  "sent_at_ms": 1783906201000,
+  "expire_at": "2026-07-13 09:30:21",
   "nonce": "a1b2c3d4"
 }
 ```
 
-字段说明：
-
 | 字段 | 说明 |
 | --- | --- |
-| `signal_id` | 幂等键；同一个 `signal_id` 在 Windows 端只会执行一次 |
-| `strategy_id` | 策略来源标识 |
-| `mode` | `live` 或 `backtest` |
+| `signal_id` | 幂等键；默认由策略、时间、代码、方向和数量组成 |
+| `strategy_id` | 信号来源标识 |
+| `mode` | 只有 `live` 会进入真实发送/执行路径 |
 | `action` | `buy` 或 `sell` |
-| `code` | 聚宽证券代码，例如 `000001.XSHE` |
-| `amount` | 委托数量 |
-| `reference_price` | 策略参考价，不是最终委托价 |
-| `created_at` | 聚宽策略时间 |
-| `expire_at` | 信号建议过期时间，用于执行端或监控端判断 |
-| `nonce` | 审计辅助字段，不参与幂等 |
+| `code` | 聚宽代码，如 `510300.XSHG` |
+| `amount` | 目标股数；执行端仍会按最新资金或持仓缩量 |
+| `reference_price` | 策略意见价，仅用于偏离保护，不是最终委托价 |
+| `created_at` | 策略侧时间；旧协议字段 `timestamp` 仍可解析 |
+| `sent_at_ms` | 可选，发送时的毫秒时间戳，用于延迟日志 |
+| `execute_at` | 可选，`YYYY-MM-DD HH:MM:SS`；仅独立 miniQMT 服务支持预约释放 |
+| `expire_at` / `nonce` | 发送侧审计字段；当前独立执行端不据此过期或去重 |
 
-默认 `signal_id` 由 `strategy_id + 时间 + 代码 + 方向 + 数量` 组成。如果同一秒内对同一证券、同一方向、同一数量连续发出两笔独立订单，第二笔会被视为重复信号；如确有这种需求，应在发送函数内部增加序号后缀。
+默认 `signal_id` 在“同一秒、同一策略、同一代码、同一方向、同一数量”下会碰撞，这是有意的重复信号保护。确实需要在同一秒发送两笔独立订单时，发送侧必须生成不同 `signal_id`。
 
-## 执行流程
+预订阅消息使用同一个 Stream：
+
+```json
+{
+  "action": "subscribe",
+  "codes": ["510300.XSHG", "159915.XSHE"],
+  "strategy_id": "hunter",
+  "mode": "live",
+  "sent_at_ms": 1783905900000
+}
+```
+
+## 定价与订单执行
+
+`execution.pricing_mode` 支持：
+
+- `slippage`：买入按最新成交价上浮 `buy_slippage_pct`，卖出按最新成交价下浮 `sell_slippage_pct`。
+- `book`：买入按卖一价加 `book_tick_offset` 个 tick，卖出按买一价减相同 tick；对手盘缺失时回退到 `slippage`。
+
+两种模式都会先比较定价基准与 `reference_price`。超过 `max_deviation_from_signal_price_pct` 时拒绝下单，而不是扩大滑点追价。
+
+买单按当前委托价和可用资金计算最大数量，再向下取整到 100 股；卖单不超过实时可卖持仓。订单超时后不会直接视为完成，而是进入“申请撤单 → 等待终态 → 核对最终成交 → 只重挂剩余数量”的流程。
+
+## 大 QMT 单文件备用执行器
+
+如果券商大 QMT 只能导入一个 Python 文件，使用：
 
 ```text
-收到 Redis Stream 消息
-  -> 解析 TradeSignal
-  -> SQLite INSERT OR IGNORE 做幂等检查
-  -> 获取 miniQMT 最新行情
-  -> 检查最新价是否偏离 reference_price 过多
-  -> 按买入 / 卖出滑点计算限价
-  -> 提交委托
-  -> 轮询订单状态
-       -> 全部成交：记录终态并 ACK
-       -> 部分成交：撤单，对剩余数量重新定价再下
-       -> 超时未成交：撤单，重新定价再下
-       -> 达到次数或总时长上限：记录终态并 ACK
+bigqmt_follower/bigqmt_redis_follower.py
 ```
+
+它保持上游信号和 Redis 契约不变，通过后台线程收消息，在大 QMT 调度线程中调用 `passorder`、查询订单和执行撤单。仓库版本的账号、Redis 地址和密码为空，`trading_enabled` 默认关闭。
+
+它与独立服务的关键差异：
+
+- 不使用 SQLite；重启后不恢复 `signal_id` 去重、FIFO 队列和未完成订单状态。
+- 消费组首次从 `$` 创建，只接收创建后的新消息。
+- 不自动认领旧 consumer 的 pending。
+- 当前只支持普通股票账户，不支持信用账户。
+- 必须在券商仿真资金账号的实时策略环境验证，平台“模拟运行模式”可能不会执行交易函数。
+
+完整导入、配置和回调字段核对见 [大 QMT Redis 信号执行端说明](bigqmt_follower/README.md)。
 
 ## 本地验证
 
-测试使用标准库 `unittest`，并通过 fake Redis / fake broker / fake market data 隔离外部依赖。运行测试不需要真实 Redis、miniQMT 或券商账号。
+核心测试使用 `unittest` 和 fake Redis / broker / market data；不需要真实 Redis、QMT 或券商账号。
 
 ```bash
 python -m unittest discover -v
-python -m compileall qmt_follower tests
+python -m compileall qmt_follower scripts tests bigqmt_follower joinquant_signal_sender.py
 ```
 
-也可以只跑单个模块：
+只运行核心执行链路：
 
 ```bash
-python -m unittest tests.test_executor -v
-python -m unittest tests.test_qmt_adapter_mapping -v
+python -m unittest tests.test_executor tests.test_runtime tests.test_store -v
 ```
 
-## miniQMT 适配状态
+仓库忽略的本地 `strategies/` 部署副本可能有对应的专项测试；在没有这些本机文件的环境中，不应把该部分结果当作核心跟单服务的验证结论。
 
-`qmt_follower/adapters/qmt.py` 已包含：
+## 上线检查
 
-- 聚宽代码到 QMT 代码的转换：`000001.XSHE -> 000001.SZ`，`510300.XSHG -> 510300.SH`
-- `xtdata.get_full_tick()` 最新价读取
-- `XtQuantTrader` 连接、订阅、下单、查单、撤单的基础实现
-- QMT 订单状态到内部 `BrokerOrderStatus` 的映射
-- 交易 API 调用锁和短缓存，减少并发轮询下的重复 QMT 调用
+- [ ] `config.yaml`、`scripts/redis_targets.yaml`、聚宽生产配置、日志和 SQLite 数据库未进入 Git。
+- [ ] Redis 未直接暴露到公网，已使用内网、VPN、来源白名单或安全组。
+- [ ] 聚宽发送函数与 Windows 执行端的 Stream 名称一致。
+- [ ] 同一批信号只有一个执行端和一个目标账户。
+- [ ] Windows、聚宽和 Redis 所在机器完成时间同步；否则延迟日志没有参考意义。
+- [ ] 目标券商的行情字段、资金/持仓字段、订单状态与撤单返回值已核对。
+- [ ] 仿真盘完成单笔买卖、拒单、部分成交、超时撤单和批量 FIFO 测试。
+- [ ] 已确认 SQLite、QMT 委托、Redis pending/ACK 和日志时间线一致。
+- [ ] 实盘第一次启用使用小额订单并由人工盯盘。
 
-仍需在真实 Windows 环境中逐项验证：
+## 常见问题
 
-- 当前券商 miniQMT 版本的 `xtquant` API 签名和返回值
-- 账号类型、资金账号格式、`userdata_mini` 路径
-- 下单、撤单、查单字段是否与适配器假设一致
-- 全成、部成、已撤、废单等状态映射是否准确
-- 模拟盘长时间运行稳定性和异常恢复路径
+### 启动时报 `trading.enabled is false`
 
-详细交接清单见 `docs/windows-qmt-adapter-handoff.md`。
+这是安全门正常工作。只有在账号、`userdata_mini` 路径、QMT 登录状态和模拟盘验证都确认后，才把 `trading.enabled` 改为 `true`。
 
-## 安全建议
+### 手动脚本找不到 Redis 配置
 
-- 不要将 Redis 6379 端口直接暴露到公网；优先使用 VPN、内网、白名单或安全组限制来源 IP。
-- 实盘前保持 `trading.enabled=false`，先确认 Redis 收发、SQLite 记录、日志和 QMT 查询链路。
-- 首次打开实盘开关时，使用小额、低风险标的，并人工盯盘验证每个状态。
-- 保留 `logs/` 和 `data/qmt_follower.db`，它们是排查重复信号、部分成交和撤单重挂的关键证据。
+确认已创建 `scripts/redis_targets.yaml`，其中存在脚本顶部 `TARGET` 对应的名称。该文件故意被 Git 忽略。
+
+### 出现价格偏离错误
+
+先检查策略参考价是否过期、行情是否已订阅、Windows 与聚宽时间是否一致。不要仅为让订单通过而放大偏离阈值。
+
+### 出现资金或持仓查询失败
+
+执行端会拒绝提交订单。先恢复 QMT 连接并确认账号字段兼容，不要添加默认资金或默认持仓绕过检查。
+
+### 出现“撤单终态未确认”
+
+执行端会熔断后续交易。立即在 QMT 委托列表人工确认是否还有活动订单；在状态不明时不要直接重启并重发信号。
+
+### Windows 服务重启后没有自动处理旧 pending
+
+当前读取循环只消费尚未投递的新消息，没有实现跨 consumer 的自动 `XCLAIM`。先核对原委托是否可能成交，再根据 SQLite 和 Redis pending 做人工恢复。
+
+## 相关文档
+
+- [Windows miniQMT 部署验证清单](docs/windows-qmt-adapter-handoff.md)
+- [大 QMT 单文件执行器说明](bigqmt_follower/README.md)
+- [聚宽社区项目介绍](docs/joinquant-community-promo.md)
 
 ## 免责声明
 

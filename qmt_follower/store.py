@@ -24,7 +24,8 @@ class SQLiteExecutionStore:
     这份本地账本是重启恢复、幂等去重和盘后审计的基础。
 
     使用 thread-local 持久连接: 每个线程第一次访问时打开连接并复用,
-    避免每次 SQL 操作都 open/close 的开销（Windows 上尤其明显）。
+    避免每次 SQL 操作都 open/close 的开销（Windows 上尤其明显）。连接启用
+    自动提交, 确保每次账本写入立即持久化且不会跨信号持有 SQLite 写锁。
     """
 
     def __init__(self, path: str | Path):
@@ -39,14 +40,14 @@ class SQLiteExecutionStore:
 
     def _connect(self) -> sqlite3.Connection:
         """创建一个新的临时连接（供测试或特殊用途，不使用线程本地缓存）。"""
-        conn = sqlite3.connect(str(self.path))
+        conn = sqlite3.connect(str(self.path), isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_db(self) -> None:
         """首次建表（仅 __init__ 调用一次，用临时连接）。"""
-        conn = sqlite3.connect(str(self.path))
+        conn = sqlite3.connect(str(self.path), isolation_level=None)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
@@ -93,7 +94,7 @@ class SQLiteExecutionStore:
     def _get_conn(self) -> sqlite3.Connection:
         """获取当前线程的持久 SQLite 连接（懒初始化）。"""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(str(self.path))
+            conn = sqlite3.connect(str(self.path), isolation_level=None)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn = conn

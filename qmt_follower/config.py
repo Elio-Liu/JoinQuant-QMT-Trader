@@ -34,6 +34,14 @@ class TradingConfig:
 
 
 @dataclass(frozen=True)
+class MarketDataConfig:
+    """行情适配器配置。"""
+
+    # 启动时预订阅的聚宽格式代码列表。订阅后取价走本地内存, 避免临场实时请求行情服务器。
+    pre_subscribe_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """运行期总配置。"""
 
@@ -41,6 +49,7 @@ class RuntimeConfig:
     execution: ExecutionConfig
     trading: TradingConfig
     state_db: Path
+    market_data: MarketDataConfig = MarketDataConfig()
     log_level: str = "INFO"
     log_dir: str = "logs"
 
@@ -61,6 +70,7 @@ def load_config(path: str | Path) -> RuntimeConfig:
     redis_raw = raw["redis"]
     execution_raw = raw.get("execution", {})
     trading_raw = raw.get("trading", {})
+    market_data_raw = raw.get("market_data", {})
     password = redis_raw.get("password")
     # 例如 "${REDIS_PASSWORD}" 会读取环境变量 REDIS_PASSWORD。
     if isinstance(password, str) and password.startswith("${") and password.endswith("}"):
@@ -87,6 +97,8 @@ def load_config(path: str | Path) -> RuntimeConfig:
                 execution_raw.get("max_deviation_from_signal_price_pct", 0.02)
             ),
             poll_interval_sec=float(execution_raw.get("poll_interval_sec", 0.2)),
+            pricing_mode=str(execution_raw.get("pricing_mode", "slippage")),
+            book_tick_offset=int(execution_raw.get("book_tick_offset", 2)),
         ),
         trading=TradingConfig(
             enabled=bool(trading_raw.get("enabled", False)),
@@ -94,6 +106,11 @@ def load_config(path: str | Path) -> RuntimeConfig:
             miniqmt_path=str(trading_raw.get("miniqmt_path", "")),
             session_id=int(trading_raw.get("session_id", 0)),
             strategy_name=str(trading_raw.get("strategy_name", "tidal_quant")),
+        ),
+        market_data=MarketDataConfig(
+            pre_subscribe_codes=tuple(
+                str(code) for code in market_data_raw.get("pre_subscribe_codes", [])
+            ),
         ),
         state_db=Path(raw.get("state_db", "data/qmt_follower.db")),
         log_level=str(raw.get("log_level", "INFO")),
