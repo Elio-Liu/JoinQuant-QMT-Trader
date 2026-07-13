@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 from qmt_follower.models import ExecutionConfig
 
@@ -45,13 +46,17 @@ class RuntimeConfig:
 
 
 def load_config(path: str | Path) -> RuntimeConfig:
-    """从 JSON 配置文件加载运行参数。
+    """从 YAML 配置文件加载运行参数。
 
-    config.example.json 使用 _comment 字段写中文说明; 加载时这些字段会被自然忽略。
     password 支持 "${ENV_NAME}" 形式, 便于把密码放到环境变量里。
     """
-    with Path(path).open("r", encoding="utf-8") as fh:
-        raw = json.load(fh)
+    config_path = Path(path)
+    if config_path.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError(f"配置文件必须使用 YAML 格式（.yaml 或 .yml）: {config_path}")
+    with config_path.open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    if not isinstance(raw, dict):
+        raise ValueError(f"YAML 配置根节点必须是映射: {config_path}")
 
     redis_raw = raw["redis"]
     execution_raw = raw.get("execution", {})
