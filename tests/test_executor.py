@@ -613,6 +613,7 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual(market_data.queries, [])
             self.assertEqual(broker.submitted, [])
             self.assertEqual(broker.cash_queries, 0)
+            store.close()
 
     def test_invalid_expire_at_fails_closed_without_market_or_broker_access(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -638,6 +639,7 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual(market_data.queries, [])
             self.assertEqual(broker.submitted, [])
             self.assertEqual(broker.cash_queries, 0)
+            store.close()
 
 
 if __name__ == "__main__":

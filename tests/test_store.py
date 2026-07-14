@@ -32,6 +32,7 @@ class StoreTests(unittest.TestCase):
                 ).fetchone()
             raw = json.loads(row["raw_json"])
             self.assertEqual(raw["expire_at"], "2026-07-10 09:30:20")
+            store.close()
 
     def test_two_threads_can_accept_distinct_signals_and_persist_them(self):
         with tempfile.TemporaryDirectory() as tmpdir:
