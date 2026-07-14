@@ -82,6 +82,7 @@ class RuntimeTests(unittest.TestCase):
                                             "amount": 1000,
                                             "reference_price": 10.0,
                                             "created_at": "2026-06-08 09:30:00",
+                                            "expire_at": "2026-06-08 09:30:20",
                                         }
                                     )
                                 },
@@ -118,6 +119,7 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(fake.block_values, [20])
         self.assertEqual(message.message_id, "1-0")
+        self.assertEqual(message.signal.expire_at, "2026-06-08 09:30:20")
 
     def test_redis_group_creation_log_uses_one_tag_and_one_emoji(self):
         class FakeRedis:

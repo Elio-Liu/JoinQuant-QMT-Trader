@@ -30,6 +30,7 @@ class ExecutionStatus(StrEnum):
     DUPLICATE_IGNORED = "duplicate_ignored"
     ORDER_SUBMITTED = "order_submitted"
     FILLED = "filled"
+    EXPIRED = "expired"
     FAILED_TIMEOUT = "failed_timeout"
     PARTIALLY_FILLED_TIMEOUT = "partially_filled_timeout"
     FAILED_RISK = "failed_risk"
@@ -42,6 +43,7 @@ _CONSOLE_EVENT_EMOJIS = {
     "风控": "⚠️",
     "竞价": "⏳",
     "超时": "⏰",
+    "过期": "⌛",
     "失败": "❌",
     "成交": "✅",
     "重试": "🔁",
@@ -66,6 +68,7 @@ class TradeSignal:
     mode: str = "live"
     sent_at_ms: int | None = None
     execute_at: str | None = None
+    expire_at: str | None = None
 
     @property
     def label(self) -> str:
@@ -103,6 +106,7 @@ class TradeSignal:
 
         sent_at_ms = raw.get("sent_at_ms")
         execute_at = raw.get("execute_at")
+        expire_at = raw.get("expire_at")
         return cls(
             signal_id=str(raw["signal_id"]),
             strategy_id=str(raw["strategy_id"]),
@@ -114,6 +118,7 @@ class TradeSignal:
             mode=str(raw.get("mode", "live")),
             sent_at_ms=int(sent_at_ms) if sent_at_ms is not None else None,
             execute_at=str(execute_at) if execute_at else None,
+            expire_at=str(expire_at) if expire_at else None,
         )
 
 

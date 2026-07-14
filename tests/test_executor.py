@@ -587,6 +587,58 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual(result.filled_qty, 0)
             self.assertEqual(len(broker.submitted), 0)
 
+    def test_expired_signal_is_recorded_without_market_or_broker_access(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteExecutionStore(Path(tmpdir) / "state.db")
+            signal = TradeSignal(
+                signal_id="sig-expired",
+                strategy_id="hunter",
+                action=Action.BUY,
+                code="000001.XSHE",
+                amount=1000,
+                reference_price=10.0,
+                created_at="2000-01-01 09:30:00",
+                expire_at="2000-01-01 09:30:20",
+            )
+            market_data = FakeMarketData([])
+            broker = FakeBroker({})
+            engine = OrderExecutionEngine(store, market_data, broker, ExecutionConfig())
+
+            result = engine.execute(signal)
+
+            self.assertEqual(result.status, ExecutionStatus.EXPIRED)
+            self.assertEqual(result.filled_qty, 0)
+            self.assertEqual(result.attempts, 0)
+            self.assertEqual(store.get_signal(signal.signal_id).status, ExecutionStatus.EXPIRED)
+            self.assertEqual(market_data.queries, [])
+            self.assertEqual(broker.submitted, [])
+            self.assertEqual(broker.cash_queries, 0)
+
+    def test_invalid_expire_at_fails_closed_without_market_or_broker_access(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteExecutionStore(Path(tmpdir) / "state.db")
+            signal = TradeSignal(
+                signal_id="sig-invalid-expiry",
+                strategy_id="hunter",
+                action=Action.BUY,
+                code="000001.XSHE",
+                amount=1000,
+                reference_price=10.0,
+                created_at="2026-07-14 09:30:00",
+                expire_at="09:30:20",
+            )
+            market_data = FakeMarketData([])
+            broker = FakeBroker({})
+            engine = OrderExecutionEngine(store, market_data, broker, ExecutionConfig())
+
+            result = engine.execute(signal)
+
+            self.assertEqual(result.status, ExecutionStatus.FAILED_RISK)
+            self.assertIn("invalid expire_at", result.message)
+            self.assertEqual(market_data.queries, [])
+            self.assertEqual(broker.submitted, [])
+            self.assertEqual(broker.cash_queries, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

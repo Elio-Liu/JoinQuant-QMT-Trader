@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,30 @@ from qmt_follower.store import SQLiteExecutionStore
 
 
 class StoreTests(unittest.TestCase):
+    def test_signal_expire_at_is_preserved_in_raw_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteExecutionStore(Path(tmpdir) / "state.db")
+            signal = TradeSignal(
+                signal_id="sig-expiry-audit",
+                strategy_id="hunter",
+                action=Action.BUY,
+                code="000001.XSHE",
+                amount=1000,
+                reference_price=10.0,
+                created_at="2026-07-10 09:30:00",
+                expire_at="2026-07-10 09:30:20",
+            )
+
+            store.try_accept_signal(signal)
+
+            with store._connect() as conn:
+                row = conn.execute(
+                    "SELECT raw_json FROM signals WHERE signal_id = ?",
+                    (signal.signal_id,),
+                ).fetchone()
+            raw = json.loads(row["raw_json"])
+            self.assertEqual(raw["expire_at"], "2026-07-10 09:30:20")
+
     def test_two_threads_can_accept_distinct_signals_and_persist_them(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SQLiteExecutionStore(Path(tmpdir) / "state.db")

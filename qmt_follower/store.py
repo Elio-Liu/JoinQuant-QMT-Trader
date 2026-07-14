@@ -129,6 +129,7 @@ class SQLiteExecutionStore:
                 "reference_price": signal.reference_price,
                 "created_at": signal.created_at,
                 "mode": signal.mode,
+                "expire_at": signal.expire_at,
             },
             ensure_ascii=False,
         )

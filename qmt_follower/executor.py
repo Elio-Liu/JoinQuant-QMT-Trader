@@ -73,6 +73,7 @@ _STATUS_LABELS: dict[ExecutionStatus, str] = {
     ExecutionStatus.DUPLICATE_IGNORED: "重复忽略",
     ExecutionStatus.ORDER_SUBMITTED: "已下单",
     ExecutionStatus.FILLED: "完全成交",
+    ExecutionStatus.EXPIRED: "信号过期",
     ExecutionStatus.FAILED_TIMEOUT: "超时失败",
     ExecutionStatus.PARTIALLY_FILLED_TIMEOUT: "部分成交超时",
     ExecutionStatus.FAILED_RISK: "风控拒绝",
@@ -184,6 +185,36 @@ class OrderExecutionEngine:
             signal.reference_price,
             signal.strategy_id,
         )
+
+        if signal.expire_at:
+            try:
+                expire_at = dt.datetime.strptime(signal.expire_at, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                logger.error(
+                    "%s | %s | 过期时间非法 %r | 未下单",
+                    signal.console_event("失败"), short_code, signal.expire_at,
+                )
+                return self._finish(
+                    signal,
+                    ExecutionStatus.FAILED_RISK,
+                    0,
+                    0,
+                    "invalid expire_at: %s" % signal.expire_at,
+                )
+            now = dt.datetime.now()
+            if now > expire_at:
+                overdue_sec = (now - expire_at).total_seconds()
+                logger.warning(
+                    "%s | %s | 截止 %s | 已过期 %.1fs | 未下单",
+                    signal.console_event("过期"), short_code, signal.expire_at, overdue_sec,
+                )
+                return self._finish(
+                    signal,
+                    ExecutionStatus.EXPIRED,
+                    0,
+                    0,
+                    "signal expired at %s" % signal.expire_at,
+                )
 
         # 上一笔订单撤单终态不明确时，禁止任何后续信号继续触达券商。
         if self._trading_halt_reason is not None:
