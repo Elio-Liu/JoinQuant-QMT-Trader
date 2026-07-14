@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import json
 import queue
+import time
 import types
 import unittest
 from pathlib import Path
@@ -48,6 +50,28 @@ class BigQmtParsingAndPricingTests(unittest.TestCase):
         self.assertEqual(message["message_id"], "100-0")
         self.assertEqual(message["signal"]["reference_price"], 3.912)
         self.assertEqual(message["signal"]["created_at"], "2026-07-12 09:30:00")
+
+    def test_parse_trade_payload_preserves_expire_at(self):
+        message = self.module.parse_stream_message(
+            "102-0",
+            {
+                "payload": json.dumps(
+                    {
+                        "signal_id": "sig-expiry",
+                        "strategy_id": "hunter",
+                        "mode": "live",
+                        "action": "buy",
+                        "code": "510300.XSHG",
+                        "amount": 1000,
+                        "reference_price": 3.912,
+                        "created_at": "2026-07-12 09:30:00",
+                        "expire_at": "2026-07-12 09:30:20",
+                    }
+                )
+            },
+        )
+
+        self.assertEqual(message["signal"]["expire_at"], "2026-07-12 09:30:20")
 
     def test_parse_watchlist_command(self):
         message = self.module.parse_stream_message(
@@ -255,8 +279,11 @@ class FakeGateway:
         return True
 
 
-def trade_message(message_id, signal_id, action="buy", code="000001.XSHE", amount=1000):
-    return {
+def trade_message(
+    message_id, signal_id, action="buy", code="000001.XSHE", amount=1000,
+    expire_at=None,
+):
+    message = {
         "kind": "trade",
         "message_id": message_id,
         "signal": {
@@ -271,6 +298,9 @@ def trade_message(message_id, signal_id, action="buy", code="000001.XSHE", amoun
             "sent_at_ms": None,
         },
     }
+    if expire_at is not None:
+        message["signal"]["expire_at"] = expire_at
+    return message
 
 
 class BigQmtSubmissionTests(unittest.TestCase):
@@ -307,6 +337,36 @@ class BigQmtSubmissionTests(unittest.TestCase):
         self.assertEqual(set(self.context.universes[0]), {"510300.SH", "159915.SZ"})
         self.assertEqual(self.acks.get_nowait(), "300-0")
         self.assertEqual(self.gateway.submissions, [])
+
+    def test_expired_fifo_signal_is_acked_without_submission_and_next_signal_continues(self):
+        expired_now = time.mktime(datetime.datetime(2026, 7, 12, 9, 30, 21).timetuple())
+        self.runtime.clock = lambda: expired_now
+        self.inbound.put(
+            trade_message("310-0", "sig-expired", expire_at="2026-07-12 09:30:20")
+        )
+        self.inbound.put(trade_message("311-0", "sig-valid"))
+
+        self.runtime.on_timer(self.context)
+
+        self.assertEqual(self.acks.get_nowait(), "310-0")
+        self.assertEqual(self.gateway.submissions, [])
+        self.assertIsNone(self.runtime.active)
+
+        self.runtime.on_timer(self.context)
+
+        self.assertEqual(len(self.gateway.submissions), 1)
+        self.assertEqual(self.runtime.active["signal"]["signal_id"], "sig-valid")
+
+    def test_invalid_expire_at_is_acked_without_submission(self):
+        self.inbound.put(
+            trade_message("312-0", "sig-invalid-expiry", expire_at="09:30:20")
+        )
+
+        self.runtime.on_timer(self.context)
+
+        self.assertEqual(self.acks.get_nowait(), "312-0")
+        self.assertEqual(self.gateway.submissions, [])
+        self.assertIsNone(self.runtime.active)
 
     def test_buy_is_lot_capped_by_available_cash(self):
         self.gateway.cash = 9500.0

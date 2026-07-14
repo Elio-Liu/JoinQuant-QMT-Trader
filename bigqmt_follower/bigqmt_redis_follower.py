@@ -74,6 +74,7 @@ def parse_stream_message(message_id, fields):
     amount = int(raw["amount"])
     if amount <= 0:
         raise ValueError("trade signal amount must be positive")
+    expire_at = raw.get("expire_at")
     signal = {
         "signal_id": str(raw["signal_id"]),
         "strategy_id": str(raw["strategy_id"]),
@@ -84,8 +85,22 @@ def parse_stream_message(message_id, fields):
         "reference_price": float(reference_price),
         "created_at": str(raw.get("created_at", raw.get("timestamp", ""))),
         "sent_at_ms": raw.get("sent_at_ms"),
+        "expire_at": str(expire_at) if expire_at else None,
     }
     return {"kind": "trade", "message_id": str(message_id), "signal": signal}
+
+
+def signal_expiration_status(signal, now_epoch):
+    expire_at = signal.get("expire_at")
+    if not expire_at:
+        return None
+    try:
+        deadline = datetime.datetime.strptime(expire_at, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return "FAILED_INVALID_SIGNAL"
+    if now_epoch > time.mktime(deadline.timetuple()):
+        return "EXPIRED"
+    return None
 
 
 def jq_code_to_qmt_code(code):
@@ -417,6 +432,20 @@ class BigQmtRuntime(object):
             return
         if self.active is None and self.pending:
             message = self.pending.popleft()
+            expiration_status = signal_expiration_status(message["signal"], self.clock())
+            if expiration_status is not None:
+                level = "ERROR" if expiration_status == "FAILED_INVALID_SIGNAL" else "WARNING"
+                _log(
+                    level,
+                    "信号终态 %s status=%s expire_at=%r 未下单"
+                    % (
+                        message["signal"]["signal_id"],
+                        expiration_status,
+                        message["signal"].get("expire_at"),
+                    ),
+                )
+                self.worker.ack_queue.put(message["message_id"])
+                return
             self.active = {
                 "message": message,
                 "signal": message["signal"],
