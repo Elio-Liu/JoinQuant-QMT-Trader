@@ -99,7 +99,7 @@ class StableDiscountHunterLoggingTests(unittest.TestCase):
         self.assertIn("流动性筛选｜境内2只", log_text)
         self.assertIn("510300.XSHG（沪深300ETF）", log_text)
 
-    def test_live_selection_publishes_auction_sell_and_scheduled_buy(self):
+    def test_live_selection_publishes_preopen_sell_and_buy(self):
         log = FakeLog()
         self.strategy.log = log
         self.strategy.g = SimpleNamespace(
@@ -151,24 +151,34 @@ class StableDiscountHunterLoggingTests(unittest.TestCase):
             {("sell", "OLD.XSHG"), ("buy", "TARGET.XSHG")},
         )
 
-    def test_preopen_buy_payload_executes_at_0930_but_sell_is_immediate(self):
+    def test_preopen_payloads_omit_execute_at_and_expire_from_send_time(self):
         self.strategy.g = SimpleNamespace(etf_names={"510300.XSHG": "沪深300ETF"})
         self.strategy.log = FakeLog()
         client = FakeRedisClient()
         context_time = dt.datetime(2026, 7, 13, 9, 25, 30)
+        send_time = dt.datetime(2026, 7, 13, 9, 25, 31)
         context = SimpleNamespace(current_dt=context_time)
 
-        with mock.patch.dict(self.strategy.__dict__, {
-            "_signal_mode": mock.Mock(return_value=("live", context_time)),
-            "_signal_redis_client": mock.Mock(return_value=client),
-        }):
+        class FixedDateTime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return send_time
+
+        with mock.patch.object(self.strategy.dt, "datetime", FixedDateTime), mock.patch.dict(
+            self.strategy.__dict__,
+            {
+                "_signal_mode": mock.Mock(return_value=("live", context_time)),
+                "_signal_redis_client": mock.Mock(return_value=client),
+            },
+        ):
             self.strategy.publish_trade_signal_to_redis(context, "buy", "510300.XSHG", 1000, 4.0)
             self.strategy.publish_trade_signal_to_redis(context, "sell", "510300.XSHG", 1000, 4.0)
 
         buy_payload, sell_payload = client.payloads
-        self.assertEqual(buy_payload["execute_at"], "2026-07-13 09:30:00")
-        self.assertEqual(buy_payload["expire_at"], "2026-07-13 09:30:20")
+        self.assertNotIn("execute_at", buy_payload)
         self.assertNotIn("execute_at", sell_payload)
+        self.assertEqual(buy_payload["expire_at"], "2026-07-13 09:25:51")
+        self.assertEqual(sell_payload["expire_at"], "2026-07-13 09:25:51")
 
     def test_live_shadow_trade_skips_convergence_filter(self):
         log = FakeLog()

@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from qmt_follower.models import ExecutionStatus, StoredSignal, TradeSignal
+from miniqmt_follower.models import DailyPlan, ExecutionStatus, StoredSignal, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,18 @@ class SQLiteExecutionStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS plans (
+                    plan_id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    codes_to_sell TEXT NOT NULL,
+                    codes_to_buy TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
         finally:
             conn.close()
         logger.debug("💾 SQLite数据库已初始化 | 路径=%s", self.path)
@@ -158,6 +170,35 @@ class SQLiteExecutionStore:
             logger.debug("💾 信号已写入SQLite | signal_id=%s", signal.signal_id)
         except sqlite3.IntegrityError:
             logger.debug("💾 信号已存在(幂等拦截) | signal_id=%s", signal.signal_id)
+            return False
+        return True
+
+    def try_accept_plan(self, plan: DailyPlan) -> bool:
+        """记录日计划已收到（审计用）。返回 False 表示同一天已收到过该 plan。
+
+        注意: 不是执行去重闸门 —— 执行去重由派生信号的 signal_id 幂等保证,
+        这样重启后 Redis 重投 plan 时, 未受理的派生信号仍能继续执行。
+        """
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                """
+                INSERT INTO plans (
+                    plan_id, strategy_id, codes_to_sell, codes_to_buy, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    plan.signal_id,
+                    plan.strategy_id,
+                    json.dumps(list(plan.codes_to_sell), ensure_ascii=False),
+                    json.dumps(list(plan.codes_to_buy), ensure_ascii=False),
+                    plan.created_at,
+                ),
+            )
+            logger.debug("💾 日计划已写入SQLite | plan_id=%s", plan.signal_id)
+        except sqlite3.IntegrityError:
+            logger.debug("💾 日计划已存在(审计去重) | plan_id=%s", plan.signal_id)
             return False
         return True
 

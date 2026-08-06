@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from qmt_follower.config import load_config
-from qmt_follower.models import Action
-from qmt_follower.redis_stream import RedisStreamClient, _parse_message, _parse_signal
+from miniqmt_follower.config import load_config
+from miniqmt_follower.models import Action
+from miniqmt_follower.redis_stream import RedisStreamClient, _parse_message, _parse_signal
 
 
 class RuntimeTests(unittest.TestCase):
@@ -131,14 +131,33 @@ class RuntimeTests(unittest.TestCase):
         stream.client = FakeRedis()
         stream.config = SimpleNamespace(stream="signals", group="executors")
 
-        with self.assertLogs("qmt_follower.redis_stream", level="INFO") as captured:
+        with self.assertLogs("miniqmt_follower.redis_stream", level="INFO") as captured:
             stream.ensure_group()
 
         message = captured.records[0].getMessage()
         self.assertTrue(message.startswith("【Redis】📡 "))
         self.assertNotIn("【系统】【Redis】", message)
 
-    def test_parse_signal_accepts_json_payload(self):
+    def test_new_consumer_group_starts_from_latest(self):
+        class FakeRedis:
+            def __init__(self, **_):
+                self.group_kwargs = None
+
+            def xgroup_create(self, *args, **kwargs):
+                self.group_kwargs = (args, kwargs)
+
+        fake = FakeRedis()
+        stream = RedisStreamClient.__new__(RedisStreamClient)
+        stream.client = fake
+        stream.config = SimpleNamespace(stream="signals", group="executors")
+
+        stream.ensure_group()
+
+        _, kwargs = fake.group_kwargs
+        self.assertEqual(kwargs["id"], "$")
+        self.assertTrue(kwargs["mkstream"])
+
+    def test_parse_signal_ignores_legacy_execute_at(self):
         signal = _parse_signal(
             {
                 "payload": json.dumps(
@@ -158,7 +177,7 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(signal.signal_id, "sig-1")
         self.assertEqual(signal.action, Action.BUY)
-        self.assertEqual(signal.execute_at, "2026-07-13 09:30:00")
+        self.assertFalse(hasattr(signal, "execute_at"))
 
     def test_parse_message_recognizes_subscribe_command(self):
         message = _parse_message(

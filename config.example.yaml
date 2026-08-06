@@ -1,13 +1,20 @@
 # QMT 跟单助手示例配置。复制为 config.yaml 后按你的环境修改。
+# 当前推荐值按 "龙头情绪收割机" (harvester) 策略调优:
+#   09:26 预订阅 → 09:27 竞价止损卖出 → 09:29 预发开盘买单 → 09:30 开盘买入
+#   → 盘中分钟级硬止损卖出 / 跌停排队卖出 (L2) → 14:30 尾盘清仓。
 redis:
   # Redis Stream 配置。聚宽侧用 XADD 写入 stream，Windows 端用 consumer group 消费。
   host: YOUR_REDIS_HOST # Redis 服务地址；实盘建议使用内网、VPN 或安全组白名单。
   port: 6379 # Redis 端口。
   password: ${REDIS_PASSWORD} # 本地无密码 Redis 可改为 null。
   stream: tidal_quant_signals # 必须与聚宽侧函数里的 stream 保持一致。
-  group: qmt_executors # 消费组名称；同一账户建议只运行一个执行端以保持 FIFO。
-  consumer: win-qmt-01 # 当前执行器名称；多台机器必须使用不同名称。
+  group: qmt_executors # 消费组名称。同一账户严禁多端（会重复下单）；多台交易机（多账户）
+                       # 时每台必须用不同 group：每个 group 独立拿到 Stream 完整副本。
+  consumer: win-qmt-01 # 当前执行器名称，组内唯一；多机建议按机命名（win-qmt-02...）。
   block_ms: 20 # 10-50ms 响应较快；数值越小 CPU 空轮询越多。
+  # strategy_id 白名单：非空时只执行名单内策略的信号，其余记日志后直接 ACK。
+  # Stream 是多策略共享的；只推进 harvester 实盘时务必启用，挡住其他策略的信号。
+  allowed_strategy_ids: ["harvester"]
 
 # 订单执行参数。修改后重启 python main.py 生效。
 execution:
@@ -16,13 +23,49 @@ execution:
   order_timeout_sec: 3 # 单次委托等待秒数；超时后撤单并等待真实终态。
   max_attempts: 3 # 单条信号最多下单尝试次数，包含首次和重挂。
   max_total_duration_sec: 15 # 单条信号从开始到停止的最大总执行时间（秒）。
-  max_deviation_from_signal_price_pct: 0.02 # 行情定价基准相对策略参考价允许的最大偏离。
+  # 撤单后等待券商回报真实终态的最长时间，独立于 max_total_duration_sec。
+  # 超过它才认定"撤单终态不明"并停止后续交易，所以不要调得太小：
+  # 最后一次重挂必然贴着总预算边界，若与总预算共用，普通的未成交撤单就会误触停机。
+  cancel_confirm_timeout_sec: 30
+  # 注：曾有 max_deviation_from_signal_price_pct / exempt_sell_from_deviation_guard
+  # 两项「行情价偏离参考价就拒单」的风控，已移除。本执行端是跟单器，拦下的委托会让
+  # 实盘持仓与聚宽模拟盘永久分叉且无补单机制，一致性优先。旧配置里留着这两个键也无妨，
+  # 会被直接忽略。
   poll_interval_sec: 0.2 # 稳态查单轮询间隔（秒）。
-  pricing_mode: slippage # slippage=最新价加减固定滑点；book=按对手盘加减 tick。
-  book_tick_offset: 2 # 股票 tick=0.01，ETF/基金 tick=0.001。
+  # book=按对手盘加减 tick 定价（买入=卖一+offset，卖出=买一-offset），追求首挂即成交；
+  # 止损卖出直接吃买一价比"最新价-滑点"更快锁定成交。盘口缺失时自动回退 slippage。
+  pricing_mode: book
+  book_tick_offset: 2 # 股票 tick=0.01；主板股票 2 tick = 2 分钱的成交裕量。
+  # 9:15~9:30 排队委托的激进报价幅度（买 +2%／卖 -2%），只买 9:30 撮合的时间优先，
+  # 成交价仍由对手方挂单价决定；报价强制夹在涨跌停内，取不到涨跌停价则回退常规定价。
+  # 设为 0 关闭。切勿改成挂涨跌停价：吃不完的剩余会留在涨跌停价被反向扫单。
+  auction_aggressive_pct: 0.02
+  skip_sell_when_limit_down: false # 已由 limit_down_sell_mode 取代，保留兼容旧配置。
+  # 旧兼容开关；limit_up_buy_mode 非空时以新模式为准。
+  skip_buy_when_limit_up: true
+  # 跌停锁盘时卖单的处理模式。queue=挂跌停价排队至截止时间，开板即按价格优先成交。
+  # 策略端 L2 跌停排队逃生依赖此模式：炸开跌停的窗口只有几秒，排队是唯一逃生口。
+  limit_down_sell_mode: "queue"
+  queue_sell_poll_interval_sec: 3 # 排队期间的慢轮询间隔（秒）；排队单不撤不重挂，无需快轮询。
+  queue_sell_deadline: "14:56:30" # 排队截止时间，到点撤单收尾（避开深市 14:57 尾盘集合竞价）。
+  # 排队单占用卖出 worker 至成交或截止；超限的新排队请求降级 skip。
+  # 必须 ≤ 卖出线程数(--workers，默认8) - 2，保证止损卖出永远有可用线程。
+  max_concurrent_queue_sells: 2
+  # 涨停锁盘买单的处理模式。queue=确认涨停价且卖一无档后，挂涨停价保留队列位置。
+  # 聚宽信号代表模拟盘已成交; 实盘遇涨停排队买入以保持一致, 不因时序差异丢单。
+  limit_up_buy_mode: "queue"
+  queue_buy_deadline: "14:56:30" # 截止仍未完全成交时撤单并等待真实终态。
+  # 默认买入线程数为 8；最多允许 5 只涨停股全天排队，保留 3 个 worker 处理普通买单。
+  max_concurrent_queue_buys: 5
+  # 意图型信号（日计划）：09:28 收到 plan 后，09:30 先清仓、再按真实资金等分买入。
+  plan_enabled: true               # 日计划执行开关；无 plan 消息时不影响旧协议。
+  plan_execute_at: "09:30:00"      # plan 执行时刻（交易机本地时间，HH:MM:SS）。
+  # 单票买入金额上限 = 当前账户总资产（现金+股票市值）× 该比例；0~1 小数，5 只等权推荐 0.2。
+  max_single_position_pct: 0.2
 
 market_data:
-  # 启动时预订阅的聚宽格式代码列表，例如 000001.XSHE、510300.XSHG。
+  # 启动时预订阅的聚宽格式代码列表。harvester 每日 09:26 会推送当日股票池+持仓，
+  # 这里无需静态配置；若需盘前手工盯某些代码可加在此处。
   pre_subscribe_codes: []
 
 trading:
@@ -33,6 +76,6 @@ trading:
   session_id: 0 # miniQMT 会话 ID，通常为 0。
   strategy_name: tidal_quant # 写入 QMT 委托备注、用于客户端筛选的策略名称。
 
-state_db: data/qmt_follower.db # SQLite 本地执行账本路径，用于幂等与订单状态记录。
+state_db: data/miniqmt_follower.db # SQLite 本地执行账本路径，用于幂等与订单状态记录。
 log_level: INFO # 控制台日志级别；文件日志始终记录 DEBUG 明细。
 log_dir: logs # 按天轮转的日志目录。

@@ -1,1 +1,1 @@
-"""Test package for qmt_follower."""
+"""Test package for miniqmt_follower."""

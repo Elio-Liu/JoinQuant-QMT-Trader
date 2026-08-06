@@ -4,8 +4,8 @@ import threading
 import unittest
 from pathlib import Path
 
-from qmt_follower.models import Action, ExecutionStatus, TradeSignal
-from qmt_follower.store import SQLiteExecutionStore
+from miniqmt_follower.models import Action, DailyPlan, ExecutionStatus, TradeSignal
+from miniqmt_follower.store import SQLiteExecutionStore
 
 
 class StoreTests(unittest.TestCase):
@@ -135,6 +135,22 @@ class StoreTests(unittest.TestCase):
 
             self.assertEqual(journal_mode.lower(), "wal")
             self.assertEqual(synchronous, 1)
+
+
+class PlanStoreTests(unittest.TestCase):
+    def test_try_accept_plan_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteExecutionStore(Path(tmpdir) / "state.db")
+            plan = DailyPlan(
+                signal_id="harvester-20260806-plan",
+                strategy_id="harvester",
+                codes_to_sell=("000001.XSHE",),
+                codes_to_buy=("600000.XSHG",),
+                created_at="2026-08-06 09:28:00",
+            )
+            self.assertTrue(store.try_accept_plan(plan))
+            self.assertFalse(store.try_accept_plan(plan))
+            store.close()
 
 
 if __name__ == "__main__":

@@ -5,11 +5,11 @@ import unittest
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-import qmt_follower.executor as executor_module
-from qmt_follower.app import _execute_safe
-from qmt_follower.executor import OrderExecutionEngine
-from qmt_follower.logging_config import _ColoredFormatter, _FileFormatter, setup_logging
-from qmt_follower.models import (
+import miniqmt_follower.executor as executor_module
+from miniqmt_follower.app import _execute_safe
+from miniqmt_follower.executor import OrderExecutionEngine
+from miniqmt_follower.logging_config import _ColoredFormatter, _FileFormatter, setup_logging
+from miniqmt_follower.models import (
     Action,
     BrokerOrderStatus,
     ExecutionConfig,
@@ -17,7 +17,8 @@ from qmt_follower.models import (
     OrderSnapshot,
     TradeSignal,
 )
-from qmt_follower.store import SQLiteExecutionStore
+from miniqmt_follower.opening import OpeningSellBarrier
+from miniqmt_follower.store import SQLiteExecutionStore
 from tests.test_executor import FakeBroker, FakeMarketData
 
 
@@ -30,8 +31,8 @@ class TerminalLoggingTests(unittest.TestCase):
 
         signal = self._signal()
 
-        with self.assertLogs("qmt_follower.app", level=logging.ERROR) as captured:
-            result = _execute_safe(ExplodingEngine(), signal)
+        with self.assertLogs("miniqmt_follower.app", level=logging.ERROR) as captured:
+            result = _execute_safe(ExplodingEngine(), signal, OpeningSellBarrier())
 
         self.assertEqual(result.status, ExecutionStatus.FAILED_BROKER)
         self.assertIn("【卖单】❌", captured.records[0].getMessage())
@@ -41,9 +42,14 @@ class TerminalLoggingTests(unittest.TestCase):
         signal = self._signal()
 
         self.assertTrue(hasattr(signal, "console_prefix"), "TradeSignal lacks console_prefix")
-        self.assertRegex(signal.console_prefix, r"^【卖单】📥 信号#[0-9A-F]{4}$")
+        self.assertRegex(signal.console_prefix, r"^【卖单】📉 信号#[0-9A-F]{4}$")
         self.assertEqual(signal.console_prefix, self._signal().console_prefix)
         self.assertNotIn("【信号】", signal.console_prefix)
+
+    def test_display_code_shows_name_when_available_and_falls_back_to_code(self):
+        named = self._signal().with_stock_name("央企创新ETF")
+        self.assertEqual(named.display_code, "央企创新ETF(517110)")
+        self.assertEqual(self._signal().display_code, "517110")
 
     def test_trade_events_use_one_semantic_emoji_without_stacked_event_tags(self):
         signal = self._signal()
@@ -55,24 +61,24 @@ class TerminalLoggingTests(unittest.TestCase):
 
     def test_console_formatter_keeps_only_time_and_structured_message(self):
         record = logging.LogRecord(
-            name="qmt_follower.executor",
+            name="miniqmt_follower.executor",
             level=logging.INFO,
             pathname=__file__,
             lineno=1,
-            msg="【卖单】📥 信号#A3F2 | 517110 | 13700股",
+            msg="【卖单】📉 信号#A3F2 | 央企创新ETF(517110) | 13700股",
             args=(),
             exc_info=None,
         )
 
         formatted = _ColoredFormatter().format(record)
 
-        self.assertRegex(formatted, r"^\d{2}:\d{2}:\d{2} 【卖单】📥")
+        self.assertRegex(formatted, r"^\d{2}:\d{2}:\d{2} 【卖单】📉")
         self.assertNotIn("[信息]", formatted)
         self.assertNotIn("[executor]", formatted)
 
     def test_console_formatter_adds_level_emoji_to_unstructured_messages(self):
         record = logging.LogRecord(
-            name="qmt_follower.test",
+            name="miniqmt_follower.test",
             level=logging.WARNING,
             pathname=__file__,
             lineno=1,
@@ -90,7 +96,7 @@ class TerminalLoggingTests(unittest.TestCase):
             raise RuntimeError("boom")
         except RuntimeError:
             record = logging.LogRecord(
-                name="qmt_follower.app",
+                name="miniqmt_follower.app",
                 level=logging.ERROR,
                 pathname=__file__,
                 lineno=1,
@@ -120,9 +126,9 @@ class TerminalLoggingTests(unittest.TestCase):
                 self.assertEqual(console.level, logging.INFO)
                 self.assertEqual(file_handler.level, logging.DEBUG)
 
-                logging.getLogger("qmt_follower.test").debug("debug-detail-for-file")
+                logging.getLogger("miniqmt_follower.test").debug("debug-detail-for-file")
                 file_handler.flush()
-                text = (Path(tmpdir) / "qmt_follower.log").read_text(encoding="utf-8")
+                text = (Path(tmpdir) / "miniqmt_follower.log").read_text(encoding="utf-8")
                 self.assertIn("debug-detail-for-file", text)
             finally:
                 for handler in root.handlers:
@@ -153,15 +159,18 @@ class TerminalLoggingTests(unittest.TestCase):
                 )
                 engine = OrderExecutionEngine(
                     store,
-                    FakeMarketData([
-                        executor_module.Quote(last_price=0.710, ask1=0.711, bid1=0.710),
-                        executor_module.Quote(last_price=0.710, ask1=0.711, bid1=0.710),
-                    ]),
+                    FakeMarketData(
+                        [
+                            executor_module.Quote(last_price=0.710, ask1=0.711, bid1=0.710),
+                            executor_module.Quote(last_price=0.710, ask1=0.711, bid1=0.710),
+                        ],
+                        names={"517110.XSHG": "央企创新ETF"},
+                    ),
                     broker,
                     config,
                 )
 
-                with self.assertLogs("qmt_follower.executor", level=logging.INFO) as captured:
+                with self.assertLogs("miniqmt_follower.executor", level=logging.INFO) as captured:
                     engine.execute(signal)
 
                 messages = [record.getMessage() for record in captured.records]
@@ -170,6 +179,7 @@ class TerminalLoggingTests(unittest.TestCase):
 
                 self.assertEqual(len(retries), 1)
                 self.assertIn("【卖单】🔁", retries[0])
+                self.assertIn("央企创新ETF(517110)", retries[0])
                 self.assertIn("第01次", retries[0])
                 self.assertIn("行情 0.710", retries[0])
                 self.assertIn("买/卖 0.710/0.711", retries[0])
@@ -178,6 +188,7 @@ class TerminalLoggingTests(unittest.TestCase):
                 self.assertIn("未成→已撤", retries[0])
                 self.assertEqual(len(completions), 1)
                 self.assertIn("【卖单】✅", completions[0])
+                self.assertIn("央企创新ETF(517110)", completions[0])
                 self.assertIn("第02次", completions[0])
                 self.assertIn("全成 13700/13700", completions[0])
                 self.assertFalse(any("第1次定价" in message for message in messages))

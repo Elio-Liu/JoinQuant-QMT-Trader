@@ -1,10 +1,11 @@
 import unittest
 
-from qmt_follower.adapters.qmt import (
+from miniqmt_follower.adapters.qmt import (
     _qmt_order_status_to_broker_status,
+    classify_qmt_rejection,
     jq_code_to_qmt_code,
 )
-from qmt_follower.models import BrokerOrderStatus
+from miniqmt_follower.models import BrokerOrderStatus, BrokerRejectionKind
 
 
 class QmtCodeMappingTests(unittest.TestCase):
@@ -72,6 +73,45 @@ class QmtOrderStatusMappingTests(unittest.TestCase):
         self.assertEqual(
             _qmt_order_status_to_broker_status(999),
             BrokerOrderStatus.OPEN,
+        )
+
+
+class QmtRejectionClassificationTests(unittest.TestCase):
+    def test_price_rejections_are_recoverable(self):
+        for reason in ("委托价不正确", "订单价格超出范围", "价格笼子校验失败"):
+            with self.subTest(reason=reason):
+                self.assertEqual(classify_qmt_rejection(reason), BrokerRejectionKind.PRICE)
+
+    def test_resource_rejections_refresh_account_resources(self):
+        for reason in ("可用资金不足", "可卖数量不足", "委托数量不正确"):
+            with self.subTest(reason=reason):
+                self.assertEqual(classify_qmt_rejection(reason), BrokerRejectionKind.RESOURCE)
+
+    def test_transient_rejections_are_retried(self):
+        for reason in ("交易通道繁忙，请稍后重试", "柜台忙", "请求频率过高"):
+            with self.subTest(reason=reason):
+                self.assertEqual(classify_qmt_rejection(reason), BrokerRejectionKind.TRANSIENT)
+
+    def test_permanent_rejections_stop_immediately(self):
+        for reason in (
+            "证券停牌",
+            "账户状态异常",
+            "无交易权限",
+            "股东账户不存在",
+            "该证券禁止买入",
+            "该客户未开通创业板交易权限",
+            "股东代码不存在",
+            "证券账户未指定",
+            "该证券禁止交易",
+            "账号未登录",
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(classify_qmt_rejection(reason), BrokerRejectionKind.HARD_STOP)
+
+    def test_unrecognized_confirmed_rejection_defaults_to_retry(self):
+        self.assertEqual(
+            classify_qmt_rejection("柜台返回未识别文本"),
+            BrokerRejectionKind.UNKNOWN,
         )
 
 

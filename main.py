@@ -1,4 +1,4 @@
-from qmt_follower import app
+from miniqmt_follower import app
 
 
 def main():

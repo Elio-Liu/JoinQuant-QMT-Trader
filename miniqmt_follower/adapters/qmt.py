@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
-from qmt_follower.config import TradingConfig
-from qmt_follower.models import (
+from miniqmt_follower.config import TradingConfig
+from miniqmt_follower.models import (
     Action,
+    BrokerOrderRejected,
     BrokerOrderStatus,
+    BrokerRejectionKind,
+    BrokerSubmissionUncertain,
     OrderSnapshot,
     Quote,
     TradeSignal,
@@ -19,11 +24,83 @@ logger = logging.getLogger(__name__)
 # 订单列表缓存有效期（秒）—— 短缓存避免重复 query_stock_orders 全量扫描
 _ORDERS_CACHE_TTL = 0.05
 
+_HARD_STOP_REJECTION_KEYWORDS = (
+    "停牌",
+    "账户异常",
+    "账户状态异常",
+    "无交易权限",
+    "交易权限",
+    "权限不足",
+    "未开通",
+    "股东账户",
+    "股东代码",
+    "证券账户未指定",
+    "禁止买入",
+    "禁止卖出",
+    "禁止交易",
+    "禁买",
+    "禁卖",
+    "不允许交易",
+    "未登录",
+)
+_PRICE_REJECTION_KEYWORDS = (
+    "委托价",
+    "订单价格",
+    "价格超出",
+    "报价不正确",
+    "价格笼子",
+    "涨跌停范围",
+)
+_RESOURCE_REJECTION_KEYWORDS = (
+    "资金不足",
+    "可用资金",
+    "可卖数量",
+    "持仓不足",
+    "委托数量",
+    "数量不正确",
+    "最大可委托",
+)
+_TRANSIENT_REJECTION_KEYWORDS = (
+    "繁忙",
+    "柜台忙",
+    "稍后重试",
+    "频率过高",
+    "流控",
+)
+
+_ORDER_ERROR_WAIT_SEC = 0.05
+
+
+@dataclass(frozen=True)
+class _QmtOrderError:
+    order_id: str | None
+    error_code: str | None
+    reason: str
+    order_remark: str | None
+
 
 class QmtAdapterNotConfigured(RuntimeError):
     """QMT 运行环境或账号交易适配尚未配置。"""
 
     pass
+
+
+def classify_qmt_rejection(reason: str | None) -> BrokerRejectionKind:
+    """把 QMT/柜台废单文案归一化；未识别的已确认废单默认允许重试。"""
+    normalized = str(reason or "").strip().lower()
+    for keyword in _HARD_STOP_REJECTION_KEYWORDS:
+        if keyword in normalized:
+            return BrokerRejectionKind.HARD_STOP
+    for keyword in _PRICE_REJECTION_KEYWORDS:
+        if keyword in normalized:
+            return BrokerRejectionKind.PRICE
+    for keyword in _RESOURCE_REJECTION_KEYWORDS:
+        if keyword in normalized:
+            return BrokerRejectionKind.RESOURCE
+    for keyword in _TRANSIENT_REJECTION_KEYWORDS:
+        if keyword in normalized:
+            return BrokerRejectionKind.TRANSIENT
+    return BrokerRejectionKind.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +186,10 @@ class QmtMarketDataAdapter:
         self.xtdata = xtdata
         self._subscribed: set[str] = set()
         self._subscribe_lock = threading.Lock()
+        # 静态合约信息缓存: 当日不变, 每代码每天只查一次 get_instrument_detail。
+        # 涨跌停价和证券中文名都从这里取, 避免同一只票一天重复请求。
+        self._instrument_detail_cache: dict[str, dict[str, Any]] = {}
+        self._instrument_detail_cache_day: str = ""
         if pre_subscribe_codes:
             self.subscribe(pre_subscribe_codes)
             logger.info("【行情】📡 启动预订阅完成 | %s只", len(self._subscribed))
@@ -142,14 +223,70 @@ class QmtMarketDataAdapter:
         if not tick:
             raise RuntimeError(f"no tick data for {code} (qmt: {qmt_code})")
         last_price = float(tick.get("lastPrice") or tick.get("last_price"))
+        high_limit, low_limit = self._limit_prices_of(qmt_code)
         return Quote(
             last_price=last_price,
             ask1=_first_book_level(tick.get("askPrice")),
             bid1=_first_book_level(tick.get("bidPrice")),
+            high_limit=high_limit,
+            low_limit=low_limit,
         )
 
     def latest_price(self, code: str) -> float:
         return self.latest_quote(code).last_price
+
+    def instrument_name(self, code: str) -> str | None:
+        """返回证券中文名; 合约信息不可得时返回 None, 日志回退为只显示代码。"""
+        qmt_code = jq_code_to_qmt_code(code)
+        detail = self._instrument_detail_of(qmt_code)
+        if detail is None:
+            return None
+        name = detail.get("InstrumentName") or detail.get("instrument_name")
+        return str(name).strip() if name else None
+
+    def _instrument_detail_of(self, qmt_code: str) -> dict[str, Any] | None:
+        """取静态合约信息并按代码+交易日缓存; 查询失败不缓存, 下次调用重试。"""
+        today = dt.date.today().isoformat()
+        if today != self._instrument_detail_cache_day:
+            self._instrument_detail_cache = {}
+            self._instrument_detail_cache_day = today
+        cached = self._instrument_detail_cache.get(qmt_code)
+        if cached is not None:
+            return cached
+        try:
+            detail = self.xtdata.get_instrument_detail(qmt_code)
+        except Exception as exc:
+            logger.warning("【行情】⚠️ %s | 合约静态信息查询失败 | %s", qmt_code, exc)
+            return None
+        if not detail:
+            logger.warning("【行情】⚠️ %s | 合约静态信息为空", qmt_code)
+            return None
+        self._instrument_detail_cache[qmt_code] = detail
+        return detail
+
+    def _limit_prices_of(self, qmt_code: str) -> tuple[float | None, float | None]:
+        """从静态合约信息取当日涨跌停价 (UpStopPrice/DownStopPrice)。
+
+        QMT tick 不含涨跌停价, 只能从静态合约信息 get_instrument_detail 取。
+        查询失败不缓存 (下次调用重试) 并返回 (None, None) —— 依赖方 (跌停排队
+        卖出) 会因此回退保守路径, 宁可跳过也不用错误价格挂单。
+        """
+        detail = self._instrument_detail_of(qmt_code)
+        if detail is None:
+            return None, None
+        return (
+            _positive_price_or_none(detail.get("UpStopPrice")),
+            _positive_price_or_none(detail.get("DownStopPrice")),
+        )
+
+
+def _positive_price_or_none(value: Any) -> float | None:
+    """静态信息里的涨跌停价字段转 float; 0/负数/缺失/非法都返回 None。"""
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
 
 
 def _first_book_level(levels: Any) -> float | None:
@@ -192,13 +329,17 @@ class QmtBrokerAdapter:
         # ---- 订单缓存: 减少轮询时重复 QMT API 调用 ----
         self._orders_cache: dict[str, OrderSnapshot] = {}  # order_id → snapshot
         self._orders_cache_time: float = 0.0
+        # ---- 报单失败回调缓存: 与交易 API 锁分离，避免阻塞 QMT 回调线程 ----
+        self._order_error_lock = threading.Lock()
+        self._order_errors_by_remark: dict[str, _QmtOrderError] = {}
+        self._order_errors_by_id: dict[str, _QmtOrderError] = {}
 
         logger.debug("🔌 正在连接QMT交易端 | 账号=%s 路径=%s 会话=%s",
                      config.account_id, config.miniqmt_path, config.session_id)
 
         try:
             from xtquant.xtconstant import FIX_PRICE, STOCK_BUY, STOCK_SELL
-            from xtquant.xttrader import XtQuantTrader
+            from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
             from xtquant.xttype import StockAccount
         except ImportError as exc:
             raise QmtAdapterNotConfigured("xtquant is not installed in this Python environment") from exc
@@ -209,6 +350,16 @@ class QmtBrokerAdapter:
 
         self._account = StockAccount(config.account_id)
         self._trader = XtQuantTrader(config.miniqmt_path, config.session_id)
+
+        adapter = self
+
+        class _OrderErrorCallback(XtQuantTraderCallback):
+            def on_order_error(self, error):
+                adapter._cache_order_error(error)
+
+        # 保留强引用，避免回调对象被回收。
+        self._callback = _OrderErrorCallback()
+        self._trader.register_callback(self._callback)
         self._trader.start()
 
         connect_result = self._trader.connect()
@@ -257,24 +408,67 @@ class QmtBrokerAdapter:
             return 0
         return 0
 
+    def query_position(self, code: str) -> int:
+        """实时查询某只股票的总持仓（含当日不可卖部分）。"""
+        qmt_code = jq_code_to_qmt_code(code)
+        with self._trading_lock:
+            positions: list[Any] = self._trader.query_stock_positions(self._account)
+        for pos in positions:
+            pos_code = str(getattr(pos, "stock_code", ""))
+            if pos_code != qmt_code:
+                continue
+            for attr in ("volume", "m_nVolume", "can_use_volume"):
+                val = getattr(pos, attr, None)
+                if val is not None:
+                    return int(val)
+            return 0
+        return 0
+
+    def query_total_assets(self) -> float:
+        """查询账户当前总资产（现金 + 股票市值）。"""
+        with self._trading_lock:
+            asset = self._trader.query_stock_asset(self._account)
+        for attr in ("m_dTotalAssets", "total_assets", "m_dBalance"):
+            val = getattr(asset, attr, None)
+            if val is not None:
+                return float(val)
+        raise RuntimeError(f"Cannot extract total assets from asset object: {asset}")
+
     def submit_order(self, signal: TradeSignal, quantity: int, price: float) -> str:
         qmt_code = jq_code_to_qmt_code(signal.code)
         order_type = self._STOCK_BUY if signal.action == Action.BUY else self._STOCK_SELL
 
-        with self._trading_lock:
-            order_id = self._trader.order_stock(
-                self._account,
-                qmt_code,
-                order_type,
-                int(quantity),
-                self._FIX_PRICE,
-                float(price),
-                self._strategy_name,
-                signal.signal_id,  # order_remark — 方便在 QMT 客户端追溯到信号
-            )
+        try:
+            with self._trading_lock:
+                order_id = self._trader.order_stock(
+                    self._account,
+                    qmt_code,
+                    order_type,
+                    int(quantity),
+                    self._FIX_PRICE,
+                    float(price),
+                    self._strategy_name,
+                    signal.signal_id,  # order_remark — 方便在 QMT 客户端追溯到信号
+                )
+        except Exception as exc:
+            raise BrokerSubmissionUncertain(
+                f"QMT order submission state is uncertain: {exc}"
+            ) from exc
 
         if order_id is None or (isinstance(order_id, int) and order_id < 0):
-            raise RuntimeError(f"QMT order_stock failed: returned {order_id}")
+            rejection = self._take_order_error_by_remark(
+                signal.signal_id, wait_timeout=_ORDER_ERROR_WAIT_SEC,
+            )
+            reason = (
+                rejection.reason
+                if rejection is not None
+                else f"QMT order_stock failed: returned {order_id}"
+            )
+            raise BrokerOrderRejected(
+                reason,
+                error_code=(rejection.error_code if rejection is not None else str(order_id)),
+                kind=classify_qmt_rejection(reason),
+            )
 
         oid = str(order_id)
         # 预填缓存: 新订单初始为 OPEN
@@ -289,6 +483,51 @@ class QmtBrokerAdapter:
             price,
         )
         return oid
+
+    def _cache_order_error(self, error: Any) -> None:
+        """QMT 回调线程只写轻量内存缓存，不触达交易 API 或 SQLite。"""
+        raw_order_id = getattr(error, "order_id", None)
+        raw_error_code = getattr(error, "error_id", None)
+        raw_reason = getattr(error, "error_msg", None)
+        raw_remark = getattr(error, "order_remark", None)
+        cached = _QmtOrderError(
+            order_id=(str(raw_order_id) if raw_order_id is not None else None),
+            error_code=(str(raw_error_code) if raw_error_code is not None else None),
+            reason=str(raw_reason or "QMT order rejected"),
+            order_remark=(str(raw_remark) if raw_remark else None),
+        )
+        with self._order_error_lock:
+            if cached.order_id is not None:
+                self._order_errors_by_id[cached.order_id] = cached
+            if cached.order_remark is not None:
+                self._order_errors_by_remark[cached.order_remark] = cached
+
+    def _take_order_error_by_remark(
+        self,
+        order_remark: str,
+        *,
+        wait_timeout: float,
+    ) -> _QmtOrderError | None:
+        """短暂等待异步错误回调，并按 signal_id/order_remark 原子消费。"""
+        deadline = time.monotonic() + max(0.0, wait_timeout)
+        while True:
+            with self._order_error_lock:
+                cached = self._order_errors_by_remark.pop(order_remark, None)
+                if cached is not None:
+                    if cached.order_id is not None:
+                        self._order_errors_by_id.pop(cached.order_id, None)
+                    return cached
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+
+    def _take_order_error_by_id(self, order_id: str) -> _QmtOrderError | None:
+        """按 QMT 订单号消费回调错误，并清理同一记录的 remark 索引。"""
+        with self._order_error_lock:
+            cached = self._order_errors_by_id.pop(order_id, None)
+            if cached is not None and cached.order_remark is not None:
+                self._order_errors_by_remark.pop(cached.order_remark, None)
+            return cached
 
     def get_order_snapshot(self, order_id: str) -> OrderSnapshot:
         """查询单个订单快照，带 50ms 短期缓存避免轮询时重复全量查询。"""
@@ -313,10 +552,33 @@ class QmtBrokerAdapter:
         fresh: dict[str, OrderSnapshot] = {}
         for o in orders:
             oid = str(o.order_id)
+            status = _qmt_order_status_to_broker_status(o.order_status)
+            callback_error = (
+                self._take_order_error_by_id(oid)
+                if status == BrokerOrderStatus.REJECTED
+                else None
+            )
+            raw_status_msg = str(getattr(o, "status_msg", "") or "").strip()
+            rejection_reason = None
+            rejection_code = None
+            if status == BrokerOrderStatus.REJECTED:
+                rejection_reason = raw_status_msg or (
+                    callback_error.reason if callback_error is not None else "QMT order rejected"
+                )
+                rejection_code = (
+                    callback_error.error_code if callback_error is not None else None
+                )
             fresh[oid] = OrderSnapshot(
                 order_id=oid,
-                status=_qmt_order_status_to_broker_status(o.order_status),
+                status=status,
                 filled_qty=int(getattr(o, "traded_volume", 0)),
+                rejection_reason=rejection_reason,
+                rejection_code=rejection_code,
+                rejection_kind=(
+                    classify_qmt_rejection(rejection_reason)
+                    if status == BrokerOrderStatus.REJECTED
+                    else None
+                ),
             )
         self._orders_cache = fresh
 

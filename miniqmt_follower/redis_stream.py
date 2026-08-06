@@ -7,8 +7,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from qmt_follower.config import RedisConfig
-from qmt_follower.models import TradeSignal
+from miniqmt_follower.config import RedisConfig
+from miniqmt_follower.models import DailyPlan, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +28,15 @@ class WatchlistCommand:
 class StreamMessage:
     """Redis Stream 中的一条消息。
 
-    message_id 是 Redis 生成的流 ID。signal 与 watchlist 二选一:
-    交易信号填 signal, 预订阅指令(action=subscribe)填 watchlist。
+    message_id 是 Redis 生成的流 ID。signal 与 watchlist/plan 三选一:
+    交易信号填 signal, 预订阅指令(action=subscribe)填 watchlist,
+    日计划(action=plan)填 plan。
     """
 
     message_id: str
     signal: TradeSignal | None = None
     watchlist: WatchlistCommand | None = None
+    plan: DailyPlan | None = None
 
 
 class RedisStreamClient:
@@ -61,10 +63,16 @@ class RedisStreamClient:
     def ensure_group(self) -> None:
         """确保消费组存在。
 
+        新组从 Stream 最新位置（$）开始消费：多台交易机各用独立 group 时,
+        盘中新加入的机器不会重放历史消息（早上的 plan 没有 expire_at,
+        重放会导致误建仓）。错过 plan 的机器当日不买, 符合"宁可少买不盲买"。
+        已存在的组不受影响（BUSYGROUP 直接忽略, 各自游标继续推进）。
         BUSYGROUP 表示组已经存在, 属于正常情况, 其他异常继续抛出。
         """
         try:
-            self.client.xgroup_create(self.config.stream, self.config.group, id="0", mkstream=True)
+            self.client.xgroup_create(
+                self.config.stream, self.config.group, id="$", mkstream=True
+            )
             logger.info("【Redis】📡 消费组已创建 | stream=%s | group=%s", self.config.stream, self.config.group)
         except Exception as exc:
             if "BUSYGROUP" in str(exc):
@@ -145,6 +153,11 @@ def _parse_message(message_id: str, fields: dict[str, str]) -> StreamMessage:
         )
         logger.debug("📨 预订阅指令已解析 | msg_id=%s 数量=%s", message_id, len(watchlist.codes))
         return StreamMessage(message_id=message_id, watchlist=watchlist)
+
+    if str(raw.get("action", "")).lower() == "plan":
+        plan = DailyPlan.from_dict(raw)
+        logger.debug("📨 日计划已解析 | msg_id=%s plan_id=%s", message_id, plan.signal_id)
+        return StreamMessage(message_id=message_id, plan=plan)
 
     signal = TradeSignal.from_dict(raw)
     logger.debug("📨 Redis消息已解析 | msg_id=%s signal_id=%s", message_id, signal.signal_id)

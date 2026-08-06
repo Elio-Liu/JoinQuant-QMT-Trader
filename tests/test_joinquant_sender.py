@@ -6,7 +6,13 @@ import types
 import unittest
 
 import joinquant_signal_sender
-from joinquant_signal_sender import publish_trade_signal_to_redis, publish_watchlist_to_redis
+from joinquant_signal_sender import (
+    publish_daily_plan_to_redis,
+    publish_sell_all_to_redis,
+    publish_sell_half_to_redis,
+    publish_trade_signal_to_redis,
+    publish_watchlist_to_redis,
+)
 
 
 class FakeContext:
@@ -120,7 +126,13 @@ class JoinQuantSenderTests(unittest.TestCase):
 
         self.assertEqual(
             public_functions,
-            ["publish_trade_signal_to_redis", "publish_watchlist_to_redis"],
+            [
+                "publish_trade_signal_to_redis",
+                "publish_watchlist_to_redis",
+                "publish_daily_plan_to_redis",
+                "publish_sell_half_to_redis",
+                "publish_sell_all_to_redis",
+            ],
         )
 
     def test_watchlist_publishes_subscribe_command(self):
@@ -161,6 +173,81 @@ class JoinQuantSenderTests(unittest.TestCase):
     def _install_fake_redis(self, client):
         fake_module = types.SimpleNamespace(Redis=lambda **_: client)
         sys.modules["redis"] = fake_module
+
+
+class IntentSignalSenderTests(unittest.TestCase):
+    def setUp(self):
+        self.original_redis = sys.modules.get("redis")
+        for attr in ("_redis_client", "_redis_config_key"):
+            if hasattr(publish_trade_signal_to_redis, attr):
+                delattr(publish_trade_signal_to_redis, attr)
+
+    def tearDown(self):
+        if self.original_redis is None:
+            sys.modules.pop("redis", None)
+        else:
+            sys.modules["redis"] = self.original_redis
+
+    def _install_fake_redis(self, client):
+        fake_module = types.SimpleNamespace(Redis=lambda **_: client)
+        sys.modules["redis"] = fake_module
+
+    def test_daily_plan_publishes_lists_without_amount(self):
+        now = dt.datetime.now()
+        client = FakeRedisClient()
+        self._install_fake_redis(client)
+
+        result = publish_daily_plan_to_redis(
+            FakeContext(now), ["000001.XSHE"], ["600000.XSHG", "000002.XSHE"]
+        )
+
+        self.assertTrue(result["sent"])
+        payload = json.loads(client.xadd_calls[0]["fields"]["payload"])
+        self.assertEqual(payload["action"], "plan")
+        self.assertEqual(
+            payload["signal_id"], "hunter-{}-plan".format(now.strftime("%Y%m%d"))
+        )
+        self.assertEqual(payload["codes_to_sell"], ["000001.XSHE"])
+        self.assertEqual(payload["codes_to_buy"], ["600000.XSHG", "000002.XSHE"])
+        self.assertNotIn("amount", payload)
+
+    def test_sell_half_publishes_without_amount(self):
+        now = dt.datetime.now()
+        client = FakeRedisClient()
+        self._install_fake_redis(client)
+
+        result = publish_sell_half_to_redis(FakeContext(now), "000001.XSHE", 10.5)
+
+        self.assertTrue(result["sent"])
+        payload = json.loads(client.xadd_calls[0]["fields"]["payload"])
+        self.assertEqual(payload["action"], "sell_half")
+        self.assertEqual(payload["code"], "000001.XSHE")
+        self.assertEqual(payload["reference_price"], 10.5)
+        self.assertNotIn("amount", payload)
+
+    def test_sell_all_publishes_without_amount(self):
+        now = dt.datetime.now()
+        client = FakeRedisClient()
+        self._install_fake_redis(client)
+
+        result = publish_sell_all_to_redis(FakeContext(now), "000002.XSHE", 9.8)
+
+        self.assertTrue(result["sent"])
+        payload = json.loads(client.xadd_calls[0]["fields"]["payload"])
+        self.assertEqual(payload["action"], "sell_all")
+        self.assertNotIn("amount", payload)
+
+    def test_intent_signals_skipped_in_backtest(self):
+        client = FakeRedisClient()
+        self._install_fake_redis(client)
+        old = dt.datetime(2026, 6, 8, 9, 30, 1)
+
+        plan = publish_daily_plan_to_redis(FakeContext(old), ["000001.XSHE"], [])
+        half = publish_sell_half_to_redis(FakeContext(old), "000001.XSHE", 10.0)
+
+        self.assertFalse(plan["sent"])
+        self.assertFalse(half["sent"])
+        self.assertEqual(client.xadd_calls, [])
 
 
 if __name__ == "__main__":

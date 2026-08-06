@@ -91,7 +91,7 @@ def setup_logging(level: int | str = logging.INFO, log_dir: str | Path = "logs")
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
     file_handler = TimedRotatingFileHandler(
-        filename=log_path / "qmt_follower.log",
+        filename=log_path / "miniqmt_follower.log",
         when="midnight",
         interval=1,
         backupCount=30,

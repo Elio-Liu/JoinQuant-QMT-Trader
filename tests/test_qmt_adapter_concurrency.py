@@ -1,9 +1,21 @@
+import sys
 import threading
 import unittest
+from types import ModuleType
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from qmt_follower.adapters.qmt import QmtBrokerAdapter
-from qmt_follower.models import Action, BrokerOrderStatus, OrderSnapshot, TradeSignal
+from miniqmt_follower.adapters.qmt import QmtBrokerAdapter
+from miniqmt_follower.config import TradingConfig
+from miniqmt_follower.models import (
+    Action,
+    BrokerOrderRejected,
+    BrokerOrderStatus,
+    BrokerRejectionKind,
+    BrokerSubmissionUncertain,
+    OrderSnapshot,
+    TradeSignal,
+)
 
 
 class _BlockingTrader:
@@ -52,7 +64,215 @@ class _CancelTrader:
         return 0
 
 
+class _OrdersTrader:
+    def __init__(self, orders):
+        self.orders = orders
+
+    def query_stock_orders(self, _account):
+        return self.orders
+
+
+class _RejectedTrader:
+    @staticmethod
+    def order_stock(*_args):
+        return -1
+
+
+class _ExplodingTrader:
+    @staticmethod
+    def order_stock(*_args):
+        raise ConnectionError("QMT connection dropped")
+
+
+class _CallbackBase:
+    pass
+
+
+class _InitTrader:
+    last_instance = None
+
+    def __init__(self, _path, _session_id):
+        self.callback = None
+        _InitTrader.last_instance = self
+
+    def register_callback(self, callback):
+        self.callback = callback
+
+    @staticmethod
+    def start():
+        return None
+
+    @staticmethod
+    def connect():
+        return 0
+
+    @staticmethod
+    def subscribe(_account):
+        return 0
+
+
 class QmtAdapterConcurrencyTests(unittest.TestCase):
+    def test_constructor_registers_lightweight_order_error_callback(self):
+        xtconstant = ModuleType("xtquant.xtconstant")
+        xtconstant.FIX_PRICE = 11
+        xtconstant.STOCK_BUY = 23
+        xtconstant.STOCK_SELL = 24
+        xttrader = ModuleType("xtquant.xttrader")
+        xttrader.XtQuantTrader = _InitTrader
+        xttrader.XtQuantTraderCallback = _CallbackBase
+        xttype = ModuleType("xtquant.xttype")
+        xttype.StockAccount = lambda account_id: SimpleNamespace(account_id=account_id)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "xtquant.xtconstant": xtconstant,
+                "xtquant.xttrader": xttrader,
+                "xtquant.xttype": xttype,
+            },
+        ):
+            adapter = QmtBrokerAdapter(
+                TradingConfig(
+                    enabled=True,
+                    account_id="test-account",
+                    miniqmt_path="C:/test/userdata_mini",
+                    session_id=7,
+                )
+            )
+
+        callback = _InitTrader.last_instance.callback
+        self.assertIsNotNone(callback)
+        callback.on_order_error(
+            SimpleNamespace(
+                order_id=-1,
+                error_id=110001,
+                error_msg="委托价不正确",
+                order_remark="sig-from-callback",
+            )
+        )
+        cached = adapter._take_order_error_by_remark(
+            "sig-from-callback", wait_timeout=0,
+        )
+        self.assertEqual(cached.reason, "委托价不正确")
+
+    def test_rejected_order_snapshot_preserves_status_message_and_classification(self):
+        trader = _OrdersTrader(
+            [
+                SimpleNamespace(
+                    order_id=123456,
+                    order_status=57,
+                    traded_volume=0,
+                    status_msg="委托价不正确",
+                )
+            ]
+        )
+        adapter = self._build_adapter(trader)
+
+        adapter._refresh_orders_cache()
+
+        snapshot = adapter._orders_cache["123456"]
+        self.assertEqual(snapshot.status, BrokerOrderStatus.REJECTED)
+        self.assertEqual(snapshot.rejection_reason, "委托价不正确")
+        self.assertEqual(snapshot.rejection_kind, BrokerRejectionKind.PRICE)
+
+    def test_rejected_snapshot_uses_callback_error_when_status_message_is_empty(self):
+        trader = _OrdersTrader(
+            [
+                SimpleNamespace(
+                    order_id=123456,
+                    order_status=57,
+                    traded_volume=0,
+                    status_msg="",
+                )
+            ]
+        )
+        adapter = self._build_adapter(trader)
+        adapter._cache_order_error(
+            SimpleNamespace(
+                order_id=123456,
+                error_id=110001,
+                error_msg="委托价不正确",
+                order_remark="concurrency-test",
+            )
+        )
+
+        adapter._refresh_orders_cache()
+
+        snapshot = adapter._orders_cache["123456"]
+        self.assertEqual(snapshot.rejection_reason, "委托价不正确")
+        self.assertEqual(snapshot.rejection_code, "110001")
+        self.assertEqual(snapshot.rejection_kind, BrokerRejectionKind.PRICE)
+
+    def test_negative_order_id_uses_callback_reason_as_confirmed_rejection(self):
+        adapter = self._build_adapter(_RejectedTrader())
+        adapter._cache_order_error(
+            SimpleNamespace(
+                order_id=-1,
+                error_id=110001,
+                error_msg="订单价格超出范围",
+                order_remark="concurrency-test",
+            )
+        )
+
+        with self.assertRaises(BrokerOrderRejected) as raised:
+            adapter.submit_order(self._signal(), 100, 1.26)
+
+        self.assertEqual(raised.exception.reason, "订单价格超出范围")
+        self.assertEqual(raised.exception.error_code, "110001")
+        self.assertEqual(raised.exception.kind, BrokerRejectionKind.PRICE)
+        self.assertEqual(adapter._orders_cache, {})
+
+    def test_negative_order_id_without_callback_is_unknown_confirmed_rejection(self):
+        adapter = self._build_adapter(_RejectedTrader())
+
+        with self.assertRaises(BrokerOrderRejected) as raised:
+            adapter.submit_order(self._signal(), 100, 1.26)
+
+        self.assertEqual(raised.exception.kind, BrokerRejectionKind.UNKNOWN)
+        self.assertIn("returned -1", raised.exception.reason)
+
+    def test_order_stock_exception_is_submission_uncertain(self):
+        adapter = self._build_adapter(_ExplodingTrader())
+
+        with self.assertRaises(BrokerSubmissionUncertain) as raised:
+            adapter.submit_order(self._signal(), 100, 1.26)
+
+        self.assertIn("QMT connection dropped", str(raised.exception))
+
+    def test_order_error_callback_cache_does_not_wait_for_trading_lock(self):
+        trader = _BlockingTrader("asset")
+        adapter = self._build_adapter(trader)
+        errors = []
+        query_thread = threading.Thread(
+            target=self._run,
+            args=(adapter.query_available_cash, errors),
+        )
+        query_thread.start()
+        self.assertTrue(trader.query_entered.wait(timeout=1.0))
+
+        callback_finished = threading.Event()
+
+        def cache_error():
+            adapter._cache_order_error(
+                SimpleNamespace(
+                    order_id=-1,
+                    error_id=1,
+                    error_msg="委托价不正确",
+                    order_remark="concurrency-test",
+                )
+            )
+            callback_finished.set()
+
+        callback_thread = threading.Thread(target=cache_error)
+        callback_thread.start()
+        completed_while_query_active = callback_finished.wait(timeout=0.1)
+        trader.release_query.set()
+        query_thread.join(timeout=1.0)
+        callback_thread.join(timeout=1.0)
+
+        self.assertTrue(completed_while_query_active)
+        self.assertEqual(errors, [])
+
     def test_position_is_queried_fresh_for_every_call(self):
         trader = _PositionTrader("517110.SH", 13700)
         adapter = self._build_adapter(trader)
@@ -128,6 +348,9 @@ class QmtAdapterConcurrencyTests(unittest.TestCase):
         adapter._positions_cache_time = 0.0
         adapter._orders_cache = {}
         adapter._orders_cache_time = 0.0
+        adapter._order_error_lock = threading.Lock()
+        adapter._order_errors_by_remark = {}
+        adapter._order_errors_by_id = {}
         return adapter
 
     @staticmethod
