@@ -112,6 +112,14 @@ def _validated_sell_half_insufficient_lot_mode(raw_value: object) -> str:
     return mode
 
 
+def _validated_signal_expire_seconds(raw_value: object) -> int:
+    """校验信号过期秒数; 0 表示不过期。"""
+    seconds = int(raw_value)
+    if seconds < 0:
+        raise ValueError(f"execution.signal_expire_seconds 不能为负数: {raw_value!r}")
+    return seconds
+
+
 def load_config(path: str | Path) -> RuntimeConfig:
     """从 YAML 配置文件加载运行参数。
 
@@ -199,6 +207,9 @@ def load_config(path: str | Path) -> RuntimeConfig:
             ),
             sell_half_insufficient_lot_mode=_validated_sell_half_insufficient_lot_mode(
                 execution_raw.get("sell_half_insufficient_lot_mode", "sell_all")
+            ),
+            signal_expire_seconds=_validated_signal_expire_seconds(
+                execution_raw.get("signal_expire_seconds", 600)
             ),
         ),
         trading=TradingConfig(

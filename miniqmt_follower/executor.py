@@ -335,35 +335,20 @@ class OrderExecutionEngine:
                 signal, amount=resolved, quantity_mode="exact", budget_group_size=None,
             )
 
-        if signal.expire_at:
-            try:
-                expire_at = dt.datetime.strptime(signal.expire_at, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
+        expire_status = self._signal_expiry_status(signal)
+        if expire_status is not None:
+            status, message = expire_status
+            if status == ExecutionStatus.FAILED_RISK:
                 logger.error(
                     "%s | %s | 过期时间非法 %r | 未下单",
                     signal.console_event("失败"), code_label, signal.expire_at,
                 )
-                return self._finish(
-                    signal,
-                    ExecutionStatus.FAILED_RISK,
-                    0,
-                    0,
-                    "invalid expire_at: %s" % signal.expire_at,
-                )
-            now = dt.datetime.now()
-            if now > expire_at:
-                overdue_sec = (now - expire_at).total_seconds()
+            else:
                 logger.warning(
-                    "%s | %s | 截止 %s | 已过期 %.1fs | 未下单",
-                    signal.console_event("过期"), code_label, signal.expire_at, overdue_sec,
+                    "%s | %s | %s | 未下单",
+                    signal.console_event("过期"), code_label, message,
                 )
-                return self._finish(
-                    signal,
-                    ExecutionStatus.EXPIRED,
-                    0,
-                    0,
-                    "signal expired at %s" % signal.expire_at,
-                )
+            return self._finish(signal, status, 0, 0, message)
 
         # 上一笔订单撤单终态不明确时，禁止任何后续信号继续触达券商。
         halt_reason = self._current_trading_halt_reason()
@@ -760,6 +745,44 @@ class OrderExecutionEngine:
             )
         raise ValueError(f"invalid quantity_mode: {signal.quantity_mode}")
 
+    def _signal_expiry_status(
+        self, signal: TradeSignal
+    ) -> tuple[ExecutionStatus, str] | None:
+        """返回 (终态, 原因) 或 None。
+
+        旧协议 expire_at(绝对时间字符串)优先兼容；新机制按
+        sent_at_ms + execution.signal_expire_seconds 计算截止时间。
+        sent_at_ms 缺失或配置为 0 时不做过期判断。
+        """
+        if signal.expire_at:
+            try:
+                expire_at = dt.datetime.strptime(
+                    signal.expire_at, "%Y-%m-%d %H:%M:%S"
+                )
+            except ValueError:
+                return (
+                    ExecutionStatus.FAILED_RISK,
+                    "invalid expire_at: %s" % signal.expire_at,
+                )
+            if dt.datetime.now() > expire_at:
+                return (
+                    ExecutionStatus.EXPIRED,
+                    "signal expired at %s" % signal.expire_at,
+                )
+            return None
+
+        seconds = self.config.signal_expire_seconds
+        if seconds and signal.sent_at_ms is not None:
+            deadline_ms = signal.sent_at_ms + int(seconds) * 1000
+            now_ms = int(dt.datetime.now().timestamp() * 1000)
+            if now_ms > deadline_ms:
+                overdue_ms = now_ms - deadline_ms
+                return (
+                    ExecutionStatus.EXPIRED,
+                    "signal expired: sent_at_ms=%s + %ss (overdue %sms)"
+                    % (signal.sent_at_ms, seconds, overdue_ms),
+                )
+        return None
     def _wait_for_terminal_or_timeout(
         self,
         order_id: str,

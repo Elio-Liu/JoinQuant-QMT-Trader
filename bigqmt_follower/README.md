@@ -48,6 +48,8 @@ CONFIG = {
     "max_single_position_pct": 0.2,
     # sell_half 半仓不足一手(<200股): sell_all=全卖(默认) / skip=跳过不卖。
     "sell_half_insufficient_lot_mode": "sell_all",
+    # 信号过期秒数: sent_at_ms + 该值; 0=不过期; 旧 expire_at 优先兼容。
+    "signal_expire_seconds": 600,
     # 其余定价、超时和重试参数见源码顶部。
 }
 ```
@@ -93,7 +95,7 @@ Redis监听已启动 stream=... group=... consumer=...
 - 涨停排队买单被废单（非硬拒单）时刷新行情与资金后重新排队，最多到 `max_attempts`（与 miniQMT 一致）；硬拒单立即终止。
 - 撤单状态无法确认时熔断；熔断后的活动单与后续信号都以失败终态记录并 ACK，恢复时凭 QMT 委托与日志人工对账。
 - 交易信号达到明确终态后才 `XACK`。
-- 带 `expire_at` 的交易信号在到达对应方向 FIFO 队首时校验；过期或格式非法时不调用交易接口，记录终态并 ACK。没有该字段的旧信号继续执行。
+- 信号过期由 `signal_expire_seconds`（默认 600 秒，即 10 分钟）决定：按 `sent_at_ms` + 配置值在 FIFO 队首校验，过期或格式非法时不调用交易接口，记录终态并 ACK；旧协议自带 `expire_at` 的消息仍优先按该绝对时间判断，`sent_at_ms` 缺失或配置 0 则不过期。
 - 不再支持预约执行；历史消息中的 `execute_at` 会被忽略，未过期信号到达队首后立即提交。
 
 09:25–09:30 收到的卖出信号会立即调用 `passorder`。该时段交易所不接收买卖申报，委托能否由大 QMT/券商柜台接收并暂存到 09:30，必须在目标券商仿真环境确认；买入信号在盘前窗口内排队等待，09:30 后才提交。

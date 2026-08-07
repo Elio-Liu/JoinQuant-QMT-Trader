@@ -50,7 +50,9 @@
 - XADD 成功只表示 Redis 已收到信号，不代表 Windows 端已经下单或成交。
 - signal_id 是执行端幂等键：同一秒、同一策略、同一代码、同一方向、同一数量
   会生成相同 id，重复投递会被执行端去重（同一秒两笔独立订单需自行改 id）。
-- expire_at 默认 20 秒：信号到达执行端队首时过期会直接终态并 ACK，不下单。
+- 信号过期由执行端配置 execution.signal_expire_seconds 决定：执行端按
+  sent_at_ms（发送时刻毫秒时间戳）+ 配置秒数判断，到点仍未开始执行就
+  直接终态并 ACK，不下单。发送端只附带发送时刻，不写死过期时间。
 - execute_at 已废弃：执行端收到未过期信号后立即执行，不再等待预约时间。
 - reference_price 只作审计/日志参考，执行端始终按实时行情重新定价。
 """
@@ -70,7 +72,6 @@ SIGNAL_REDIS_CONFIG = {
     "socket_connect_timeout": 1,
 }
 SIGNAL_STRATEGY_ID = "hunter"        # 与 Windows 端白名单 allowed_strategy_ids 对应
-SIGNAL_EXPIRE_SECONDS = 20           # 信号从发送起的有效秒数
 SIGNAL_MAX_LIVE_LAG_SECONDS = 600    # context 时间与系统时间差超过它视为回测
 
 
@@ -167,9 +168,6 @@ def publish_trade_signal_to_redis(context, action, code, amount, price):
             "amount": amount,
             "reference_price": float(price),
             "created_at": context_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "expire_at": (now + dt.timedelta(seconds=SIGNAL_EXPIRE_SECONDS)).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
             "nonce": uuid.uuid4().hex[:8],
             "sent_at_ms": int(now.timestamp() * 1000),
         }

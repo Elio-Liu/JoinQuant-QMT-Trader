@@ -63,6 +63,9 @@ execution:
   # sell_half 意图信号在半仓取整不足一手（<200股）时的处理：
   #   sell_all=全卖当前持仓（默认） / skip=跳过不卖。
   sell_half_insufficient_lot_mode: "sell_all"
+  # 信号过期秒数：执行端按聚宽发送时刻（sent_at_ms）+ 该值判断是否过期，
+  # 到点仍未开始执行的信号直接终态并 ACK，不下单；0=不过期。
+  signal_expire_seconds: 600
 
 market_data:
   # 启动时预订阅的聚宽格式代码列表。harvester 每日 09:26 会推送当日股票池+持仓，

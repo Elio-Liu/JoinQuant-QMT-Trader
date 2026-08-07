@@ -127,7 +127,7 @@ Signals are JSON objects written to Redis Stream (message field `payload`). The 
 
 - `reference_price` is the strategy's opinion, **not** the final order price — the Windows side always reprices from the live quote. Nothing gates on it: the deviation guard that used to reject orders straying too far from it was removed, because a rejected order forks live holdings away from the JoinQuant paper portfolio permanently and nothing re-sends it. It survives purely as an audit/log field.
 - `mode` distinguishes live vs backtest; backtest signals are silently dropped by the sender.
-- `expire_at` is checked when a signal reaches the head of its side-specific execution queue; expired or malformed signals are finalized without broker submission. `nonce` remains an audit-only field. `from_dict` also accepts legacy field names `price` and `timestamp`.
+- Signal expiry is driven by `sent_at_ms + execution.signal_expire_seconds` (default 600s / 10 minutes, `0` disables), checked when a signal reaches the head of its side-specific execution queue / starts executing; expired or malformed signals are finalized without broker submission. The legacy `expire_at` absolute-time field is still honored first when present. `nonce` remains an audit-only field. `from_dict` also accepts legacy field names `price` and `timestamp`.
 - `execute_at` is no longer part of the live contract. Historical payloads containing it remain parseable because unknown keys are ignored, but they execute immediately when otherwise valid and unexpired.
 - `sent_at_ms` (epoch milliseconds at send time) feeds the latency instrumentation: the consumer logs transport latency on receipt and end-to-end latency at terminal state. Optional — old signals without it just skip those log fields. Only meaningful when both machines are NTP-synced.
 - Default `signal_id` = `strategy_id + time + code + action + amount`, so two identical orders in the same second collide — a deliberate dedupe property.
@@ -158,6 +158,7 @@ Copy `config.example.yaml` to `config.yaml`. Password supports `${ENV_VAR}` synt
 - `limit_down_sell_mode` / `limit_up_buy_mode` — `"queue"` (park at the limit price until `queue_sell_deadline` / `queue_buy_deadline`, default 14:56:30), `"skip"`, or `"none"`; `"queue"` holds one of the `max_concurrent_queue_sells` / `max_concurrent_queue_buys` slots, which must stay below the worker count
 - `plan_enabled` / `plan_execute_at` / `max_single_position_pct` — daily-plan handling (default enabled, executes at 09:30:00 local time) and the per-stock auto-buy cap (total assets × pct, default 0.2)
 - `sell_half_insufficient_lot_mode` — `"sell_all"` (default; a sell-half whose rounded half is below one lot sells the whole position) or `"skip"` (resolves to 0 and ends as `SKIPPED_SMALL_POSITION` without an order)
+- `signal_expire_seconds` — seconds after `sent_at_ms` after which a not-yet-started signal is finalized as `EXPIRED` (default 600 / 10 minutes; `0` disables expiry; legacy `expire_at` still wins when present)
 - `poll_interval_sec` — steady-state order polling interval
 - `pricing_mode` — `"slippage"` (default: last price ± slippage) or `"book"` (buy at ask1 + `book_tick_offset` ticks, sell at bid1 − offset; falls back to slippage when that book side is empty, e.g. limit-up/down)
 

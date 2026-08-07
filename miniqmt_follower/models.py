@@ -295,6 +295,9 @@ class ExecutionConfig:
     #   "sell_all" — 全卖当前持仓(默认, 原行为)
     #   "skip"     — 不卖, 记 SKIPPED_SMALL_POSITION 终态
     sell_half_insufficient_lot_mode: str = "sell_all"
+    # 信号过期秒数: 执行端按 sent_at_ms(发送时刻毫秒) + 该值判断是否已过期;
+    # 0 = 不过期。旧协议 expire_at 绝对时间字段仍优先兼容。
+    signal_expire_seconds: int = 600
 
     def effective_limit_down_sell_mode(self) -> str:
         """归一化跌停卖出模式; 缺省时由旧开关 skip_sell_when_limit_down 推导。"""

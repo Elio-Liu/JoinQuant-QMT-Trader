@@ -58,6 +58,9 @@ CONFIG = {
     "max_single_position_pct": 0.2,
     # sell_half 半仓取整不足一手(<200股)时的处理: sell_all=全卖(默认) / skip=跳过不卖。
     "sell_half_insufficient_lot_mode": "sell_all",
+    # 信号过期秒数: 按 sent_at_ms(发送时刻毫秒) + 该值判断; 0=不过期。
+    # 旧协议 expire_at 绝对时间字段仍优先兼容。
+    "signal_expire_seconds": 600,
 }
 
 # 竞价排队时段: 9:15~9:30 提交的委托都要等 9:30 连续竞价才可能成交。
@@ -210,16 +213,27 @@ def parse_stream_message(message_id, fields):
     return {"kind": "trade", "message_id": str(message_id), "signal": signal}
 
 
-def signal_expiration_status(signal, now_epoch):
+def signal_expiration_status(signal, now_epoch, expire_seconds=0):
+    """返回 None / "EXPIRED" / "FAILED_RISK"。
+
+    旧协议 expire_at(绝对时间字符串)优先兼容；新机制按
+    sent_at_ms + expire_seconds 计算截止时间。sent_at_ms 缺失或
+    expire_seconds<=0 时不做过期判断。
+    """
     expire_at = signal.get("expire_at")
-    if not expire_at:
+    if expire_at:
+        try:
+            deadline = datetime.datetime.strptime(expire_at, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return "FAILED_RISK"
+        if now_epoch > time.mktime(deadline.timetuple()):
+            return "EXPIRED"
         return None
-    try:
-        deadline = datetime.datetime.strptime(expire_at, "%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError):
-        return "FAILED_RISK"
-    if now_epoch > time.mktime(deadline.timetuple()):
-        return "EXPIRED"
+    seconds = int(expire_seconds or 0)
+    sent_at_ms = signal.get("sent_at_ms")
+    if seconds > 0 and sent_at_ms is not None:
+        if now_epoch * 1000 > int(sent_at_ms) + seconds * 1000:
+            return "EXPIRED"
     return None
 
 
@@ -987,7 +1001,11 @@ class BigQmtRuntime(object):
             signal["quantity_mode"] = "exact"
             _log("INFO", "实盘计算数量 %s=%s股" % (quantity_mode, resolved))
 
-        expiration_status = signal_expiration_status(signal, self.clock())
+        expiration_status = signal_expiration_status(
+            signal,
+            self.clock(),
+            self.config.get("signal_expire_seconds", 600),
+        )
         if expiration_status is not None:
             level = "ERROR" if expiration_status == "FAILED_RISK" else "WARNING"
             _log(
@@ -1529,6 +1547,8 @@ def validate_config(config):
     ).strip().lower()
     if half_mode not in ("sell_all", "skip"):
         raise RuntimeError("CONFIG.sell_half_insufficient_lot_mode 必须是 sell_all 或 skip")
+    if int(config.get("signal_expire_seconds", 600)) < 0:
+        raise RuntimeError("CONFIG.signal_expire_seconds 不能为负数")
 
 
 def init(ContextInfo):
