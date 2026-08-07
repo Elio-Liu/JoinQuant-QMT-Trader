@@ -20,11 +20,17 @@ class RedisConfig:
     stream: str
     group: str
     consumer: str
-    block_ms: int = 20
+    block_ms: int = 1000
     # strategy_id 白名单: 非空时只执行名单内策略的信号, 其余记日志后直接 ACK。
     # Stream 是多策略共享的, 只推进部分策略实盘时用它挡住其余策略的历史/测试信号。
     # 空元组 = 不过滤 (兼容旧配置)。
     allowed_strategy_ids: tuple[str, ...] = ()
+    # —— 跨网络部署的连接健壮性参数 ——
+    socket_connect_timeout_sec: float = 3.0
+    # 读超时 = block_ms + 该余量。必须大于 BLOCK 时长, 否则阻塞读被自己的超时掐断。
+    socket_timeout_margin_sec: float = 5.0
+    # redis-py 定期 PING 探活间隔, 用于发现 TCP 还在但对端已消失的"半死连接"。
+    health_check_interval_sec: int = 30
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,34 @@ def _validated_max_single_position_pct(raw_value: object) -> float:
     return pct
 
 
+def _validated_pricing_mode(raw_value: object) -> str:
+    """校验定价模式。写错任何值都静默回退 slippage 是很贵的误会 —— 开盘时会用
+    完全不同的定价逻辑, 而日志里没有任何提示, 所以这里必须硬校验。"""
+    mode = str(raw_value or "slippage").strip().lower()
+    if mode not in {"slippage", "book"}:
+        raise ValueError(
+            f'execution.pricing_mode 取值非法: {raw_value!r} (允许: "slippage" / "book")'
+        )
+    return mode
+
+
+def _resolve_env_placeholder(value: object) -> object:
+    """把 "${ENV_NAME}" 形式的值替换成环境变量内容; 其余原样返回。"""
+    if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        return os.environ.get(value[2:-1])
+    return value
+
+
+def _validated_cash_fee_buffer_pct(raw_value: object) -> float:
+    """校验买入资金的手续费缓冲比例, 允许 [0, 0.05)。"""
+    pct = float(raw_value)
+    if not (0.0 <= pct < 0.05):
+        raise ValueError(
+            f"execution.cash_fee_buffer_pct 必须位于 [0, 0.05): {raw_value!r}"
+        )
+    return pct
+
+
 def _validated_sell_half_insufficient_lot_mode(raw_value: object) -> str:
     """校验 sell_half 半仓不足一手时的处理模式。"""
     mode = str(raw_value or "sell_all").strip().lower()
@@ -137,10 +171,8 @@ def load_config(path: str | Path) -> RuntimeConfig:
     execution_raw = raw.get("execution", {})
     trading_raw = raw.get("trading", {})
     market_data_raw = raw.get("market_data", {})
-    password = redis_raw.get("password")
     # 例如 "${REDIS_PASSWORD}" 会读取环境变量 REDIS_PASSWORD。
-    if isinstance(password, str) and password.startswith("${") and password.endswith("}"):
-        password = os.environ.get(password[2:-1])
+    password = _resolve_env_placeholder(redis_raw.get("password"))
 
     # 配置文件缺省时使用保守默认值, 方便先跑通 MVP。
     return RuntimeConfig(
@@ -151,9 +183,18 @@ def load_config(path: str | Path) -> RuntimeConfig:
             stream=str(redis_raw.get("stream", "tidal_quant_signals")),
             group=str(redis_raw.get("group", "qmt_executors")),
             consumer=str(redis_raw.get("consumer", "win-qmt-01")),
-            block_ms=int(redis_raw.get("block_ms", 20)),
+            block_ms=int(redis_raw.get("block_ms", 1000)),
             allowed_strategy_ids=tuple(
                 str(sid) for sid in redis_raw.get("allowed_strategy_ids", []) or []
+            ),
+            socket_connect_timeout_sec=float(
+                redis_raw.get("socket_connect_timeout_sec", 3.0)
+            ),
+            socket_timeout_margin_sec=float(
+                redis_raw.get("socket_timeout_margin_sec", 5.0)
+            ),
+            health_check_interval_sec=int(
+                redis_raw.get("health_check_interval_sec", 30)
             ),
         ),
         execution=ExecutionConfig(
@@ -166,7 +207,9 @@ def load_config(path: str | Path) -> RuntimeConfig:
                 execution_raw.get("cancel_confirm_timeout_sec", 30.0)
             ),
             poll_interval_sec=float(execution_raw.get("poll_interval_sec", 0.2)),
-            pricing_mode=str(execution_raw.get("pricing_mode", "slippage")),
+            pricing_mode=_validated_pricing_mode(
+                execution_raw.get("pricing_mode", "slippage")
+            ),
             book_tick_offset=int(execution_raw.get("book_tick_offset", 2)),
             auction_aggressive_pct=float(
                 execution_raw.get("auction_aggressive_pct", 0.02)
@@ -203,7 +246,10 @@ def load_config(path: str | Path) -> RuntimeConfig:
                 execution_raw.get("plan_execute_at", "09:30:00")
             ),
             max_single_position_pct=_validated_max_single_position_pct(
-                execution_raw.get("max_single_position_pct", 0.2)
+                execution_raw.get("max_single_position_pct", 0.5)
+            ),
+            cash_fee_buffer_pct=_validated_cash_fee_buffer_pct(
+                execution_raw.get("cash_fee_buffer_pct", 0.003)
             ),
             sell_half_insufficient_lot_mode=_validated_sell_half_insufficient_lot_mode(
                 execution_raw.get("sell_half_insufficient_lot_mode", "sell_all")

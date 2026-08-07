@@ -2,14 +2,23 @@
 
 redis:
   # Redis Stream 配置。聚宽侧用 XADD 写入 stream，Windows 端用 consumer group 消费。
-  host: YOUR_REDIS_HOST # Redis 服务地址；实盘建议使用内网、VPN 或安全组白名单。
-  port: 6379 # Redis 端口。
-  password: ${REDIS_PASSWORD} # 本地无密码 Redis 可改为 null。
+  host: YOUR_REDIS_HOST # 独立 Redis 服务器地址；同 VPC 内优先填内网 IP。
+  port: 6380 # 非默认端口能挡掉绝大多数自动化扫描；须与 redis.conf 一致。
+  password: ${REDIS_PASSWORD} # 走环境变量，凭据不进版本库。
   stream: tidal_quant_signals # 必须与聚宽侧函数里的 stream 保持一致。
   group: qmt_executors # 消费组名称。同一账户严禁多端（会重复下单）；多台交易机（多账户）
                        # 时每台必须用不同 group：每个 group 独立拿到 Stream 完整副本。
   consumer: win-qmt-01 # 当前执行器名称，组内唯一；多机建议按机命名（win-qmt-02...）。
-  block_ms: 20 # 10-50ms 响应较快；数值越小 CPU 空轮询越多。
+  # 阻塞读时长。Redis 的 BLOCK 是服务端推送：调大不增加收信延迟，只减少空轮询
+  # （20ms 相当于每台每秒 50 次网络往返，跨网络部署是纯浪费）。
+  # ACK 由任务完成回调驱动，不依赖这里的节奏。
+  block_ms: 1000
+  # 跨网络连接健壮性。只设 socket_connect_timeout 挡不住"半死连接"
+  # （TCP 还在、对端已消失），那种情况下 xreadgroup 会永久挂起，
+  # 进程既不报错也不干活。实际读超时 = block_ms/1000 + margin，必须大于 BLOCK。
+  socket_connect_timeout_sec: 3
+  socket_timeout_margin_sec: 5
+  health_check_interval_sec: 30
   # strategy_id 白名单：非空时只执行名单内策略的信号，其余记日志后直接 ACK。
   # Stream 是多策略共享的；只推进 harvester 实盘时务必启用，挡住其他策略的信号。
   allowed_strategy_ids: ["harvester"]
@@ -59,7 +68,16 @@ execution:
   plan_enabled: true               # 日计划执行开关；无 plan 消息时不影响旧协议。
   plan_execute_at: "09:30:00"      # plan 执行时刻（交易机本地时间，HH:MM:SS）。
   # 单票买入金额上限 = 当前账户总资产（现金+股票市值）× 该比例；0~1 小数，5 只等权推荐 0.2。
-  max_single_position_pct: 0.2
+  # 单票买入金额上限 = 总资产（现金+股票市值）× 该比例，取值 (0, 1]。
+  # 这是单票集中度风控，不是等分逻辑的一部分：等分负责把资金摊到几只票上，
+  # 它负责无论摊给几只、单票都不能太重。目标股 ≥3 只时 可用资金/N 天然低于它、
+  # 不会生效；只有 1~2 只时才真正咬合 —— 而那恰恰是最需要它的场景
+  # （满仓押一只连板股，当天高开跳水就是一次不可接受的回撤）。
+  max_single_position_pct: 0.5
+  # 买入资金的手续费缓冲：委托金额上限按 可用资金×(1-该值) 计算。
+  # 不留缓冲时"用满可用资金"的委托会被柜台以资金不足废单，而重试拿到的是同一个
+  # 报价 —— max_attempts 次尝试会全烧在同一笔必然失败的委托上。
+  cash_fee_buffer_pct: 0.003
   # sell_half 意图信号在半仓取整不足一手（<200股）时的处理：
   #   sell_all=全卖当前持仓（默认） / skip=跳过不卖。
   sell_half_insufficient_lot_mode: "sell_all"

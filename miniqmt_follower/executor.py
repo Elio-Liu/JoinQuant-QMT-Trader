@@ -30,7 +30,7 @@ from miniqmt_follower.models import (
 )
 from miniqmt_follower.opening import is_preopen_sell
 from miniqmt_follower.pricing import calculate_order_price, tick_size_for
-from miniqmt_follower.sizing import resolve_auto_buy, resolve_sell_all, resolve_sell_half
+from miniqmt_follower.sizing import resolve_sell_all, resolve_sell_half, shares_for_budget
 from miniqmt_follower.store import SQLiteExecutionStore
 
 logger = logging.getLogger(__name__)
@@ -211,6 +211,20 @@ def _seconds_until_queue_buy_deadline(deadline_hhmmss: str) -> float:
     return max(0.0, (deadline_dt - now).total_seconds())
 
 
+def _budget_batch_key(signal: TradeSignal) -> str:
+    """从派生买单 id 还原它所属的批次标识。
+
+    PlanExecutor 生成的 id 形如 "<plan_id>-buy-<code>"; 去掉尾部即同一份日计划
+    展开出来的所有买单共享的 key。不符合该形态(旧协议单发买单)时返回空串,
+    表示不参与批次预算闩锁, 保持每条各自计算的原行为。
+    """
+    marker = f"-{Action.BUY.value}-"
+    head, sep, _tail = signal.signal_id.rpartition(marker)
+    if not sep or not head:
+        return ""
+    return head
+
+
 # ---------------------------------------------------------------------------
 # 执行引擎
 # ---------------------------------------------------------------------------
@@ -249,6 +263,38 @@ class OrderExecutionEngine:
         self._queue_buy_lock = threading.Lock()
         self._active_queue_buys = 0
         self._buy_cash_submit_lock = threading.Lock()
+        # auto_buy 预算闩锁: 同一批派生买单只在第一条进来时快照一次资金,
+        # 兄弟信号复用同一个绝对预算。否则分母固定为 N 而分子(可用资金)随
+        # 兄弟报单递减, "等分可用资金"会退化成公比 (N-1)/N 的等比数列 ——
+        # 5 只票只投得出约 67% 的资金, 且分配顺序随线程调度每天都不一样。
+        self._budget_lock = threading.Lock()
+        self._budget_cache: dict[str, float] = {}
+
+    def _per_stock_budget(self, signal: TradeSignal) -> float:
+        """取得(或首次快照并缓存)同一批 auto_buy 的单票预算。
+
+        闩锁的 key 用派生信号 id 去掉 "-buy-<code>" 后缀得到的批次标识,
+        同一个 plan 展开出来的买单共用一份预算快照。拿不到批次标识(旧协议
+        单发买单)时退化为每条各自计算, 与原行为一致。
+        """
+        batch_key = _budget_batch_key(signal)
+        with self._budget_lock:
+            cached = self._budget_cache.get(batch_key) if batch_key else None
+            if cached is not None:
+                return cached
+            available_cash = self.broker.query_available_cash()
+            total_assets = self.broker.query_total_assets()
+            budget = min(
+                available_cash / max(signal.budget_group_size or 1, 1),
+                total_assets * self.config.max_single_position_pct,
+            )
+            if batch_key:
+                self._budget_cache[batch_key] = budget
+                logger.info(
+                    "【买单】💰 批次预算已锁定 | %s | 可用 %.2f ÷ %s 只 | 单票 %.2f",
+                    batch_key, available_cash, signal.budget_group_size or 1, budget,
+                )
+            return budget
 
     def execute(self, signal: TradeSignal) -> ExecutionResult:
         # 延迟打点起点: 从工作线程真正开始处理这条信号算起。
@@ -384,7 +430,7 @@ class OrderExecutionEngine:
                 "%s | %s | 距开盘 %.0f秒 | 委托排队等待撮合",
                 signal.console_event("竞价"), code_label, auction_extra,
             )
-        while remaining_qty > 0 and attempts < self.config.max_attempts:
+        while remaining_qty > 0 and attempts < self._effective_max_attempts():
             # 总时长限制
             elapsed = time.monotonic() - started
             if elapsed > self.config.max_total_duration_sec + auction_extra:
@@ -414,8 +460,22 @@ class OrderExecutionEngine:
                     and quote.bid1 is None
                     and self.config.effective_limit_down_sell_mode() == "queue"
                 ):
-                    return self._queue_sell_at_limit_down(
-                        signal, quote, remaining_qty, total_filled, attempts,
+                    # 取不到跌停价时既无法确认是否真跌停, 也无法安全定价
+                    # (单边盘口下滑点定价会报到跌停价以下被交易所废单),
+                    # 交给 _queue_sell_at_limit_down 内部走保守的降级跳过。
+                    # 拿得到跌停价时, 必须确认价格真的贴在跌停上才进排队 ——
+                    # 否则一次普通的买一档缺失就会把清仓单挂成跌停价并锁死
+                    # 一个排队 worker 到 14:56:30 且全天不重新定价。
+                    if quote.low_limit is None or quote.low_limit <= 0 or (
+                        self._is_confirmed_limit_down(signal, quote)
+                    ):
+                        return self._queue_sell_at_limit_down(
+                            signal, quote, remaining_qty, total_filled, attempts,
+                        )
+                    logger.info(
+                        "%s | %s | 买一无档但价格未触及跌停(最新 %.3f vs 跌停 %.3f) | 走常规定价",
+                        signal.console_event("重试"), code_label,
+                        quote.last_price, quote.low_limit,
                     )
 
                 # ---- 涨停锁盘买单: 挂涨停价全天保留队列位置 ----
@@ -538,9 +598,7 @@ class OrderExecutionEngine:
                     signal.console_event("重试"), code_label, attempts,
                     exc.kind.value, exc.reason,
                 )
-                retry_delay = min(self.config.poll_interval_sec, 0.05)
-                if retry_delay > 0:
-                    time.sleep(retry_delay)
+                self._sleep_before_retry()
                 continue
             except BrokerSubmissionUncertain as exc:
                 attempts = attempt_no
@@ -682,9 +740,7 @@ class OrderExecutionEngine:
                     rejection_kind.value, rejection_reason, total_filled, target_qty,
                     remaining_qty,
                 )
-                retry_delay = min(self.config.poll_interval_sec, 0.05)
-                if retry_delay > 0:
-                    time.sleep(retry_delay)
+                self._sleep_before_retry()
                 continue
 
             # ---- 本笔订单已终态但信号仍有剩余，下一轮重新查资源和行情 ----
@@ -723,6 +779,39 @@ class OrderExecutionEngine:
     # 内部方法
     # -------------------------------------------------------------------
 
+    def _effective_max_attempts(self) -> int:
+        """竞价时段放宽尝试次数上限。
+
+        盘前(9:15~9:30)柜台若拒收申报, 每次拒单都消耗一次 attempt。原先固定
+        0.05 秒退避配 max_attempts=20, 意味着 20 次尝试在 1 秒内烧光 —— 09:28
+        提交的开盘清仓单在距开盘还有 119 秒时就已经放弃, 而卖单一进终态就会
+        释放开盘买入屏障, 账户直接变成"只买不卖"。
+
+        竞价时段改为按"剩余秒数 ÷ 退避间隔"给出足够次数, 让重试均匀铺满到开盘。
+        总时长仍受 max_total_duration_sec + auction_extra 约束, 不会无限重试。
+        """
+        auction_extra = _seconds_until_market_open()
+        if auction_extra <= 0:
+            return self.config.max_attempts
+        interval = max(self._retry_backoff_sec(), 0.05)
+        return max(self.config.max_attempts, int(auction_extra / interval) + 1)
+
+    def _retry_backoff_sec(self) -> float:
+        """拒单重试的退避间隔。
+
+        竞价时段用较长间隔(把重试铺满到开盘, 顺便少打柜台); 连续竞价时段保持
+        原来的快速重试 —— 抢单场景下每一次行情刷新都值钱。
+        """
+        auction_extra = _seconds_until_market_open()
+        if auction_extra > 0:
+            return min(1.0, max(0.2, auction_extra / 20.0))
+        return min(self.config.poll_interval_sec, 0.05)
+
+    def _sleep_before_retry(self) -> None:
+        delay = self._retry_backoff_sec()
+        if delay > 0:
+            time.sleep(delay)
+
     def _resolve_intent_amount(self, signal: TradeSignal) -> int:
         """意图型信号 → 具体股数（sell_all/sell_half 查持仓, auto_buy 查资金+行情）。"""
         if signal.quantity_mode == "sell_all":
@@ -736,12 +825,10 @@ class OrderExecutionEngine:
             )
         if signal.quantity_mode == "auto_buy":
             quote = self.market_data.latest_quote(signal.code)
-            return resolve_auto_buy(
-                available_cash=self.broker.query_available_cash(),
-                total_assets=self.broker.query_total_assets(),
-                buy_count=signal.budget_group_size or 1,
+            return shares_for_budget(
+                budget=self._per_stock_budget(signal),
                 price=quote.last_price,
-                max_single_position_pct=self.config.max_single_position_pct,
+                fee_buffer_pct=self.config.cash_fee_buffer_pct,
             )
         raise ValueError(f"invalid quantity_mode: {signal.quantity_mode}")
 
@@ -883,6 +970,27 @@ class OrderExecutionEngine:
         return any(
             price is not None and abs(price - quote.high_limit) <= tolerance
             for price in (quote.last_price, quote.bid1)
+        )
+
+    def _is_confirmed_limit_down(self, signal: TradeSignal, quote: Quote) -> bool:
+        """仅在跌停价可用且最新价/卖一已触及跌停时确认锁盘。
+
+        与买入侧 _is_confirmed_limit_up 对称。此前这里只判断 "bid1 is None",
+        于是任何买一档缺失的行情 —— 停牌、盘口不连续发布的 9:25~9:30 时段、
+        行情源丢档 —— 都会被当成跌停封死, 把一笔普通清仓单挂成跌停价、
+        并锁死一个排队 worker 到 14:56:30 且全天不重新定价。
+        """
+        if (
+            signal.action != Action.SELL
+            or quote.bid1 is not None
+            or quote.low_limit is None
+            or quote.low_limit <= 0
+        ):
+            return False
+        tolerance = tick_size_for(signal.code) + 1e-9
+        return any(
+            price is not None and abs(price - quote.low_limit) <= tolerance
+            for price in (quote.last_price, quote.ask1)
         )
 
     def _queue_buy_at_limit_up(
@@ -1478,7 +1586,10 @@ class OrderExecutionEngine:
             if order_price <= 0:
                 raise ValueError(f"invalid order price: {order_price}")
             available_cash = self.broker.query_available_cash()
-            max_shares = int(available_cash / order_price + 1e-9)
+            # 留出手续费缓冲: 柜台校验的是"委托金额 + 佣金/过户费 ≤ 可用资金",
+            # 顶格算出的股数会被判定资金不足而废单, 且重试拿到的是同一个报价。
+            usable_cash = available_cash * (1.0 - self.config.cash_fee_buffer_pct)
+            max_shares = int(usable_cash / order_price + 1e-9)
             capped_qty = (min(requested_qty, max_shares) // 100) * 100
             if capped_qty < requested_qty:
                 logger.warning(

@@ -101,10 +101,27 @@ def main() -> None:
     if _sigbreak is not None:
         _signal.signal(_sigbreak, _on_shutdown)
 
+    # 启动 banner: 多机部署时配错 group/consumer 是最常见也最隐蔽的事故 ——
+    # 同 group 会让两台机器瓜分消息(每台只买到一部分), 而日志里没有任何异常。
+    # 把身份信息打出来, 配错一眼能看出来。
     logger.info(
-        "【系统】🟢 Redis监听已启动 | stream=%s | group=%s | consumer=%s",
+        "【系统】🟢 Redis监听已启动 | stream=%s | group=%s | consumer=%s | "
+        "账户=%s | 账本=%s",
         config.redis.stream, config.redis.group, config.redis.consumer,
+        config.trading.account_id, config.state_db,
     )
+    # 排队单会一直占着 worker 直到成交或截止, 必须给普通信号留出线程,
+    # 否则盘中止损会排在涨跌停排队单后面进不去。这个不变量原先只写在注释里。
+    for label, need in (
+        ("卖出", config.execution.max_concurrent_queue_sells),
+        ("买入", config.execution.max_concurrent_queue_buys),
+    ):
+        if args.workers < need + 2:
+            logger.warning(
+                "【系统】⚠️ %s线程数不足 | --workers=%s < 排队上限%s + 预留2 | "
+                "排队单占满后普通信号会被饿死",
+                label, args.workers, need,
+            )
 
     with (
         ThreadPoolExecutor(
@@ -122,16 +139,35 @@ def main() -> None:
                 if _shutdown_event.is_set():
                     break
 
-                # 清理已完成的任务并 ACK。即使本轮轮询没有新消息(message 为 None)
-                # 也要执行, 否则已执行完的信号只能等到"下一条信号到达"才会被
-                # 记终态日志和 ACK —— 行情安静时会造成日志时间线严重失真。
+                # 兜底收割: ACK 主要由任务完成回调驱动(见 _submit_trade),
+                # 这里只是防止回调因异常漏掉。因为不再靠它保证 ACK 及时性,
+                # block_ms 可以放心调大 —— Redis 阻塞读是服务端推送, BLOCK
+                # 调大不增加收信延迟, 只减少跨网络的空轮询。
                 _reap_completed(pending, stream)
 
                 if message is None:
                     continue
 
+                # 无法解析的消息: 记日志后直接 ACK, 绝不让它卡住消费组, 也绝不
+                # 让它把消费循环打崩。Stream 是多策略共享的, 别的策略换个 schema
+                # 就可能产生本执行端不认识的消息。
+                if message.rejected is not None:
+                    logger.warning(
+                        "【Redis】⛔ 消息已丢弃 | msg_id=%s | %s",
+                        message.message_id, message.rejected,
+                    )
+                    stream.ack(message.message_id)
+                    continue
+
                 # 日计划: 展开为清仓/待买派生信号, 全部执行完才 ACK。
                 if message.plan is not None:
+                    if not config.execution.plan_enabled:
+                        logger.warning(
+                            "【计划】🚫 日计划执行已关闭 | plan_enabled=false | %s",
+                            message.plan.signal_id,
+                        )
+                        stream.ack(message.message_id)
+                        continue
                     if not _strategy_allowed(message.plan.strategy_id, allowed_strategies):
                         logger.info(
                             "【计划】🛂 日计划忽略 | 策略 %s 不在白名单",
@@ -206,7 +242,7 @@ def main() -> None:
                     _transport_latency_label(sig.sent_at_ms),
                 )
 
-                _submit_trade(message, pending, pools, engine, opening_barrier)
+                _submit_trade(message, pending, pools, engine, opening_barrier, stream)
 
         finally:
             if _shutdown_event.is_set():
@@ -278,13 +314,37 @@ def _submit_trade(
     pools: TradePools,
     engine: OrderExecutionEngine,
     opening_barrier: OpeningSellBarrier,
+    stream: RedisStreamClient | None = None,
 ) -> None:
-    """登记盘前卖单后，把交易信号提交给对应方向的并发工作池。"""
+    """登记盘前卖单后，把交易信号提交给对应方向的并发工作池。
+
+    传入 stream 时挂一个完成回调, 让 ACK 和终态日志在执行结束的那一刻发生,
+    而不是等消费循环的下一次轮询 —— 这样 block_ms 就不再是 ACK 时效的瓶颈。
+    """
     signal = message.signal
     opening_barrier.register(signal)
     pool = pools[signal.action]
     future = pool.submit(_execute_safe, engine, signal, opening_barrier)
     pending[future] = message
+    if stream is not None:
+        future.add_done_callback(
+            lambda f: _reap_one_safe(f, pending, stream)
+        )
+
+
+def _reap_one_safe(
+    future: Future[ExecutionResult],
+    pending: dict[Future[ExecutionResult], StreamMessage],
+    stream: RedisStreamClient,
+) -> None:
+    """完成回调入口: 与主循环的兜底收割竞争同一条记录, 由 pop 保证只处理一次。"""
+    try:
+        _reap_one(future, pending, stream)
+    except KeyError:
+        # 主循环的 _reap_completed 已经处理过这条, 正常竞态。
+        pass
+    except Exception as exc:  # 回调里绝不能抛, 否则只会进 futures 的日志
+        logger.exception("【系统】❌ 完成回调异常 | %s", exc)
 
 
 def _reap_completed(
@@ -294,7 +354,11 @@ def _reap_completed(
     """清理所有已完成的任务，ACK 对应的 Redis 消息。"""
     done = [f for f in pending if f.done()]
     for future in done:
-        _reap_one(future, pending, stream)
+        try:
+            _reap_one(future, pending, stream)
+        except KeyError:
+            # 完成回调已经先一步处理掉了, 正常竞态。
+            continue
 
 
 def _reap_one(

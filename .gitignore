@@ -14,15 +14,13 @@ venv/
 .env
 .env.*
 !.env.example
-config.json
-config_ali.yaml
-config_tcent.yaml
-config.local.json
-config.prod.json
-config.production.json
-config.yaml
 secrets.*
 
+# 实盘配置只留模板。真实的 host / 端口 / 账号 / QMT 路径 / 凭据一律不进版本库；
+# 每台交易机在本地从 config.example.yaml 复制一份改名即可（如 config.gj.yaml）。
+config*.yaml
+config*.json
+!config.example.yaml
 
 # Runtime state
 data/

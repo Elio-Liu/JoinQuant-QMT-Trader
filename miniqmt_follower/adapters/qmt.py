@@ -70,6 +70,15 @@ _TRANSIENT_REJECTION_KEYWORDS = (
 
 _ORDER_ERROR_WAIT_SEC = 0.05
 
+# 撤单复查用: 到达这些状态就说明"撤单"这件事已经没有意义了。
+_TERMINAL_ORDER_STATUSES = frozenset(
+    {
+        BrokerOrderStatus.FILLED,
+        BrokerOrderStatus.CANCELED,
+        BrokerOrderStatus.REJECTED,
+    }
+)
+
 
 @dataclass(frozen=True)
 class _QmtOrderError:
@@ -327,8 +336,12 @@ class QmtBrokerAdapter:
         self._trading_lock = threading.Lock()
 
         # ---- 订单缓存: 减少轮询时重复 QMT API 调用 ----
+        # 多个 worker 线程会并发读写它, 必须有锁: 否则 submit_order 的预填可能
+        # 被并发的全量刷新整体替换掉, 而且缓存过期瞬间多个线程会同时发起
+        # query_stock_orders 全量查询(单飞由本锁保证)。
         self._orders_cache: dict[str, OrderSnapshot] = {}  # order_id → snapshot
         self._orders_cache_time: float = 0.0
+        self._orders_cache_lock = threading.RLock()
         # ---- 报单失败回调缓存: 与交易 API 锁分离，避免阻塞 QMT 回调线程 ----
         self._order_error_lock = threading.Lock()
         self._order_errors_by_remark: dict[str, _QmtOrderError] = {}
@@ -386,7 +399,8 @@ class QmtBrokerAdapter:
         with self._trading_lock:
             asset = self._trader.query_stock_asset(self._account)
         # xtquant asset 对象的常见属性名, 按优先级尝试
-        for attr in ("m_dAvailable", "available_cash", "cash", "m_dBalance"):
+        # xtquant 的规范字段是 cash，放最前；其余为兼容旧版本/大 QMT 命名。
+        for attr in ("cash", "m_dAvailable", "available_cash", "m_dBalance"):
             val = getattr(asset, attr, None)
             if val is not None:
                 return float(val)
@@ -425,14 +439,32 @@ class QmtBrokerAdapter:
         return 0
 
     def query_total_assets(self) -> float:
-        """查询账户当前总资产（现金 + 股票市值）。"""
+        """查询账户当前总资产（现金 + 股票市值）。
+
+        xtquant 的 XtAsset 字段是 account_id / cash / frozen_cash /
+        market_value / **total_asset**（单数）。此前候选列表里只有大 QMT
+        get_trade_detail_data 风格的 m_dTotalAssets 和一个拼错的复数
+        total_assets，三个候选全部落空 → 抛 RuntimeError → 每条 auto_buy 都落
+        FAILED_BROKER，实盘一股买不进。total_asset 放在最前面。
+        """
         with self._trading_lock:
             asset = self._trader.query_stock_asset(self._account)
-        for attr in ("m_dTotalAssets", "total_assets", "m_dBalance"):
+        for attr in ("total_asset", "m_dTotalAssets", "total_assets", "m_dBalance"):
             val = getattr(asset, attr, None)
             if val is not None:
                 return float(val)
-        raise RuntimeError(f"Cannot extract total assets from asset object: {asset}")
+        # 兜底：市值 + 可用现金也能拼出总资产，好过直接让买单全废。
+        market_value = getattr(asset, "market_value", None)
+        cash = getattr(asset, "cash", None)
+        if market_value is not None and cash is not None:
+            logger.warning(
+                "【QMT】⚠️ 未找到总资产字段 | 退化为 market_value + cash 估算",
+            )
+            return float(market_value) + float(cash)
+        raise RuntimeError(
+            f"Cannot extract total assets from asset object: {asset} "
+            f"(available attrs: {[a for a in dir(asset) if not a.startswith('_')]})"
+        )
 
     def submit_order(self, signal: TradeSignal, quantity: int, price: float) -> str:
         qmt_code = jq_code_to_qmt_code(signal.code)
@@ -472,7 +504,10 @@ class QmtBrokerAdapter:
 
         oid = str(order_id)
         # 预填缓存: 新订单初始为 OPEN
-        self._orders_cache[oid] = OrderSnapshot(order_id=oid, status=BrokerOrderStatus.OPEN, filled_qty=0)
+        with self._orders_cache_lock:
+            self._orders_cache[oid] = OrderSnapshot(
+                order_id=oid, status=BrokerOrderStatus.OPEN, filled_qty=0,
+            )
 
         logger.debug(
             "📤 委托已提交 | QMT单号=%s 信号=%s 代码=%s 数量=%s 价格=%.3f",
@@ -531,22 +566,23 @@ class QmtBrokerAdapter:
 
     def get_order_snapshot(self, order_id: str) -> OrderSnapshot:
         """查询单个订单快照，带 50ms 短期缓存避免轮询时重复全量查询。"""
-        now = time.monotonic()
+        with self._orders_cache_lock:
+            now = time.monotonic()
+            # 缓存过期才刷新全量订单列表。持锁刷新即天然单飞:
+            # 多个 worker 同时发现过期时，只有一个真的去查 QMT。
+            if now - self._orders_cache_time >= _ORDERS_CACHE_TTL:
+                self._refresh_orders_cache()
+                self._orders_cache_time = time.monotonic()
 
-        # 缓存过期才刷新全量订单列表
-        if now - self._orders_cache_time >= _ORDERS_CACHE_TTL:
-            self._refresh_orders_cache()
-            self._orders_cache_time = now
-
-        cached = self._orders_cache.get(order_id)
-        if cached is not None:
-            return cached
+            cached = self._orders_cache.get(order_id)
+            if cached is not None:
+                return cached
 
         # 缓存没有（可能刚下单还没刷新），返回保守值
         return OrderSnapshot(order_id=order_id, status=BrokerOrderStatus.OPEN, filled_qty=0)
 
     def _refresh_orders_cache(self) -> None:
-        """从 QMT 全量拉取订单列表并更新缓存。"""
+        """从 QMT 全量拉取订单列表并更新缓存。调用方需持有 _orders_cache_lock。"""
         with self._trading_lock:
             orders: list[Any] = self._trader.query_stock_orders(self._account)
         fresh: dict[str, OrderSnapshot] = {}
@@ -583,14 +619,39 @@ class QmtBrokerAdapter:
         self._orders_cache = fresh
 
     def cancel_order(self, order_id: str) -> None:
+        """提交撤单请求。
+
+        关键: 返回码非 0 **不等于**出了事。最常见的情形是订单在"引擎判超时"和
+        "撤单送达柜台"之间刚好成交或已被撤，柜台自然拒绝撤一笔终态单 —— 而
+        order_timeout_sec 只有零点几秒时，这个竞态每天都会撞上好几次。
+
+        执行引擎把 cancel_order 的任何异常都当作"撤单终态不明"并熔断当天全部
+        交易（含后续所有止损、清仓），所以这里绝不能一看到非 0 就抛。正确做法是
+        先向 QMT 复查该单的真实状态：已是终态就说明撤单目的已经达成，直接返回；
+        只有"复查后仍非终态、撤单又失败"才是真的不确定，那时才抛。
+        """
         with self._trading_lock:
             cancel_result: int = self._trader.cancel_order_stock(self._account, int(order_id))
+
+        # 无论成功与否都让下一次查询穿透缓存，拿 QMT 的真实状态。
+        self._invalidate_order_cache(order_id)
+
         if cancel_result != 0:
+            snapshot = self.get_order_snapshot(order_id)
+            if snapshot.status in _TERMINAL_ORDER_STATUSES:
+                logger.info(
+                    "【QMT】ℹ️ 撤单返回 %s，但复查确认订单已终态 | QMT单号=%s | 状态=%s | 成交=%s股",
+                    cancel_result, order_id, snapshot.status.value, snapshot.filled_qty,
+                )
+                return
             raise RuntimeError(
-                f"QMT cancel_order_stock failed for order {order_id}: result={cancel_result}"
+                f"QMT cancel_order_stock failed for order {order_id}: "
+                f"result={cancel_result}, and the order is still {snapshot.status.value}"
             )
         # QMT 返回 0 只表示撤单请求已受理，不代表订单已经终态。
-        # 清掉旧快照，强制执行引擎下一次查询从 QMT 拉取最终状态和成交量。
-        self._orders_cache.pop(order_id, None)
-        self._orders_cache_time = 0.0
         logger.debug("🔙 撤单请求已提交 | QMT单号=%s", order_id)
+
+    def _invalidate_order_cache(self, order_id: str) -> None:
+        with self._orders_cache_lock:
+            self._orders_cache.pop(order_id, None)
+            self._orders_cache_time = 0.0
