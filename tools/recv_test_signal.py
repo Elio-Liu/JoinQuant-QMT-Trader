@@ -9,15 +9,18 @@
 所以可以直接拷到一台还没装好项目的交易机上跑（Python 3.6+ 即可），
 用来把"网络/端口/口令/消费组"这层问题和"项目本身"的问题分开排查。
 
-用法（两台机器的 group 必须不同！）：
+用法（两台机器的 group 必须不同，且都不能与交易机正在用的 group 相同！）：
 
     # 国金机
     python recv_test_signal.py --host 10.0.0.10 --port 6380 --password xxx \
-        --group qmt_executors_gj --consumer win-gj-01
+        --group qmt_executors_gj_test --consumer win-gj-01
 
     # 华鑫机
     python recv_test_signal.py --host 10.0.0.10 --port 6380 --password xxx \
-        --group qmt_executors_hx --consumer win-hx-01
+        --group qmt_executors_hx_test --consumer win-hx-01
+
+用交易机的真实 group 会把消息从它嘴里抢走并 ACK 掉，交易机永远收不到，
+而且它的日志里没有任何异常。脚本对不像测试组的组名会二次确认。
 
 两台同时跑着，再从任意一台执行 send_test_signal.py，
 **两边都应该看到完整的同一批消息**。只有一边看到、或各看到一部分，
@@ -106,6 +109,14 @@ def parse_message(fields):
         return "rejected", "%s: %s" % (type(exc).__name__, exc), None
 
 
+_TEST_GROUP_HINTS = ("test", "probe", "dryrun", "dry_run", "测", "试")
+
+
+def _looks_like_a_test_group(group):
+    lowered = str(group).lower()
+    return any(hint in lowered for hint in _TEST_GROUP_HINTS)
+
+
 def main():
     parser = argparse.ArgumentParser(description="消费 Redis Stream 测试信号，只打印不下单")
     parser.add_argument("--host", required=True)
@@ -122,7 +133,24 @@ def main():
     parser.add_argument("--no-ack", action="store_true",
                         help="不 ACK，消息留在 pending 里。用来观察 pending 行为。")
     parser.add_argument("--show-raw", action="store_true", help="打印完整 payload")
+    parser.add_argument("--yes", action="store_true",
+                        help="跳过消费组确认（非交互式运行时用）")
     args = parser.parse_args()
+
+    if not _looks_like_a_test_group(args.group) and not args.yes:
+        print()
+        print("⚠️ group=%s 看着不像测试专用消费组。" % args.group)
+        print("   消费组状态在 Redis 服务端：如果它和某台交易机的 group 相同，")
+        print("   Redis 会把消息在你和那台机器之间瓜分，本脚本还会把抢到的那部分")
+        print("   ACK 掉 —— 交易机将永远收不到那些信号，而它的日志里没有任何异常。")
+        print("   测试请另起一个组名，例如 %s_test。" % args.group)
+        try:
+            if input("   确认继续？输入 yes 回车： ").strip().lower() != "yes":
+                print("已取消。")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            return 0
 
     _signal.signal(_signal.SIGINT, _stop)
     _signal.signal(_signal.SIGTERM, _stop)

@@ -342,6 +342,8 @@ class QmtBrokerAdapter:
         self._orders_cache: dict[str, OrderSnapshot] = {}  # order_id → snapshot
         self._orders_cache_time: float = 0.0
         self._orders_cache_lock = threading.RLock()
+        # 全量刷新的单飞锁，与上面的缓存锁分开：见 get_order_snapshot。
+        self._orders_refresh_lock = threading.Lock()
         # ---- 报单失败回调缓存: 与交易 API 锁分离，避免阻塞 QMT 回调线程 ----
         self._order_error_lock = threading.Lock()
         self._order_errors_by_remark: dict[str, _QmtOrderError] = {}
@@ -453,14 +455,17 @@ class QmtBrokerAdapter:
             val = getattr(asset, attr, None)
             if val is not None:
                 return float(val)
-        # 兜底：市值 + 可用现金也能拼出总资产，好过直接让买单全废。
+        # 兜底：市值 + 现金也能拼出总资产，好过直接让买单全废。
+        # 冻结资金必须算进来 —— 它是已报未成委托占用的钱，仍然是账户的资产。
+        # 漏掉它会在挂单期间低估总资产，进而把单票集中度上限算小、少买。
         market_value = getattr(asset, "market_value", None)
         cash = getattr(asset, "cash", None)
         if market_value is not None and cash is not None:
+            frozen_cash = getattr(asset, "frozen_cash", None) or 0.0
             logger.warning(
-                "【QMT】⚠️ 未找到总资产字段 | 退化为 market_value + cash 估算",
+                "【QMT】⚠️ 未找到总资产字段 | 退化为 市值+可用+冻结 估算",
             )
-            return float(market_value) + float(cash)
+            return float(market_value) + float(cash) + float(frozen_cash)
         raise RuntimeError(
             f"Cannot extract total assets from asset object: {asset} "
             f"(available attrs: {[a for a in dir(asset) if not a.startswith('_')]})"
@@ -564,25 +569,34 @@ class QmtBrokerAdapter:
                 self._order_errors_by_remark.pop(cached.order_remark, None)
             return cached
 
+    def _orders_cache_is_stale(self) -> bool:
+        with self._orders_cache_lock:
+            return time.monotonic() - self._orders_cache_time >= _ORDERS_CACHE_TTL
+
     def get_order_snapshot(self, order_id: str) -> OrderSnapshot:
         """查询单个订单快照，带 50ms 短期缓存避免轮询时重复全量查询。"""
-        with self._orders_cache_lock:
-            now = time.monotonic()
-            # 缓存过期才刷新全量订单列表。持锁刷新即天然单飞:
-            # 多个 worker 同时发现过期时，只有一个真的去查 QMT。
-            if now - self._orders_cache_time >= _ORDERS_CACHE_TTL:
-                self._refresh_orders_cache()
-                self._orders_cache_time = time.monotonic()
+        if self._orders_cache_is_stale():
+            # 单飞放在专用锁上, 而不是压在缓存锁里: QMT 全量查询是一次同步的
+            # 跨进程调用, 把缓存锁攥着等它返回, 会让其余轮询线程连"读一眼旧
+            # 快照"都做不到 —— 9:30 一批并发委托时这就是一次整齐的串行。
+            with self._orders_refresh_lock:
+                if self._orders_cache_is_stale():  # 双检: 可能已被别的线程刷过
+                    self._refresh_orders_cache()
 
+        with self._orders_cache_lock:
             cached = self._orders_cache.get(order_id)
-            if cached is not None:
-                return cached
+        if cached is not None:
+            return cached
 
         # 缓存没有（可能刚下单还没刷新），返回保守值
         return OrderSnapshot(order_id=order_id, status=BrokerOrderStatus.OPEN, filled_qty=0)
 
     def _refresh_orders_cache(self) -> None:
-        """从 QMT 全量拉取订单列表并更新缓存。调用方需持有 _orders_cache_lock。"""
+        """从 QMT 全量拉取订单列表并整体替换缓存。
+
+        QMT 查询在缓存锁之外完成，只有最后的整体替换持锁。调用方应持有
+        _orders_refresh_lock 以保证单飞。
+        """
         with self._trading_lock:
             orders: list[Any] = self._trader.query_stock_orders(self._account)
         fresh: dict[str, OrderSnapshot] = {}
@@ -616,7 +630,9 @@ class QmtBrokerAdapter:
                     else None
                 ),
             )
-        self._orders_cache = fresh
+        with self._orders_cache_lock:
+            self._orders_cache = fresh
+            self._orders_cache_time = time.monotonic()
 
     def cancel_order(self, order_id: str) -> None:
         """提交撤单请求。

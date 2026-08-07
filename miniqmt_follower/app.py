@@ -249,8 +249,9 @@ def main() -> None:
                 logger.info("【系统】⏳ 等待 %s 个进行中的任务完成", len(pending))
             else:
                 logger.info("【系统】⏳ 消费循环退出 | 等待 %s 个任务完成", len(pending))
-            # 等待所有进行中的任务
-            for future in as_completed(pending):
+            # 等待所有进行中的任务。先快照: as_completed 会遍历传入的容器,
+            # 而工作线程的完成回调正在并发 pop 同一个 pending。
+            for future in as_completed(list(pending)):
                 _reap_one(future, pending, stream)
             # 关闭各线程的数据库连接
             store.close()
@@ -337,13 +338,10 @@ def _reap_one_safe(
     pending: dict[Future[ExecutionResult], StreamMessage],
     stream: RedisStreamClient,
 ) -> None:
-    """完成回调入口: 与主循环的兜底收割竞争同一条记录, 由 pop 保证只处理一次。"""
+    """完成回调入口: 在工作线程里跑, 绝不能抛 —— 抛了只会进 futures 的日志。"""
     try:
         _reap_one(future, pending, stream)
-    except KeyError:
-        # 主循环的 _reap_completed 已经处理过这条, 正常竞态。
-        pass
-    except Exception as exc:  # 回调里绝不能抛, 否则只会进 futures 的日志
+    except Exception as exc:
         logger.exception("【系统】❌ 完成回调异常 | %s", exc)
 
 
@@ -351,14 +349,15 @@ def _reap_completed(
     pending: dict[Future[ExecutionResult], StreamMessage],
     stream: RedisStreamClient,
 ) -> None:
-    """清理所有已完成的任务，ACK 对应的 Redis 消息。"""
-    done = [f for f in pending if f.done()]
-    for future in done:
-        try:
+    """清理所有已完成的任务，ACK 对应的 Redis 消息。
+
+    必须先 list() 快照再遍历: 完成回调在工作线程里 pop 同一个 pending,
+    直接遍历 dict 会撞上 "dictionary changed size during iteration" ——
+    而这个异常会一路穿出没有 except 的消费循环, 让当天的跟单直接收工。
+    """
+    for future in list(pending):
+        if future.done():
             _reap_one(future, pending, stream)
-        except KeyError:
-            # 完成回调已经先一步处理掉了, 正常竞态。
-            continue
 
 
 def _reap_one(
@@ -366,8 +365,14 @@ def _reap_one(
     pending: dict[Future[ExecutionResult], StreamMessage],
     stream: RedisStreamClient,
 ) -> None:
-    """处理单个已完成任务：ACK + 日志。"""
-    message = pending.pop(future)
+    """处理单个已完成任务：ACK + 日志。
+
+    完成回调、主循环兜底收割、退出等待三条路径会对同一条记录竞争, 由 pop 的
+    原子性定胜负: 谁先取到 message 谁负责 ACK, 后到的直接返回。
+    """
+    message = pending.pop(future, None)
+    if message is None:
+        return
     if message.plan is not None:
         try:
             results = future.result()

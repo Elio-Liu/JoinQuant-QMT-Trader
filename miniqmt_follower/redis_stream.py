@@ -88,6 +88,32 @@ class RedisStreamClient:
             retry_on_timeout=True,
         )
 
+    def _fatal_reason(self, exc: Exception) -> str | None:
+        """区分"重试永远好不了的配置错误"与"重试就能恢复的网络故障"。
+
+        口令写错、REDIS_PASSWORD 环境变量没设、Redis 版本没有 Stream —— 这些
+        退避重连一万次也不会自愈, 而进程照常打出 🟢 启动 banner, 看着像在跑却
+        永远收不到信号, 直到收盘才发现当天一单没跟。这类必须立刻抛出去。
+
+        反过来, "Redis 服务还没起来 / 链路抖动" 必须继续重试: Windows 上跟单
+        服务可能比 Redis 服务先启动, 一次启动竞态不该让当天的跟单起不来。
+        """
+        exceptions = getattr(self._redis_module, "exceptions", None)
+        auth_error = getattr(exceptions, "AuthenticationError", None)
+        if auth_error is not None and isinstance(exc, auth_error):
+            return f"Redis 认证失败(检查 REDIS_PASSWORD 环境变量) | {exc}"
+        text = str(exc).upper()
+        for token, reason in (
+            ("NOAUTH", "Redis 要求口令, 但本地没有配置口令"),
+            ("WRONGPASS", "Redis 口令不正确"),
+            ("INVALID PASSWORD", "Redis 口令不正确"),
+            ("WITHOUT ANY PASSWORD", "Redis 未设口令, 但本地配了口令"),
+            ("UNKNOWN COMMAND", "该 Redis 不支持 Stream 命令(需要 5.0+)"),
+        ):
+            if token in text:
+                return f"{reason} | {exc}"
+        return None
+
     def ensure_group(self) -> None:
         """确保消费组存在。
 
@@ -163,6 +189,12 @@ class RedisStreamClient:
                 )
             except Exception as exc:
                 connected = False
+                fatal = self._fatal_reason(exc)
+                if fatal is not None:
+                    # 退避重连救不了配置错误, 只会把它藏成一行行看起来像网络
+                    # 抖动的日志。直接抛出去让服务起不来, 运维一眼就能看见。
+                    logger.critical("【Redis】🛑 配置错误, 重连不会自愈 | %s", fatal)
+                    raise
                 delay = _RECONNECT_BACKOFF_SEC[min(attempt, len(_RECONNECT_BACKOFF_SEC) - 1)]
                 attempt += 1
                 logger.error(

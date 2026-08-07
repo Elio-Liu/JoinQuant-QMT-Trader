@@ -211,6 +211,10 @@ def _seconds_until_queue_buy_deadline(deadline_hhmmss: str) -> float:
     return max(0.0, (deadline_dt - now).total_seconds())
 
 
+# 批次预算闩锁保留的最近批次数。一天一个 plan, 32 条足够覆盖任何回看窗口。
+_BUDGET_CACHE_MAX_ENTRIES = 32
+
+
 def _budget_batch_key(signal: TradeSignal) -> str:
     """从派生买单 id 还原它所属的批次标识。
 
@@ -289,6 +293,11 @@ class OrderExecutionEngine:
                 total_assets * self.config.max_single_position_pct,
             )
             if batch_key:
+                # 跟单进程一跑就是几个月, 而 key 里带日期 => 每个交易日新增一条,
+                # 只增不删。批次标识按插入序保留最近若干个即可: 老批次早已终态,
+                # 再被查到只会是重投, 那条路上幂等闸门已经先拦住了。
+                while len(self._budget_cache) >= _BUDGET_CACHE_MAX_ENTRIES:
+                    self._budget_cache.pop(next(iter(self._budget_cache)))
                 self._budget_cache[batch_key] = budget
                 logger.info(
                     "【买单】💰 批次预算已锁定 | %s | 可用 %.2f ÷ %s 只 | 单票 %.2f",

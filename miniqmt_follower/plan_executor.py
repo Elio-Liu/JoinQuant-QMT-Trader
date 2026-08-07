@@ -8,6 +8,7 @@ f"{plan_id}-buy-{code}"），走现有 signals 表幂等 —— 重启后 Redis 
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Iterator
 from concurrent.futures import Future
 
@@ -86,9 +87,20 @@ def submit_plan_tasks(
 
     combined: Future[list[ExecutionResult]] = Future()
 
+    # 最后两条派生信号并发终态时，两个回调会同时看到"全部完成"并各自
+    # set_result，第二次抛 InvalidStateError（只会被 futures 记一行日志）。
+    # 用一把锁 + 一次性标志定胜负，谁先到谁负责收口。
+    combine_lock = threading.Lock()
+    combined_done = False
+
     def _combine(_future: Future[ExecutionResult]) -> None:
+        nonlocal combined_done
         if not all(child.done() for child in children):
             return
+        with combine_lock:
+            if combined_done:
+                return
+            combined_done = True
         combined.set_result([child.result() for child in children])
 
     for child in children:

@@ -200,12 +200,17 @@ redis-cli -h <Redis服务器IP> -p 6380 -a <口令> --no-auth-warning PING
 ```powershell
 # 国金机
 python recv_test_signal.py --host <RedisIP> --port 6380 --password <口令> `
-    --group qmt_executors_gj --consumer win-gj-01
+    --group qmt_executors_gj_test --consumer win-gj-01
 
 # 华鑫机
 python recv_test_signal.py --host <RedisIP> --port 6380 --password <口令> `
-    --group qmt_executors_hx --consumer win-hx-01
+    --group qmt_executors_hx_test --consumer win-hx-01
 ```
+
+> 这里用的是**带 `_test` 后缀的独立消费组**，不是交易机配置里那个。消费组是
+> 组内分发不是广播：如果测试脚本和 `qmt-trader` 服务共用一个 group，脚本会把
+> 抢到的消息 ACK 掉，交易机永远收不到，而它的日志里没有任何异常。脚本遇到
+> 不像测试组的组名会二次确认。
 
 **第二步**，从任意一台机器发一整轮测试信号：
 
