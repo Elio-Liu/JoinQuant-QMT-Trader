@@ -23,6 +23,7 @@ config.production.json
 config.yaml
 secrets.*
 
+
 # Runtime state
 data/
 *.db
@@ -34,3 +35,5 @@ logs/
 .claude/
 strategies/
 CLAUDE.md
+# 本地测试套件（含私有策略相关用例），不进入版本库
+tests/

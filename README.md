@@ -127,10 +127,9 @@ RedisStreamClient.read_forever()
 ├── bigqmt_follower/
 │   ├── bigqmt_redis_follower.py         # 可直接导入大 QMT 的单文件执行器
 │   └── README.md                        # 大 QMT 部署与仿真验收说明
-├── tests/                               # unittest 测试
 ```
 
-`config.yaml`本机配置文件、聚宽策略部署副本（可能含真实 Redis 地址）、日志和运行数据库都属于本机部署内容，默认不进入版本控制，不应强制提交。
+`config.yaml`、`config_ali.yaml`、`config_tcent.yaml` 等本机配置文件、聚宽策略部署副本（可能含真实 Redis 地址）、本机测试套件（`tests/`）、日志和运行数据库都属于本机部署内容，默认不进入版本控制，不应强制提交。
 
 ## 快速开始：独立 miniQMT 服务
 
@@ -385,6 +384,8 @@ FIFO，天然串行，不需要该锁）。
 ## 本地验证
 
 核心测试使用 `unittest` 和 fake Redis / broker / market data；不需要真实 Redis、QMT 或券商账号。
+`tests/` 目录是本机测试套件，不随仓库分发（可能包含依赖私有策略部署副本的用例）；
+以下命令只在配置了本地测试副本的机器上有效。
 
 ```bash
 python -m unittest discover -v

@@ -9,10 +9,10 @@ JoinQuant miniQMT Live Follower — a two-sided system where a JoinQuant cloud s
 ## Commands
 
 ```bash
-# Run all tests
+# Run all tests (tests/ is a local-only suite, not tracked in this repo)
 python -m unittest discover -v
 
-# Compile-check runtime and tests (catches ImportErrors before runtime)
+# Compile-check runtime and tests (catches ImportErrors before runtime; tests/ is local-only)
 python -m compileall miniqmt_follower bigqmt_follower tests
 
 # Run the Windows execution service
@@ -178,6 +178,10 @@ Note: `redis.stream` must match the stream name hard-coded inside the copy of `p
 Opening-flow deployment has two independent artifacts: update `miniqmt_follower/` and restart `qmt-trader` on the Windows trading box, then paste the updated strategy deployment copy into the JoinQuant live simulation. No new YAML key is required; before deployment manually confirm both limit modes are `queue`, both deadlines are `14:56:30`, and both queue-capacity limits are 5.
 
 ## Testing
+
+`tests/` is intentionally kept outside version control as a local-only suite (it includes
+strategy-specific contract tests that read private deployment copies). The commands above
+work on machines that have the local `tests/` copy; a fresh clone has no tests.
 
 Tests use only stdlib `unittest` and inject fakes:
 - `FakeMarketData` with a pre-loaded price queue
