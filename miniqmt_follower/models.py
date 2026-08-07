@@ -66,6 +66,8 @@ class ExecutionStatus(StrEnum):
     FAILED_RISK = "failed_risk"
     FAILED_BROKER = "failed_broker"
     SKIPPED_NO_POSITION = "skipped_no_position"
+    # sell_half 意图信号半仓不足一手、且配置为 skip 时的终态（与无持仓区分开）。
+    SKIPPED_SMALL_POSITION = "skipped_small_position"
     # 涨跌停无对手盘时的快速跳过终态: 挂单只会排进涨跌停价的巨量队列,
     # 占满超时预算和同方向 worker, 不如直接跳过并留痕供盘后对账。
     SKIPPED_LIMIT_DOWN = "skipped_limit_down"
@@ -289,6 +291,10 @@ class ExecutionConfig:
     plan_execute_at: str = "09:30:00"  # plan 执行时刻（HH:MM:SS，交易机本地时间）
     # 单票买入金额上限 = 账户总资产（现金+股票市值）× 该比例；取值范围 (0, 1]。
     max_single_position_pct: float = 0.2
+    # sell_half 意图信号在半仓取整不足一手(<200股)时的处理:
+    #   "sell_all" — 全卖当前持仓(默认, 原行为)
+    #   "skip"     — 不卖, 记 SKIPPED_SMALL_POSITION 终态
+    sell_half_insufficient_lot_mode: str = "sell_all"
 
     def effective_limit_down_sell_mode(self) -> str:
         """归一化跌停卖出模式; 缺省时由旧开关 skip_sell_when_limit_down 推导。"""

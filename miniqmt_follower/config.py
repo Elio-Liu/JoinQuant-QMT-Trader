@@ -101,6 +101,17 @@ def _validated_max_single_position_pct(raw_value: object) -> float:
     return pct
 
 
+def _validated_sell_half_insufficient_lot_mode(raw_value: object) -> str:
+    """校验 sell_half 半仓不足一手时的处理模式。"""
+    mode = str(raw_value or "sell_all").strip().lower()
+    if mode not in {"sell_all", "skip"}:
+        raise ValueError(
+            f"execution.sell_half_insufficient_lot_mode 取值非法: {raw_value!r} "
+            '(允许: "sell_all" / "skip")'
+        )
+    return mode
+
+
 def load_config(path: str | Path) -> RuntimeConfig:
     """从 YAML 配置文件加载运行参数。
 
@@ -185,6 +196,9 @@ def load_config(path: str | Path) -> RuntimeConfig:
             ),
             max_single_position_pct=_validated_max_single_position_pct(
                 execution_raw.get("max_single_position_pct", 0.2)
+            ),
+            sell_half_insufficient_lot_mode=_validated_sell_half_insufficient_lot_mode(
+                execution_raw.get("sell_half_insufficient_lot_mode", "sell_all")
             ),
         ),
         trading=TradingConfig(

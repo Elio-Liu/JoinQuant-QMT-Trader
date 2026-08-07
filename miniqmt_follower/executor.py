@@ -103,6 +103,7 @@ _STATUS_LABELS: dict[ExecutionStatus, str] = {
     ExecutionStatus.FAILED_RISK: "风控拒绝",
     ExecutionStatus.FAILED_BROKER: "券商失败",
     ExecutionStatus.SKIPPED_NO_POSITION: "实盘无持仓跳过",
+    ExecutionStatus.SKIPPED_SMALL_POSITION: "半仓不足一手跳过",
     ExecutionStatus.SKIPPED_LIMIT_DOWN: "跌停跳过",
     ExecutionStatus.SKIPPED_LIMIT_UP: "涨停跳过",
     ExecutionStatus.QUEUED_LIMIT_DOWN: "跌停排队中",
@@ -298,6 +299,18 @@ class OrderExecutionEngine:
                 )
             if resolved <= 0:
                 if signal.action == Action.SELL:
+                    if (
+                        signal.quantity_mode == "sell_half"
+                        and self.broker.query_available_position(signal.code) > 0
+                    ):
+                        logger.warning(
+                            "%s | %s | 半仓不足一手 | 配置为跳过",
+                            signal.console_event("跳过"), code_label,
+                        )
+                        return self._finish(
+                            signal, ExecutionStatus.SKIPPED_SMALL_POSITION, 0, 0,
+                            "skipped: sell-half below one lot",
+                        )
                     logger.warning(
                         "%s | %s | 实盘无可卖持仓 | 跳过",
                         signal.console_event("跳过"), code_label,
@@ -733,7 +746,8 @@ class OrderExecutionEngine:
             )
         if signal.quantity_mode == "sell_half":
             return resolve_sell_half(
-                self.broker.query_available_position(signal.code)
+                self.broker.query_available_position(signal.code),
+                self.config.sell_half_insufficient_lot_mode,
             )
         if signal.quantity_mode == "auto_buy":
             quote = self.market_data.latest_quote(signal.code)

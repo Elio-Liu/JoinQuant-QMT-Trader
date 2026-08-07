@@ -157,6 +157,7 @@ Copy `config.example.yaml` to `config.yaml`. Password supports `${ENV_VAR}` synt
 - `auction_aggressive_pct` — how far 9:15–9:30 queue orders quote past the last price (default `0.02`; `0` disables). Buys time priority for the 9:30 open; result is clamped into the daily limit band. See "Auction queue pricing" above for why this must never be the limit price itself
 - `limit_down_sell_mode` / `limit_up_buy_mode` — `"queue"` (park at the limit price until `queue_sell_deadline` / `queue_buy_deadline`, default 14:56:30), `"skip"`, or `"none"`; `"queue"` holds one of the `max_concurrent_queue_sells` / `max_concurrent_queue_buys` slots, which must stay below the worker count
 - `plan_enabled` / `plan_execute_at` / `max_single_position_pct` — daily-plan handling (default enabled, executes at 09:30:00 local time) and the per-stock auto-buy cap (total assets × pct, default 0.2)
+- `sell_half_insufficient_lot_mode` — `"sell_all"` (default; a sell-half whose rounded half is below one lot sells the whole position) or `"skip"` (resolves to 0 and ends as `SKIPPED_SMALL_POSITION` without an order)
 - `poll_interval_sec` — steady-state order polling interval
 - `pricing_mode` — `"slippage"` (default: last price ± slippage) or `"book"` (buy at ask1 + `book_tick_offset` ticks, sell at bid1 − offset; falls back to slippage when that book side is empty, e.g. limit-up/down)
 

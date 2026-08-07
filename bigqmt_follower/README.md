@@ -46,6 +46,8 @@ CONFIG = {
     "allowed_strategy_ids": [],
     # 意图型信号单票买入上限 = 总资产 × 该比例。
     "max_single_position_pct": 0.2,
+    # sell_half 半仓不足一手(<200股): sell_all=全卖(默认) / skip=跳过不卖。
+    "sell_half_insufficient_lot_mode": "sell_all",
     # 其余定价、超时和重试参数见源码顶部。
 }
 ```
@@ -78,6 +80,7 @@ Redis监听已启动 stream=... group=... consumer=...
 
 - 只执行 `mode=live` 的消息；策略白名单 `allowed_strategy_ids` 非空时，名单外的信号/日计划/预订阅直接 ACK。
 - 支持精确信号 `action=buy/sell`（带 `amount`）与意图型信号：`sell_half` / `sell_all`（数量按真实可卖持仓计算）、不带 `amount` 的 `buy`（按 `min(可用资金÷待买只数, 总资产×max_single_position_pct)` 自动买入）。
+- `sell_half` 半仓取整不足一手（<200股）时按 `sell_half_insufficient_lot_mode` 处理：`sell_all`=全卖当前持仓（默认）/ `skip`=跳过不卖。
 - 支持日计划 `action=plan`：展开为清仓 `sell_all` + 待买 `auto_buy` 派生信号（已持仓代码不再补买），全部派生信号终态后才 ACK plan；派生 `signal_id` 与 miniQMT 同规则，重放幂等。
 - 普通股票买入使用 `passorder` 操作类型 `23`，卖出使用 `24`。
 - 使用 `1101` 按股数下单、报价类型 `11` 指定限价、`quickTrade=1` 立即触发。

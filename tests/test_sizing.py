@@ -12,8 +12,16 @@ class SizingTests(unittest.TestCase):
     def test_sell_half_rounds_down_to_lot(self):
         self.assertEqual(resolve_sell_half(1000), 500)
         self.assertEqual(resolve_sell_half(1100), 500)
-        self.assertEqual(resolve_sell_half(150), 150)  # 不足一手全卖
+        self.assertEqual(resolve_sell_half(100), 100)  # 一手: 默认全卖
+        self.assertEqual(resolve_sell_half(150), 150)  # 不足一手: 默认全卖
         self.assertEqual(resolve_sell_half(0), 0)
+
+    def test_sell_half_insufficient_lot_skip_mode(self):
+        # skip 模式: 半仓不足一手 → 不卖；足一手仍按正常半仓。
+        self.assertEqual(resolve_sell_half(100, "skip"), 0)
+        self.assertEqual(resolve_sell_half(150, "skip"), 0)
+        self.assertEqual(resolve_sell_half(300, "skip"), 100)
+        self.assertEqual(resolve_sell_half(1000, "skip"), 500)
 
     def test_auto_buy_splits_cash_by_count(self):
         self.assertEqual(

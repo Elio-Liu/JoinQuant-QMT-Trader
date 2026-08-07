@@ -2,7 +2,8 @@
 
 规则（与策略端语义保持一致）:
 - sell_all: 真实可卖持仓全清。
-- sell_half: 持仓的一半向下取整到 100 股；不足一手则全卖（与策略端"不足1手全卖"一致）。
+- sell_half: 持仓的一半向下取整到 100 股；不足一手时按
+  sell_half_insufficient_lot_mode 处理（sell_all=全卖 / skip=不卖）。
 - auto_buy: 等分可用资金，再受单票上限约束：min(可用资金÷N, 总资产×单票比例)，
   向下取整到 100 股。
 """
@@ -17,12 +18,16 @@ def resolve_sell_all(available_position: int) -> int:
     return max(int(available_position), 0)
 
 
-def resolve_sell_half(available_position: int) -> int:
-    """卖一半: 向下取整到整手；不足一手全卖。"""
+def resolve_sell_half(
+    available_position: int, insufficient_lot_mode: str = "sell_all"
+) -> int:
+    """卖一半: 向下取整到整手；不足一手按模式处理（sell_all=全卖 / skip=不卖）。"""
     position = max(int(available_position), 0)
     half = position // 2 // LOT_SIZE * LOT_SIZE
     if half >= LOT_SIZE:
         return half
+    if insufficient_lot_mode == "skip":
+        return 0
     return position
 
 

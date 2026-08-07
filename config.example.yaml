@@ -1,7 +1,5 @@
 # QMT 跟单助手示例配置。复制为 config.yaml 后按你的环境修改。
-# 当前推荐值按 "龙头情绪收割机" (harvester) 策略调优:
-#   09:26 预订阅 → 09:27 竞价止损卖出 → 09:29 预发开盘买单 → 09:30 开盘买入
-#   → 盘中分钟级硬止损卖出 / 跌停排队卖出 (L2) → 14:30 尾盘清仓。
+
 redis:
   # Redis Stream 配置。聚宽侧用 XADD 写入 stream，Windows 端用 consumer group 消费。
   host: YOUR_REDIS_HOST # Redis 服务地址；实盘建议使用内网、VPN 或安全组白名单。
@@ -62,6 +60,9 @@ execution:
   plan_execute_at: "09:30:00"      # plan 执行时刻（交易机本地时间，HH:MM:SS）。
   # 单票买入金额上限 = 当前账户总资产（现金+股票市值）× 该比例；0~1 小数，5 只等权推荐 0.2。
   max_single_position_pct: 0.2
+  # sell_half 意图信号在半仓取整不足一手（<200股）时的处理：
+  #   sell_all=全卖当前持仓（默认） / skip=跳过不卖。
+  sell_half_insufficient_lot_mode: "sell_all"
 
 market_data:
   # 启动时预订阅的聚宽格式代码列表。harvester 每日 09:26 会推送当日股票池+持仓，

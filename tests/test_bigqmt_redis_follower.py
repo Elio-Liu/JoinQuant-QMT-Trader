@@ -171,6 +171,14 @@ class BigQmtParsingAndPricingTests(unittest.TestCase):
             message["plan"]["codes_to_buy"], ["600000.XSHG", "000002.XSHE"]
         )
 
+    def test_resolve_sell_half_insufficient_lot_mode(self):
+        self.assertEqual(self.module._resolve_sell_half(100), 100)
+        self.assertEqual(self.module._resolve_sell_half(150), 150)
+        self.assertEqual(self.module._resolve_sell_half(100, "skip"), 0)
+        self.assertEqual(self.module._resolve_sell_half(150, "skip"), 0)
+        self.assertEqual(self.module._resolve_sell_half(300, "skip"), 100)
+        self.assertEqual(self.module._resolve_sell_half(1000, "skip"), 500)
+
     def test_code_and_tick_mapping(self):
         self.assertEqual(self.module.jq_code_to_qmt_code("510300.XSHG"), "510300.SH")
         self.assertEqual(self.module.jq_code_to_qmt_code("159915.XSHE"), "159915.SZ")
@@ -667,6 +675,35 @@ class BigQmtSubmissionTests(unittest.TestCase):
         self.runtime.on_timer(self.context)
 
         self.assertEqual(self.gateway.submissions[0][2], 700)
+
+    def test_sell_half_one_lot_sells_all_by_default(self):
+        self.gateway.positions["000001.SZ"] = 100
+        self.inbound.put(
+            trade_message(
+                "323-0", "sig-half-lot", action="sell",
+                amount=None, quantity_mode="sell_half",
+            )
+        )
+
+        self.runtime.on_timer(self.context)
+
+        self.assertEqual(self.gateway.submissions[0][2], 100)
+
+    def test_sell_half_below_one_lot_skips_when_configured(self):
+        self.config["sell_half_insufficient_lot_mode"] = "skip"
+        self.gateway.positions["000001.SZ"] = 100
+        self.inbound.put(
+            trade_message(
+                "324-0", "sig-half-skip", action="sell",
+                amount=None, quantity_mode="sell_half",
+            )
+        )
+
+        self.runtime.on_timer(self.context)
+
+        self.assertEqual(self.gateway.submissions, [])
+        self.assertIsNone(self.runtime.active)
+        self.assertEqual(self.acks.get_nowait(), "324-0")
 
     def test_strategy_whitelist_acks_unknown_strategy_without_order(self):
         self.config["allowed_strategy_ids"] = ["harvester"]

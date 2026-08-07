@@ -89,6 +89,44 @@ class IntentQuantityExecutionTests(unittest.TestCase):
         self.assertEqual(result.status, ExecutionStatus.FILLED)
         self.assertEqual(broker.submitted[0][1], 500)
 
+    def test_sell_half_one_lot_sells_all_by_default(self):
+        broker = FakeBroker(
+            {"order-1": [OrderSnapshot("order-1", BrokerOrderStatus.FILLED, 100)]},
+            available_positions={"000001.XSHE": 100},
+        )
+        market_data = FakeMarketData([Quote(last_price=10.0, bid1=9.99)])
+        engine = self._engine(broker, market_data)
+        signal = TradeSignal(
+            signal_id="s-half-lot", strategy_id="harvester", action=Action.SELL,
+            code="000001.XSHE", amount=0, reference_price=10.0,
+            created_at="2026-08-06 10:30:00", quantity_mode="sell_half",
+        )
+        result = engine.execute(signal)
+        self.assertEqual(result.status, ExecutionStatus.FILLED)
+        self.assertEqual(broker.submitted[0][1], 100)
+
+    def test_sell_half_below_one_lot_skips_when_configured(self):
+        broker = FakeBroker(
+            {},
+            available_positions={"000001.XSHE": 100},
+        )
+        market_data = FakeMarketData([Quote(last_price=10.0, bid1=9.99)])
+        engine = self._engine(
+            broker, market_data,
+            config=ExecutionConfig(
+                order_timeout_sec=0, max_attempts=2, poll_interval_sec=0,
+                sell_half_insufficient_lot_mode="skip",
+            ),
+        )
+        signal = TradeSignal(
+            signal_id="s-half-skip", strategy_id="harvester", action=Action.SELL,
+            code="000001.XSHE", amount=0, reference_price=10.0,
+            created_at="2026-08-06 10:30:00", quantity_mode="sell_half",
+        )
+        result = engine.execute(signal)
+        self.assertEqual(result.status, ExecutionStatus.SKIPPED_SMALL_POSITION)
+        self.assertEqual(broker.submitted, [])
+
     def test_auto_buy_computes_shares_from_real_funds(self):
         broker = FakeBroker(
             {"order-1": [OrderSnapshot("order-1", BrokerOrderStatus.FILLED, 2000)]},

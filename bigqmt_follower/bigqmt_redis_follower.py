@@ -56,6 +56,8 @@ CONFIG = {
     # 与 miniQMT 版同义: 策略白名单(空=不过滤) 与 意图信号单票买入上限。
     "allowed_strategy_ids": [],
     "max_single_position_pct": 0.2,
+    # sell_half 半仓取整不足一手(<200股)时的处理: sell_all=全卖(默认) / skip=跳过不卖。
+    "sell_half_insufficient_lot_mode": "sell_all",
 }
 
 # 竞价排队时段: 9:15~9:30 提交的委托都要等 9:30 连续竞价才可能成交。
@@ -295,12 +297,14 @@ def _resolve_sell_all(available_position):
     return max(int(available_position), 0)
 
 
-def _resolve_sell_half(available_position):
-    """卖一半: 向下取整到整手；不足一手全卖（与 miniQMT sizing 一致）。"""
+def _resolve_sell_half(available_position, insufficient_lot_mode="sell_all"):
+    """卖一半: 向下取整到整手；不足一手按模式处理（与 miniQMT sizing 一致）。"""
     position = max(int(available_position), 0)
     half = position // 2 // 100 * 100
     if half >= 100:
         return half
+    if insufficient_lot_mode == "skip":
+        return 0
     return position
 
 
@@ -959,7 +963,19 @@ class BigQmtRuntime(object):
                 self._ack_message(message["message_id"], message.get("parent_plan_id"))
                 return
             if resolved <= 0:
-                status = "SKIPPED_NO_POSITION" if signal["action"] == "sell" else "FAILED_RISK"
+                if signal["action"] == "sell":
+                    if (
+                        signal.get("quantity_mode") == "sell_half"
+                        and self.gateway.available_position(
+                            jq_code_to_qmt_code(signal["code"])
+                        )
+                        > 0
+                    ):
+                        status = "SKIPPED_SMALL_POSITION"
+                    else:
+                        status = "SKIPPED_NO_POSITION"
+                else:
+                    status = "FAILED_RISK"
                 _log(
                     "INFO",
                     "信号终态 %s status=%s %s数量=0 未下单"
@@ -1018,7 +1034,10 @@ class BigQmtRuntime(object):
         if quantity_mode == "sell_all":
             return _resolve_sell_all(self.gateway.available_position(qmt_code))
         if quantity_mode == "sell_half":
-            return _resolve_sell_half(self.gateway.available_position(qmt_code))
+            return _resolve_sell_half(
+                self.gateway.available_position(qmt_code),
+                self.config.get("sell_half_insufficient_lot_mode", "sell_all"),
+            )
         if quantity_mode == "auto_buy":
             tick = self.gateway.latest_tick(signal["code"])
             return _resolve_auto_buy(
@@ -1505,6 +1524,11 @@ def validate_config(config):
     pct = float(config.get("max_single_position_pct", 0.2))
     if not (0.0 < pct <= 1.0):
         raise RuntimeError("CONFIG.max_single_position_pct 必须位于 (0,1]")
+    half_mode = str(
+        config.get("sell_half_insufficient_lot_mode", "sell_all") or "sell_all"
+    ).strip().lower()
+    if half_mode not in ("sell_all", "skip"):
+        raise RuntimeError("CONFIG.sell_half_insufficient_lot_mode 必须是 sell_all 或 skip")
 
 
 def init(ContextInfo):

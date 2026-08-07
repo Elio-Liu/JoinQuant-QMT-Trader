@@ -164,6 +164,7 @@ class PlanDrivenConfigTests(unittest.TestCase):
         self.assertTrue(execution.plan_enabled)
         self.assertEqual(execution.plan_execute_at, "09:30:00")
         self.assertEqual(execution.max_single_position_pct, 0.2)
+        self.assertEqual(execution.sell_half_insufficient_lot_mode, "sell_all")
 
     def test_plan_driven_override(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -175,6 +176,7 @@ class PlanDrivenConfigTests(unittest.TestCase):
                 "  plan_enabled: false\n"
                 '  plan_execute_at: "09:31:00"\n'
                 "  max_single_position_pct: 0.25\n"
+                '  sell_half_insufficient_lot_mode: "skip"\n'
                 "state_db: state.db\n",
                 encoding="utf-8",
             )
@@ -182,6 +184,7 @@ class PlanDrivenConfigTests(unittest.TestCase):
         self.assertFalse(execution.plan_enabled)
         self.assertEqual(execution.plan_execute_at, "09:31:00")
         self.assertEqual(execution.max_single_position_pct, 0.25)
+        self.assertEqual(execution.sell_half_insufficient_lot_mode, "skip")
 
     def test_invalid_plan_values_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,6 +204,15 @@ class PlanDrivenConfigTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 load_config(bad_pct)
+            bad_half = Path(tmpdir) / "bad_half.yaml"
+            bad_half.write_text(
+                "redis:\n  host: 127.0.0.1\n"
+                'execution:\n  sell_half_insufficient_lot_mode: "partial"\n'
+                "state_db: state.db\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_config(bad_half)
 
 
 if __name__ == "__main__":

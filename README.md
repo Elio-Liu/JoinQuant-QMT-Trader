@@ -178,6 +178,7 @@ $env:REDIS_PASSWORD="你的 Redis 密码"
 | `execution.plan_enabled` | 日计划执行开关（默认 true） |
 | `execution.plan_execute_at` | plan 执行时刻 HH:MM:SS（默认 09:30:00） |
 | `execution.max_single_position_pct` | 单票买入上限=账户总资产×比例（默认 0.2） |
+| `execution.sell_half_insufficient_lot_mode` | `sell_half` 半仓不足一手时的处理：`sell_all`=全卖（默认）/ `skip`=跳过不卖 |
 | `execution.limit_down_sell_mode` | `queue`=确认跌停后挂跌停价排队，`skip`=跳过，`none`=普通定价 |
 | `execution.queue_sell_deadline` / `max_concurrent_queue_sells` | 跌停卖单截止撤单时间和同时排队上限 |
 | `execution.limit_up_buy_mode` | `queue`=确认涨停后挂涨停价排队，`skip`=跳过，`none`=普通定价 |
