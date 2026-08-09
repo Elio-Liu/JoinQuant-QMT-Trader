@@ -1,0 +1,42 @@
+# ============================================================================
+# Windows 交易机运行时依赖 —— `python main.py` 只需要这些
+# ============================================================================
+#   python -m pip install -r requirements.txt
+#
+# 本地开发和跑测试用 requirements-dev.txt（它会先装上本文件）。
+#
+# Python 版本要求：>= 3.11
+#   miniqmt_follower/models.py 用了 enum.StrEnum（3.11 才有），3.10 上整个包
+#   都 import 不进去，报 "cannot import name 'StrEnum' from 'enum'"。
+#   app.py 的括号化 with 语句另需 >= 3.10。main.py 启动时会硬校验一次。
+# ============================================================================
+
+# Redis Stream 消费组客户端。
+# 下限 4.5：本项目用到 health_check_interval / retry_on_timeout /
+# socket_keepalive（跨网络半死连接的三件套）与 xgroup_create(mkstream=True)。
+# 上限 <8：交易系统不接受依赖大版本自动跳变，升级前请先跑一遍测试套件。
+redis>=4.5,<8
+
+# config.yaml 解析。
+PyYAML>=6.0,<7
+
+# ---------------------------------------------------------------------------
+# 故意不在这里列的：xtquant
+# ---------------------------------------------------------------------------
+# xtquant 必须用**交易机上 miniQMT 自带的那一份**，版本要和券商的交易终端匹配。
+# PyPI 上确实有个同名包，但那是第三方上传的，且只有纯 Python 的部分能用：
+# xtquant.xtconstant 能 import，真正下单要的 xtquant.xttrader 依赖随终端分发的
+# 本地二进制 xtpythonclient，非 Windows / 非 miniQMT 环境一定 ImportError。
+# 所以 pip 装它既没用又会掩盖真正的问题 —— 按 README「准备环境」那节，
+# 先确认当前解释器 `from xtquant.xttrader import XtQuantTrader` 能过。
+#
+# ---------------------------------------------------------------------------
+# 其他运行环境的依赖（都不需要装本文件）
+# ---------------------------------------------------------------------------
+# bigqmt_follower/  —— 跑在大 QMT 内置解释器里，只用 redis，且写成了 Python 2/3
+#                      双兼容（`import Queue` 回退），不要求本仓库的 3.11 下限。
+# tools/            —— 两个收发测试脚本，零依赖单文件，只要 `pip install redis`，
+#                      Python 3.6+ 即可，故意不 import 本项目任何模块。
+# joinquant_signal_sender.py / strategies/
+#                   —— 跑在聚宽云端，平台已提供 pandas/numpy/jqdata；那边只需要
+#                      策略里能 `import redis`。

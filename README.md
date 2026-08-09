@@ -55,13 +55,17 @@
 
 - Windows 10/11，装好并登录了 miniQMT，账号能手工下单、撤单、查委托
 - 一个 Windows 和聚宽都能访问的 Redis
-- 一个能 `import xtquant` 的 Python 环境（xtquant 通常随 miniQMT 提供，别从别的环境乱拷）
+- 一个能 `import xtquant` 的 **Python 3.11 或更高版本**环境（xtquant 通常随 miniQMT 提供，别从别的环境乱拷）
+
+3.11 是硬下限：`miniqmt_follower/models.py` 用了 `enum.StrEnum`，3.10 上整个包都 import 不进去。`python main.py` 启动时会先校验这一条，不达标会直接给一句人话而不是从包深处冒出来的 ImportError。
 
 装公共依赖：
 
 ```powershell
-python -m pip install redis PyYAML
+python -m pip install -r requirements.txt
 ```
+
+只装两个包：`redis` 和 `PyYAML`。**xtquant 不在里面**，它必须用交易机上 miniQMT 自带的那一份——PyPI 上那个同名包是第三方上传的，真正下单要的 `xtquant.xttrader` 依赖随终端分发的本地二进制，pip 装它只会掩盖问题。理由和其他运行环境（大 QMT、测试脚本、聚宽云端）各自的依赖，都写在 `requirements.txt` 的注释里。
 
 先确认当前解释器能用 xtquant：
 
@@ -287,9 +291,12 @@ Redis Stream 每条消息用字段 `payload` 装 JSON。精确买卖信号：
 `tests/` 是本地测试套件，不随仓库分发（里面可能有依赖私有策略副本的用例）。在配好本地副本的机器上：
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m unittest discover -v
 python -m compileall miniqmt_follower bigqmt_follower tests
 ```
+
+测试全部用 stdlib unittest 注入假对象，不需要真实 Redis、QMT 或网络，macOS/Linux 上照样跑。非 Windows 机器会有一批 skip——`xtquant.xttrader` 的本地二进制只随 Windows 版 miniQMT 分发，那是环境限制不是缺陷。
 
 只跑核心执行链路：
 
