@@ -43,9 +43,9 @@
 | `redis.group` | `qmt_executors_win_a` | `qmt_executors_win_b` |
 | `redis.consumer` | `win-qmt-01` | `win-qmt-02` |
 | `trading.account_id` | 账号 A | 账号 B |
-| `redis.allowed_strategy_ids` | `["harvester"]` | `["harvester"]` |
+| `redis.allowed_strategy_ids` | `["YOUR_STRATEGY_ID"]` | `["YOUR_STRATEGY_ID"]` |
 
-两点要注意。新消费组从 Stream 最新位置开始消费，盘中新加的机器不会重放早上的消息（早上的 plan 没有过期时间，重放会误建仓）；错过 plan 的机器当天不买，宁可少买不盲买。每台机器有独立的 SQLite 账本和日志，盘后按机器对账，单台宕机不影响其他机器。
+两点要注意。新消费组从 Stream 最新位置开始消费，盘中新加的机器不会重放早上的消息（早上的 plan 没有过期时间，重放会误建仓）；错过 plan 的机器当天不买，宁可少买不盲买。已经存在的组在交易机重启后会找回本组未确认消息，先按 `signal_id` 去 QMT 订单备注核对，再决定继续、确认或停机待人工处理。每台机器有独立的 SQLite 账本和日志，盘后按机器对账，单台宕机不影响其他机器。
 
 ## 快速开始（部署）
 
@@ -130,7 +130,7 @@ publish_sell_all_to_redis(context, "000002.XSHE", 9.8)     # 清仓
 publish_daily_plan_to_redis(context, ["000001.XSHE"], ["600000.XSHG", "000002.XSHE"])
 ```
 
-以龙头情绪收割机的开盘时序为例：09:25:45 选股，09:26 推送预订阅，09:27 竞价止损（收集清仓清单），09:28 发日计划，09:30 执行端先清仓、再按真实可用资金等分买入。10:30 卖半仓、14:30 清仓、盘中硬止损，都由聚宽发 `sell_half` / `sell_all` 意图信号，执行端按真实持仓算数量。
+对于开盘调仓策略，可以先推送预订阅和待卖清单，再发日计划。执行端会先处理盘前卖单，买单等到开盘屏障放行后，按各账户真实可用资金计算数量。具体选股、发送和卖出时间由使用者自己的策略决定，不在公开仓库中记录。
 
 发送函数会按 `context.current_dt` 和系统时间判断回测还是实盘。回测、研究、历史补跑不会写 Redis；实盘 XADD 成功也只代表 Redis 收到了，不代表已经下单成交。
 
@@ -145,8 +145,10 @@ publish_daily_plan_to_redis(context, ["000001.XSHE"], ["600000.XSHG", "000002.XS
 | `execution.order_timeout_sec` / `max_attempts` / `max_total_duration_sec` | 单次等待、最多委托次数、总执行预算 |
 | `execution.cancel_confirm_timeout_sec` | 撤单后等真实终态的时长，独立于总预算，默认 30，别调太小 |
 | `execution.signal_expire_seconds` | 信号过期秒数，默认 600（10 分钟），0=不过期 |
-| `execution.plan_enabled` / `plan_execute_at` | 日计划开关和执行时刻，默认开、09:30:00 |
-| `execution.max_single_position_pct` | 自动买入单票上限=总资产×比例，默认 0.2 |
+| `execution.plan_enabled` | 日计划开关，默认开启 |
+| `execution.plan_execute_at` | 仅兼容旧配置；当前不按它延时，买入等待由09:30开盘屏障控制 |
+| `redis.pending_claim_idle_ms` / `pending_scan_interval_sec` | 其他旧进程的遗留消息超过多久才接管、多久检查一次，默认60秒/5秒；本机同 consumer 重启时立即核对 |
+| `execution.max_single_position_pct` | 自动买入单票上限=总资产×比例，默认 0.5 |
 | `execution.sell_half_insufficient_lot_mode` | 半仓不足一手时 `sell_all`=全卖（默认）/ `skip`=不卖 |
 | `execution.limit_down_sell_mode` / `limit_up_buy_mode` | 跌停卖/涨停买的处理：`queue`=挂涨跌停价排队、`skip`=跳过、`none`=普通定价 |
 | `execution.queue_sell_deadline` / `queue_buy_deadline` | 排队截止时间，默认 14:56:30 |
@@ -187,6 +189,8 @@ xtquant 下单            passorder 下单
 
 ```text
 RedisStreamClient.read_forever()
+  → 定期检查本账号消费组的未确认消息，排除当前正在执行的消息
+  → 遗留消息先按 signal_id 查询 QMT 订单备注，确认无旧单才允许继续
   → 预订阅指令：立即订阅行情并 ACK
   → 交易信号：按方向进买入/卖出并发线程池
   → 09:25–09:30 盘前卖单先登记预挂，买单等开盘屏障
@@ -212,8 +216,8 @@ Redis Stream 每条消息用字段 `payload` 装 JSON。精确买卖信号：
 
 ```json
 {
-  "signal_id": "hunter-20260713093001-510300XSHG-buy-1000",
-  "strategy_id": "hunter",
+  "signal_id": "strategy-a-20260713093001-510300XSHG-buy-1000",
+  "strategy_id": "strategy_a",
   "mode": "live",
   "action": "buy",
   "code": "510300.XSHG",
@@ -246,13 +250,13 @@ Redis Stream 每条消息用字段 `payload` 装 JSON。精确买卖信号：
 
 ```json
 {
-  "signal_id": "harvester-20260806-plan",
-  "strategy_id": "harvester",
+  "signal_id": "strategy-a-20260806-plan",
+  "strategy_id": "strategy_a",
   "mode": "live",
   "action": "plan",
   "codes_to_sell": ["000001.XSHE"],
   "codes_to_buy": ["600000.XSHG", "000002.XSHE"],
-  "created_at": "2026-08-06 09:28:00",
+  "created_at": "2026-08-06 09:30:01",
   "sent_at_ms": 1786044480000
 }
 ```
@@ -279,7 +283,8 @@ Redis Stream 每条消息用字段 `payload` 装 JSON。精确买卖信号：
 - [ ] `config.yaml` 等本机配置、聚宽生产配置、日志、SQLite 数据库没进 Git
 - [ ] Redis 没暴露公网，走内网、VPN、白名单或安全组
 - [ ] 聚宽发送函数的 Stream 和 Windows 端 `config.yaml` 一致
-- [ ] 同一批信号只有一个执行端、一个目标账户
+- [ ] 交易机 A 和 B 使用同一 Stream、不同 group、不同 consumer、不同 account_id 和 SQLite
+- [ ] 同一资金账户只有一个执行进程（重复启动会被账本锁拒绝）
 - [ ] Windows、聚宽、Redis 时间同步（延迟日志和过期判断都依赖它）
 - [ ] 券商行情字段、资金/持仓字段、订单状态和撤单返回值核对过
 - [ ] 仿真盘跑过单笔买卖、拒单、部分成交、超时撤单、批量信号
@@ -338,9 +343,22 @@ client.publish_signal({...})  # 交易信号 / plan / subscribe 均可
 
 执行端会熔断。去 QMT 委托列表人工确认还有没有活动订单，状态不明时不要直接重启重发。
 
-### 重启后没有自动处理旧 pending
+### 重启后如何处理旧 pending
 
-程序只消费新消息，不会自动认领别的 consumer 的 pending。先核对原委托是否可能成交，再按 SQLite 和 Redis pending 人工恢复。
+程序重启时会立即拿回同 consumer 上次留下的未确认消息；其他旧 consumer 的消息超过 `pending_claim_idle_ms` 后才接管。恢复时先用由 `signal_id` 算出的 24 位稳定备注查 QMT 旧单（避免 miniQMT 截断长备注）：找到旧单就继续核对，不会直接重下；信号已开始处理但 QMT 查不到对应单、QMT 查询失败、或同一编号出现多笔活动订单时，会标记 `RECOVERY_REQUIRED`、停止该账号继续下单并保留 Redis pending。
+
+出现 `RECOVERY_REQUIRED` 后：先停止该账号的跟单程序，在 QMT 委托/成交列表按 `signal_id` 备注核对，确定实际成交数量和最终状态。确认完成后才运行：
+
+```powershell
+python -m miniqmt_follower.recovery_cli `
+  --state-db <该账号的db路径> `
+  --signal-id <日志里的signal_id> `
+  --status filled `
+  --filled-qty <实际成交股数> `
+  --confirm-qmt-reconciled
+```
+
+`--status` 可用 `filled`、`partially_filled_timeout`、`failed_timeout`、`failed_broker`。工具会检查跟单程序已停止，且只允许处理 `RECOVERY_REQUIRED`；然后重启跟单程序，它会确认这条 Redis 消息。不能手工重发交易信号。
 
 ## 相关文档
 

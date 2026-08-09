@@ -31,6 +31,9 @@ class RedisConfig:
     socket_timeout_margin_sec: float = 5.0
     # redis-py 定期 PING 探活间隔, 用于发现 TCP 还在但对端已消失的"半死连接"。
     health_check_interval_sec: int = 30
+    # 已被旧进程取走、超过该空闲时间仍未确认的消息，允许当前进程接管核对。
+    pending_claim_idle_ms: int = 60000
+    pending_scan_interval_sec: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,28 @@ def _resolve_env_placeholder(value: object) -> object:
     return value
 
 
+def _validated_bool(raw_value: object, field: str) -> bool:
+    """YAML 开关必须是真布尔值，避免 bool("false") 反而得到 True。"""
+    if not isinstance(raw_value, bool):
+        raise ValueError(f"{field} 必须写成 YAML 布尔值 true/false: {raw_value!r}")
+    return raw_value
+
+
+def _validated_string_list(raw_value: object, field: str) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, list):
+        raise ValueError(f"{field} 必须是 YAML 列表: {raw_value!r}")
+    return tuple(str(item) for item in raw_value)
+
+
+def _validated_positive_number(raw_value: object, field: str, cast):
+    value = cast(raw_value)
+    if value <= 0:
+        raise ValueError(f"{field} 必须大于0: {raw_value!r}")
+    return value
+
+
 def _validated_cash_fee_buffer_pct(raw_value: object) -> float:
     """校验买入资金的手续费缓冲比例, 允许 [0, 0.05)。"""
     pct = float(raw_value)
@@ -184,8 +209,9 @@ def load_config(path: str | Path) -> RuntimeConfig:
             group=str(redis_raw.get("group", "qmt_executors")),
             consumer=str(redis_raw.get("consumer", "win-qmt-01")),
             block_ms=int(redis_raw.get("block_ms", 1000)),
-            allowed_strategy_ids=tuple(
-                str(sid) for sid in redis_raw.get("allowed_strategy_ids", []) or []
+            allowed_strategy_ids=_validated_string_list(
+                redis_raw.get("allowed_strategy_ids", []),
+                "redis.allowed_strategy_ids",
             ),
             socket_connect_timeout_sec=float(
                 redis_raw.get("socket_connect_timeout_sec", 3.0)
@@ -195,6 +221,16 @@ def load_config(path: str | Path) -> RuntimeConfig:
             ),
             health_check_interval_sec=int(
                 redis_raw.get("health_check_interval_sec", 30)
+            ),
+            pending_claim_idle_ms=_validated_positive_number(
+                redis_raw.get("pending_claim_idle_ms", 60000),
+                "redis.pending_claim_idle_ms",
+                int,
+            ),
+            pending_scan_interval_sec=_validated_positive_number(
+                redis_raw.get("pending_scan_interval_sec", 5.0),
+                "redis.pending_scan_interval_sec",
+                float,
             ),
         ),
         execution=ExecutionConfig(
@@ -214,11 +250,13 @@ def load_config(path: str | Path) -> RuntimeConfig:
             auction_aggressive_pct=float(
                 execution_raw.get("auction_aggressive_pct", 0.02)
             ),
-            skip_sell_when_limit_down=bool(
-                execution_raw.get("skip_sell_when_limit_down", False)
+            skip_sell_when_limit_down=_validated_bool(
+                execution_raw.get("skip_sell_when_limit_down", False),
+                "execution.skip_sell_when_limit_down",
             ),
-            skip_buy_when_limit_up=bool(
-                execution_raw.get("skip_buy_when_limit_up", False)
+            skip_buy_when_limit_up=_validated_bool(
+                execution_raw.get("skip_buy_when_limit_up", False),
+                "execution.skip_buy_when_limit_up",
             ),
             limit_down_sell_mode=_validated_limit_down_sell_mode(
                 execution_raw.get("limit_down_sell_mode", "")
@@ -241,7 +279,9 @@ def load_config(path: str | Path) -> RuntimeConfig:
             max_concurrent_queue_buys=int(
                 execution_raw.get("max_concurrent_queue_buys", 5)
             ),
-            plan_enabled=bool(execution_raw.get("plan_enabled", True)),
+            plan_enabled=_validated_bool(
+                execution_raw.get("plan_enabled", True), "execution.plan_enabled"
+            ),
             plan_execute_at=_validated_plan_execute_at(
                 execution_raw.get("plan_execute_at", "09:30:00")
             ),
@@ -259,15 +299,18 @@ def load_config(path: str | Path) -> RuntimeConfig:
             ),
         ),
         trading=TradingConfig(
-            enabled=bool(trading_raw.get("enabled", False)),
+            enabled=_validated_bool(
+                trading_raw.get("enabled", False), "trading.enabled"
+            ),
             account_id=str(trading_raw.get("account_id", "")),
             miniqmt_path=str(trading_raw.get("miniqmt_path", "")),
             session_id=int(trading_raw.get("session_id", 0)),
             strategy_name=str(trading_raw.get("strategy_name", "tidal_quant")),
         ),
         market_data=MarketDataConfig(
-            pre_subscribe_codes=tuple(
-                str(code) for code in market_data_raw.get("pre_subscribe_codes", [])
+            pre_subscribe_codes=_validated_string_list(
+                market_data_raw.get("pre_subscribe_codes", []),
+                "market_data.pre_subscribe_codes",
             ),
         ),
         state_db=Path(raw.get("state_db", "data/miniqmt_follower.db")),

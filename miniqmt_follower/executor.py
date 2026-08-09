@@ -27,6 +27,7 @@ from miniqmt_follower.models import (
     OrderSnapshot,
     Quote,
     TradeSignal,
+    is_terminal_execution_status,
 )
 from miniqmt_follower.opening import is_preopen_sell
 from miniqmt_follower.pricing import calculate_order_price, tick_size_for
@@ -34,6 +35,9 @@ from miniqmt_follower.sizing import resolve_sell_all, resolve_sell_half, shares_
 from miniqmt_follower.store import SQLiteExecutionStore
 
 logger = logging.getLogger(__name__)
+
+_RECOVERY_VISIBILITY_CHECKS = 3
+_RECOVERY_VISIBILITY_INTERVAL_SEC = 0.1
 
 
 class MarketDataAdapter(Protocol):
@@ -76,6 +80,10 @@ class BrokerAdapter(Protocol):
     def submit_order(self, signal: TradeSignal, quantity: int, price: float) -> str:
         pass
 
+    def query_orders_by_signal_id(self, signal_id: str) -> tuple[OrderSnapshot, ...]:
+        """按下单备注中的 signal_id 查询本账号订单，供崩溃恢复核对。"""
+        pass
+
     def get_order_snapshot(self, order_id: str) -> OrderSnapshot:
         pass
 
@@ -110,6 +118,7 @@ _STATUS_LABELS: dict[ExecutionStatus, str] = {
     ExecutionStatus.LIMIT_DOWN_QUEUE_EXPIRED: "跌停排队未成",
     ExecutionStatus.QUEUED_LIMIT_UP: "涨停排队中",
     ExecutionStatus.LIMIT_UP_QUEUE_EXPIRED: "涨停排队未成",
+    ExecutionStatus.RECOVERY_REQUIRED: "需要人工核对",
 }
 
 _BROKER_STATUS_LABELS: dict[BrokerOrderStatus, str] = {
@@ -304,6 +313,221 @@ class OrderExecutionEngine:
                     batch_key, available_cash, signal.budget_group_size or 1, budget,
                 )
             return budget
+
+    def recover(self, signal: TradeSignal) -> ExecutionResult:
+        """核对 Redis 遗留信号与 QMT 订单；先找旧单，绝不直接重复提交。"""
+        stored = self.store.get_signal_optional(signal.signal_id)
+        if stored is None:
+            return self.execute(signal)
+        attempts = self.store.list_attempts(signal.signal_id)
+        if stored.status == ExecutionStatus.RECOVERY_REQUIRED:
+            halt_reason = self._set_trading_halt(
+                f"unresolved recovery required for {signal.signal_id}"
+            )
+            return ExecutionResult(
+                signal_id=signal.signal_id,
+                status=ExecutionStatus.RECOVERY_REQUIRED,
+                requested_qty=signal.amount,
+                filled_qty=stored.filled_qty,
+                attempts=len(attempts),
+                message=halt_reason,
+            )
+        if is_terminal_execution_status(stored.status):
+            return ExecutionResult(
+                signal_id=signal.signal_id,
+                status=stored.status,
+                requested_qty=signal.amount,
+                filled_qty=stored.filled_qty,
+                attempts=len(attempts),
+                message="recovered terminal signal",
+            )
+
+        try:
+            snapshots: tuple[OrderSnapshot, ...] = ()
+            for check in range(_RECOVERY_VISIBILITY_CHECKS):
+                snapshots = self.broker.query_orders_by_signal_id(signal.signal_id)
+                if snapshots or check + 1 >= _RECOVERY_VISIBILITY_CHECKS:
+                    break
+                time.sleep(_RECOVERY_VISIBILITY_INTERVAL_SEC)
+        except Exception as exc:
+            return self._recovery_required(
+                signal, attempts, f"QMT订单核对失败: {exc}"
+            )
+
+        if not snapshots:
+            return self._recovery_required(
+                signal,
+                attempts,
+                "信号已开始处理，但QMT未返回对应订单；"
+                "无法排除已报单但备注未可见",
+            )
+
+        by_id = {snapshot.order_id: snapshot for snapshot in snapshots}
+        for snapshot in snapshots:
+            self.store.upsert_recovered_attempt(
+                signal.signal_id,
+                snapshot.order_id,
+                max(snapshot.quantity, snapshot.filled_qty),
+                snapshot.price,
+                snapshot.status.value,
+                snapshot.filled_qty,
+            )
+
+        active = [
+            snapshot for snapshot in snapshots
+            if snapshot.status not in _TERMINAL_ORDER_STATUSES
+        ]
+        if len(active) > 1:
+            return self._recovery_required(
+                signal,
+                self.store.list_attempts(signal.signal_id),
+                "同一信号发现多笔未终态QMT订单",
+            )
+        if active:
+            current = active[0]
+            try:
+                if stored.status in {
+                    ExecutionStatus.QUEUED_LIMIT_DOWN,
+                    ExecutionStatus.QUEUED_LIMIT_UP,
+                }:
+                    current = self._wait_recovered_queue_order(current, stored.status)
+                else:
+                    current = self._wait_for_terminal_or_timeout(current.order_id)
+                if current.status not in _TERMINAL_ORDER_STATUSES:
+                    current = self._cancel_and_wait_for_terminal(
+                        current.order_id,
+                        time.monotonic() + self.config.cancel_confirm_timeout_sec,
+                    )
+            except Exception as exc:
+                return self._recovery_required(
+                    signal,
+                    self.store.list_attempts(signal.signal_id),
+                    f"遗留QMT订单终态不明: {exc}",
+                )
+            current = replace(
+                current,
+                quantity=current.quantity or active[0].quantity,
+                price=current.price or active[0].price,
+            )
+            by_id[current.order_id] = current
+            self.store.upsert_recovered_attempt(
+                signal.signal_id,
+                current.order_id,
+                max(current.quantity, current.filled_qty),
+                current.price,
+                current.status.value,
+                current.filled_qty,
+            )
+
+        recovered_attempts = self.store.list_attempts(signal.signal_id)
+        quantity_by_id = {
+            attempt.broker_order_id: attempt.quantity for attempt in recovered_attempts
+        }
+        total_filled = sum(
+            max(
+                0,
+                min(
+                    snapshot.filled_qty,
+                    snapshot.quantity or quantity_by_id.get(snapshot.order_id, 0),
+                ),
+            )
+            for snapshot in by_id.values()
+        )
+        target_qty = signal.amount if signal.quantity_mode == "exact" else 0
+        if target_qty <= 0 and recovered_attempts:
+            target_qty = recovered_attempts[0].quantity
+        if target_qty > 0 and total_filled >= target_qty:
+            status = ExecutionStatus.FILLED
+        elif total_filled > 0:
+            status = ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
+        elif any(
+            snapshot.status == BrokerOrderStatus.REJECTED
+            for snapshot in by_id.values()
+        ):
+            status = ExecutionStatus.FAILED_BROKER
+        else:
+            status = ExecutionStatus.FAILED_TIMEOUT
+        logger.warning(
+            "%s | %s | 遗留订单核对完成 | 状态=%s | 成交=%s/%s",
+            signal.console_event("重试"), signal.display_code,
+            status.value, total_filled, target_qty,
+        )
+        return self._finish(
+            signal,
+            status,
+            total_filled,
+            len(recovered_attempts),
+            "recovered from QMT order remarks",
+        )
+
+    def _wait_recovered_queue_order(
+        self,
+        initial: OrderSnapshot,
+        stored_status: ExecutionStatus,
+    ) -> OrderSnapshot:
+        if stored_status == ExecutionStatus.QUEUED_LIMIT_DOWN:
+            wait_sec = _seconds_until_queue_sell_deadline(self.config.queue_sell_deadline)
+        else:
+            wait_sec = _seconds_until_queue_buy_deadline(self.config.queue_buy_deadline)
+        deadline = time.monotonic() + max(0.0, wait_sec)
+        current = initial
+        while (
+            current.status not in _TERMINAL_ORDER_STATUSES
+            and time.monotonic() < deadline
+        ):
+            interval = self.config.queue_sell_poll_interval_sec
+            if interval > 0:
+                time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            current = self.broker.get_order_snapshot(current.order_id)
+        return current
+
+    def _recovery_required(
+        self,
+        signal: TradeSignal,
+        attempts,
+        reason: str,
+    ) -> ExecutionResult:
+        halt_reason = self._set_trading_halt(
+            f"recovery required for {signal.signal_id}: {reason}"
+        )
+        logger.critical(
+            "%s | %s | 需要人工核对 | %s",
+            signal.console_event("停止"), signal.display_code, reason,
+        )
+        stored_filled = self.store.get_signal(signal.signal_id).filled_qty
+        attempts_filled = sum(
+            max(0, min(attempt.filled_qty, attempt.quantity))
+            for attempt in attempts
+        )
+        return self._finish(
+            signal,
+            ExecutionStatus.RECOVERY_REQUIRED,
+            max(stored_filled, attempts_filled),
+            len(attempts),
+            halt_reason,
+        )
+
+    @staticmethod
+    def _defer_for_recovery(
+        signal: TradeSignal,
+        filled_qty: int,
+        attempts: int,
+        message: str,
+    ) -> ExecutionResult:
+        """订单状态当下不明：保留 SQLite 中间态，交给 pending 恢复核单。
+
+        不能在这里落 RECOVERY_REQUIRED，否则恢复分支会把它当成
+        “已经人工介入”而不再自动查 QMT。只有恢复查询仍不能
+        证明旧单状态时，_recovery_required 才把它持久化。
+        """
+        return ExecutionResult(
+            signal_id=signal.signal_id,
+            status=ExecutionStatus.RECOVERY_REQUIRED,
+            requested_qty=signal.amount,
+            filled_qty=filled_qty,
+            attempts=attempts,
+            message=message,
+        )
 
     def execute(self, signal: TradeSignal) -> ExecutionResult:
         # 延迟打点起点: 从工作线程真正开始处理这条信号算起。
@@ -619,13 +843,8 @@ class OrderExecutionEngine:
                     "%s | %s | 第%02d次 | 下单受理状态不明，停止后续交易 | %s",
                     signal.console_event("停止"), code_label, attempts, exc,
                 )
-                status = (
-                    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                    if total_filled
-                    else ExecutionStatus.FAILED_BROKER
-                )
-                return self._finish(
-                    signal, status, total_filled, attempts, halt_reason,
+                return self._defer_for_recovery(
+                    signal, total_filled, attempts, halt_reason,
                 )
             except Exception as exc:
                 logger.error(
@@ -661,13 +880,8 @@ class OrderExecutionEngine:
                     "%s | %s | 查单失败，订单终态不明，停止后续交易 | QMT单号=%s | %s",
                     signal.console_event("停止"), code_label, order_id, exc,
                 )
-                status = (
-                    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                    if total_filled
-                    else ExecutionStatus.FAILED_BROKER
-                )
-                return self._finish(
-                    signal, status, total_filled, attempts, halt_reason,
+                return self._defer_for_recovery(
+                    signal, total_filled, attempts, halt_reason,
                 )
             if snapshot.status not in _TERMINAL_ORDER_STATUSES:
                 try:
@@ -689,13 +903,8 @@ class OrderExecutionEngine:
                         "%s | %s | 撤单终态未确认，停止后续交易 | QMT单号=%s | %s",
                         signal.console_event("停止"), code_label, order_id, exc,
                     )
-                    status = (
-                        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                        if total_filled
-                        else ExecutionStatus.FAILED_BROKER
-                    )
-                    return self._finish(
-                        signal, status, total_filled, attempts, halt_reason,
+                    return self._defer_for_recovery(
+                        signal, total_filled, attempts, halt_reason,
                     )
             self.store.update_attempt(order_id, snapshot.status.value, snapshot.filled_qty)
 
@@ -792,8 +1001,8 @@ class OrderExecutionEngine:
         """竞价时段放宽尝试次数上限。
 
         盘前(9:15~9:30)柜台若拒收申报, 每次拒单都消耗一次 attempt。原先固定
-        0.05 秒退避配 max_attempts=20, 意味着 20 次尝试在 1 秒内烧光 —— 09:28
-        提交的开盘清仓单在距开盘还有 119 秒时就已经放弃, 而卖单一进终态就会
+        0.05 秒退避配 max_attempts=20, 意味着 20 次尝试在 1 秒内烧光 —— 盘前
+        提交的开盘清仓单可能在距开盘还有很久时就已经放弃, 而卖单一进终态就会
         释放开盘买入屏障, 账户直接变成"只买不卖"。
 
         竞价时段改为按"剩余秒数 ÷ 退避间隔"给出足够次数, 让重试均匀铺满到开盘。
@@ -1091,13 +1300,8 @@ class OrderExecutionEngine:
                     "%s | %s | 涨停排队受理状态不明，停止后续交易 | %s",
                     signal.console_event("停止"), code_label, exc,
                 )
-                status = (
-                    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                    if total_filled
-                    else ExecutionStatus.FAILED_BROKER
-                )
-                return self._finish(
-                    signal, status, total_filled, attempt_no, halt_reason,
+                return self._defer_for_recovery(
+                    signal, total_filled, attempt_no, halt_reason,
                 )
             except Exception as exc:
                 logger.error(
@@ -1176,13 +1380,8 @@ class OrderExecutionEngine:
                     "QMT单号=%s | %s",
                     signal.console_event("停止"), code_label, order_id, exc,
                 )
-                status = (
-                    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                    if reconciled_total
-                    else ExecutionStatus.FAILED_BROKER
-                )
-                return self._finish(
-                    signal, status, reconciled_total, attempts, halt_reason,
+                return self._defer_for_recovery(
+                    signal, reconciled_total, attempts, halt_reason,
                 )
 
             assert snapshot is not None
@@ -1204,13 +1403,8 @@ class OrderExecutionEngine:
                         "%s | %s | 涨停排队撤单终态未确认，停止后续交易 | QMT单号=%s | %s",
                         signal.console_event("停止"), code_label, order_id, exc,
                     )
-                    status = (
-                        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                        if reconciled_total
-                        else ExecutionStatus.FAILED_BROKER
-                    )
-                    return self._finish(
-                        signal, status, reconciled_total, attempts, halt_reason,
+                    return self._defer_for_recovery(
+                        signal, reconciled_total, attempts, halt_reason,
                     )
 
             self.store.update_attempt(order_id, snapshot.status.value, snapshot.filled_qty)
@@ -1375,17 +1569,8 @@ class OrderExecutionEngine:
                     "%s | %s | 跌停排队受理状态不明，停止后续交易 | %s",
                     signal.console_event("停止"), code_label, exc,
                 )
-                status = (
-                    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                    if total_filled
-                    else ExecutionStatus.FAILED_BROKER
-                )
-                return self._finish(
-                    signal,
-                    status,
-                    total_filled,
-                    attempt_no,
-                    halt_reason,
+                return self._defer_for_recovery(
+                    signal, total_filled, attempt_no, halt_reason,
                 )
             except Exception as exc:
                 logger.error(
@@ -1452,13 +1637,8 @@ class OrderExecutionEngine:
                     "QMT单号=%s | %s",
                     signal.console_event("停止"), code_label, order_id, exc,
                 )
-                status = (
-                    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                    if reconciled_total
-                    else ExecutionStatus.FAILED_BROKER
-                )
-                return self._finish(
-                    signal, status, reconciled_total, attempts, halt_reason,
+                return self._defer_for_recovery(
+                    signal, reconciled_total, attempts, halt_reason,
                 )
 
             assert snapshot is not None
@@ -1481,13 +1661,8 @@ class OrderExecutionEngine:
                         "%s | %s | 排队单撤单终态未确认，停止后续交易 | QMT单号=%s | %s",
                         signal.console_event("停止"), code_label, order_id, exc,
                     )
-                    status = (
-                        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                        if total_filled
-                        else ExecutionStatus.FAILED_BROKER
-                    )
-                    return self._finish(
-                        signal, status, total_filled, attempts, halt_reason,
+                    return self._defer_for_recovery(
+                        signal, total_filled, attempts, halt_reason,
                     )
 
             self.store.update_attempt(order_id, snapshot.status.value, snapshot.filled_qty)

@@ -101,7 +101,12 @@ def submit_plan_tasks(
             if combined_done:
                 return
             combined_done = True
-        combined.set_result([child.result() for child in children])
+        try:
+            results = [child.result() for child in children]
+        except Exception as exc:
+            combined.set_exception(exc)
+        else:
+            combined.set_result(results)
 
     for child in children:
         child.add_done_callback(_combine)

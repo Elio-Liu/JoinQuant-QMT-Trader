@@ -12,7 +12,7 @@
 
 -r requirements.txt
 
-# 只有 tests/test_stable_discount_hunter_logging.py 需要它：那个用例要在本地
+# 只有一个本地策略日志用例需要它：那个用例要在本地
 # 重建聚宽云端的运行环境（平台自带 pandas），才能对私有策略副本做契约测试。
 # 模块级 import，所以缺了它整个测试文件会直接 import 失败而不是跳过。
 pandas>=1.5

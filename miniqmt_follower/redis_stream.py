@@ -5,7 +5,8 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from collections.abc import Callable
 from typing import Any
 
 from miniqmt_follower.config import RedisConfig
@@ -26,6 +27,7 @@ class WatchlistCommand:
 
     codes: tuple[str, ...]
     strategy_id: str = ""
+    mode: str = "live"
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class StreamMessage:
     watchlist: WatchlistCommand | None = None
     plan: DailyPlan | None = None
     rejected: str | None = None
+    recovered: bool = False
 
 
 class RedisStreamClient:
@@ -150,6 +153,7 @@ class RedisStreamClient:
         block_ms: int | None = None,
         count: int = 10,
         stop_event: threading.Event | None = None,
+        active_message_ids_provider: Callable[[], set[str]] | None = None,
     ) -> Iterator[StreamMessage | None]:
         """持续消费新消息。
 
@@ -169,6 +173,7 @@ class RedisStreamClient:
         effective_block_ms = self.config.block_ms if block_ms is None else block_ms
         attempt = 0
         connected = False
+        next_pending_scan = 0.0
         while True:
             if stop_event and stop_event.is_set():
                 logger.debug("🛑 read_forever 收到停止信号，退出内部循环")
@@ -180,6 +185,33 @@ class RedisStreamClient:
                     if attempt:
                         logger.info("【Redis】🔄 连接已恢复 | 第 %s 次重试后重新消费", attempt)
                     attempt = 0
+                now = time.monotonic()
+                if (
+                    active_message_ids_provider is not None
+                    and now >= next_pending_scan
+                ):
+                    active_ids = active_message_ids_provider()
+                    # XPENDING 是从最旧消息开始取固定条数。若前面
+                    # 全是正在执行的消息，只查 count 条会让后面的失败
+                    # 消息永远露不出来，因此查询窗口要包住已排除数。
+                    pending_scan_count = max(count, len(active_ids) + 100)
+                    # 先立即捡回本 consumer 自己留下的消息。consumer 名在每台
+                    # 交易机上是稳定配置，进程重启后仍相同，因此无需白等 60 秒。
+                    owned = self.claim_stale_pending(
+                        exclude_message_ids=active_ids,
+                        count=pending_scan_count,
+                        current_consumer_only=True,
+                    )
+                    owned_ids = {message.message_id for message in owned}
+                    # 再接管同一账号组内由旧 consumer 留下、已经长期无人处理的
+                    # 消息。独立账号使用独立 group，不会把另一账号的消息拿走。
+                    stale = self.claim_stale_pending(
+                        exclude_message_ids=active_ids | owned_ids,
+                        count=pending_scan_count + len(owned_ids),
+                    )
+                    next_pending_scan = now + self.config.pending_scan_interval_sec
+                    for recovered_message in (*owned, *stale):
+                        yield recovered_message
                 response = self.client.xreadgroup(
                     self.config.group,
                     self.config.consumer,
@@ -233,6 +265,62 @@ class RedisStreamClient:
         except Exception as exc:
             logger.error("【Redis】❌ 消息确认失败 | msg_id=%s | %s", message_id, exc)
 
+    def claim_stale_pending(
+        self,
+        *,
+        exclude_message_ids: set[str] | None = None,
+        count: int = 100,
+        current_consumer_only: bool = False,
+    ) -> list[StreamMessage]:
+        """接管本消费组中长期未确认的消息；正在本进程执行的消息必须排除。"""
+        excluded = exclude_message_ids or set()
+        idle_ms = 0 if current_consumer_only else self.config.pending_claim_idle_ms
+        pending_kwargs = {
+            "min": "-",
+            "max": "+",
+            "count": count,
+        }
+        if current_consumer_only:
+            pending_kwargs["consumername"] = self.config.consumer
+        pending = self.client.xpending_range(
+            self.config.stream,
+            self.config.group,
+            **pending_kwargs,
+        )
+        message_ids = []
+        for entry in pending:
+            if isinstance(entry, dict):
+                message_id = entry.get("message_id")
+                delivered_idle_ms = int(entry.get("time_since_delivered", 0))
+            else:
+                message_id = entry[0]
+                delivered_idle_ms = int(entry[2])
+            message_id = str(message_id)
+            if (
+                message_id not in excluded
+                and (current_consumer_only or delivered_idle_ms >= idle_ms)
+            ):
+                message_ids.append(message_id)
+        if not message_ids:
+            return []
+        claimed = self.client.xclaim(
+            self.config.stream,
+            self.config.group,
+            self.config.consumer,
+            idle_ms,
+            message_ids,
+        )
+        recovered = [
+            replace(_parse_message(message_id, fields), recovered=True)
+            for message_id, fields in claimed
+        ]
+        if recovered:
+            logger.warning(
+                "【Redis】🔄 已接管遗留消息 | group=%s | %s条",
+                self.config.group, len(recovered),
+            )
+        return recovered
+
 
 def _parse_message(message_id: str, fields: dict[str, str]) -> StreamMessage:
     """把一条 Stream entry 解析为交易信号、预订阅指令或日计划。
@@ -252,9 +340,13 @@ def _parse_message(message_id: str, fields: dict[str, str]) -> StreamMessage:
 
         action = str(raw.get("action", "")).lower()
         if action == "subscribe":
+            raw_codes = raw.get("codes", [])
+            if not isinstance(raw_codes, (list, tuple)):
+                raise ValueError("codes 必须是列表")
             watchlist = WatchlistCommand(
-                codes=tuple(str(code) for code in raw.get("codes", [])),
+                codes=tuple(str(code) for code in raw_codes),
                 strategy_id=str(raw.get("strategy_id", "")),
+                mode=str(raw.get("mode", "live")),
             )
             logger.debug("📨 预订阅指令已解析 | msg_id=%s 数量=%s", message_id, len(watchlist.codes))
             return StreamMessage(message_id=message_id, watchlist=watchlist)

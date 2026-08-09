@@ -79,6 +79,31 @@ class ExecutionStatus(StrEnum):
     LIMIT_DOWN_QUEUE_EXPIRED = "limit_down_queue_expired"
     QUEUED_LIMIT_UP = "queued_limit_up"
     LIMIT_UP_QUEUE_EXPIRED = "limit_up_queue_expired"
+    # 重启核对时无法确认券商是否已有订单：保留 Redis 待办并阻止自动重下。
+    RECOVERY_REQUIRED = "recovery_required"
+
+
+TERMINAL_EXECUTION_STATUSES = frozenset(
+    {
+        ExecutionStatus.FILLED,
+        ExecutionStatus.EXPIRED,
+        ExecutionStatus.FAILED_TIMEOUT,
+        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT,
+        ExecutionStatus.FAILED_RISK,
+        ExecutionStatus.FAILED_BROKER,
+        ExecutionStatus.SKIPPED_NO_POSITION,
+        ExecutionStatus.SKIPPED_SMALL_POSITION,
+        ExecutionStatus.SKIPPED_LIMIT_DOWN,
+        ExecutionStatus.SKIPPED_LIMIT_UP,
+        ExecutionStatus.LIMIT_DOWN_QUEUE_EXPIRED,
+        ExecutionStatus.LIMIT_UP_QUEUE_EXPIRED,
+    }
+)
+
+
+def is_terminal_execution_status(status: ExecutionStatus) -> bool:
+    """只有明确不会再触达券商的状态，才允许确认对应 Redis 消息。"""
+    return status in TERMINAL_EXECUTION_STATUSES
 
 
 _CONSOLE_EVENT_EMOJIS = {
@@ -333,6 +358,8 @@ class OrderSnapshot:
     rejection_reason: str | None = None
     rejection_code: str | None = None
     rejection_kind: BrokerRejectionKind | None = None
+    quantity: int = 0
+    price: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -357,6 +384,18 @@ class StoredSignal:
 
 
 @dataclass(frozen=True)
+class StoredAttempt:
+    """重启核对所需的单笔委托最小记录。"""
+
+    attempt_no: int
+    broker_order_id: str
+    quantity: int
+    price: float
+    status: str
+    filled_qty: int
+
+
+@dataclass(frozen=True)
 class DailyPlan:
     """日计划: 开盘清仓清单 + 今日待买清单（signal_id 按日期幂等）。"""
 
@@ -373,12 +412,18 @@ class DailyPlan:
         action = str(raw.get("action", "")).lower()
         if action != "plan":
             raise ValueError(f"not a plan message: action={action!r}")
+        raw_sell = raw.get("codes_to_sell", [])
+        raw_buy = raw.get("codes_to_buy", [])
+        if not isinstance(raw_sell, (list, tuple)):
+            raise ValueError("codes_to_sell 必须是列表")
+        if not isinstance(raw_buy, (list, tuple)):
+            raise ValueError("codes_to_buy 必须是列表")
         sent_at_ms = raw.get("sent_at_ms")
         return cls(
             signal_id=str(raw["signal_id"]),
             strategy_id=str(raw["strategy_id"]),
-            codes_to_sell=tuple(str(code) for code in raw.get("codes_to_sell", [])),
-            codes_to_buy=tuple(str(code) for code in raw.get("codes_to_buy", [])),
+            codes_to_sell=tuple(str(code) for code in raw_sell),
+            codes_to_buy=tuple(str(code) for code in raw_buy),
             created_at=str(raw.get("created_at") or ""),
             mode=str(raw.get("mode", "live")),
             sent_at_ms=int(sent_at_ms) if sent_at_ms is not None else None,

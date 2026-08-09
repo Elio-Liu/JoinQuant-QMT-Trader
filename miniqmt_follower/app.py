@@ -12,6 +12,7 @@ Redis 收信和行情预订阅保持响应; 交易信号按买卖方向进独立
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import signal as _signal
 import threading
@@ -24,11 +25,17 @@ from miniqmt_follower.adapters.qmt import QmtBrokerAdapter, QmtMarketDataAdapter
 from miniqmt_follower.config import load_config
 from miniqmt_follower.executor import OrderExecutionEngine
 from miniqmt_follower.logging_config import setup_logging
-from miniqmt_follower.models import Action, ExecutionResult, ExecutionStatus, TradeSignal
+from miniqmt_follower.models import (
+    Action,
+    ExecutionResult,
+    TradeSignal,
+    is_terminal_execution_status,
+)
 from miniqmt_follower.opening import OpeningSellBarrier, seconds_until_market_open
 from miniqmt_follower.plan_executor import PlanExecutor, submit_plan_tasks
+from miniqmt_follower.process_lock import SingleInstanceLock
 from miniqmt_follower.redis_stream import RedisStreamClient, StreamMessage
-from miniqmt_follower.store import SQLiteExecutionStore
+from miniqmt_follower.store import PlanPayloadConflict, SQLiteExecutionStore
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +59,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=TRADE_EXECUTION_WORKERS,
         help="每个买卖方向的交易执行线程数 (默认 %(default)s)。开盘多票抢单与"
-        "盘中多票止损需要并行, 至少要 ≥ 策略单日目标股数(harvester 为 5), 否则"
+        "盘中多票止损需要并行, 至少要 ≥ 策略单日目标股数(例如 5), 否则"
         "第 5 只买单要等前面的 worker 空出来才提交, 错过开盘排位; "
         "涨跌停排队模式还需给普通信号至少预留 2 个 worker",
     )
@@ -78,6 +85,16 @@ def main() -> None:
     allowed_strategies = set(config.redis.allowed_strategy_ids)
     if allowed_strategies:
         logger.info("【系统】🛂 策略白名单已启用 | %s", ",".join(sorted(allowed_strategies)))
+    if config.execution.plan_execute_at != "09:30:00":
+        logger.warning(
+            "【配置】⚠️ plan_execute_at=%s 仅作旧配置兼容，当前不控制延时；"
+            "买单由09:30开盘屏障控制",
+            config.execution.plan_execute_at,
+        )
+
+    instance_lock = SingleInstanceLock(str(config.state_db) + ".lock")
+    instance_lock.acquire()
+    atexit.register(instance_lock.release)
 
     # Redis 负责收信号; SQLite 负责记录本机执行状态; Engine 负责下单状态机。
     stream = RedisStreamClient(config.redis)
@@ -135,7 +152,12 @@ def main() -> None:
         pending: dict[Future[Any], StreamMessage] = {}
 
         try:
-            for message in stream.read_forever(stop_event=_shutdown_event):
+            for message in stream.read_forever(
+                stop_event=_shutdown_event,
+                active_message_ids_provider=lambda: {
+                    item.message_id for item in list(pending.values())
+                },
+            ):
                 if _shutdown_event.is_set():
                     break
 
@@ -143,7 +165,7 @@ def main() -> None:
                 # 这里只是防止回调因异常漏掉。因为不再靠它保证 ACK 及时性,
                 # block_ms 可以放心调大 —— Redis 阻塞读是服务端推送, BLOCK
                 # 调大不增加收信延迟, 只减少跨网络的空轮询。
-                _reap_completed(pending, stream)
+                _reap_completed(pending, stream, store)
 
                 if message is None:
                     continue
@@ -159,42 +181,24 @@ def main() -> None:
                     stream.ack(message.message_id)
                     continue
 
+                # 回测/测试消息必须在查询行情、账户和券商之前截住。
+                if _ack_if_not_live(message, stream):
+                    continue
+
                 # 日计划: 展开为清仓/待买派生信号, 全部执行完才 ACK。
                 if message.plan is not None:
-                    if not config.execution.plan_enabled:
-                        logger.warning(
-                            "【计划】🚫 日计划执行已关闭 | plan_enabled=false | %s",
-                            message.plan.signal_id,
-                        )
-                        stream.ack(message.message_id)
-                        continue
-                    if not _strategy_allowed(message.plan.strategy_id, allowed_strategies):
-                        logger.info(
-                            "【计划】🛂 日计划忽略 | 策略 %s 不在白名单",
-                            message.plan.strategy_id,
-                        )
-                        stream.ack(message.message_id)
-                        continue
-                    if not plan_executor.record(message.plan):
-                        logger.info(
-                            "【计划】⏭️ 重复日计划 | %s", message.plan.signal_id,
-                        )
-                    combined = submit_plan_tasks(
-                        message.plan,
-                        plan_executor,
-                        pools,
-                        engine,
-                        _execute_safe,
-                        opening_barrier,
+                    _handle_plan_message(
+                        message=message,
+                        config=config,
+                        allowed_strategies=allowed_strategies,
+                        plan_executor=plan_executor,
+                        pools=pools,
+                        engine=engine,
+                        opening_barrier=opening_barrier,
+                        pending=pending,
+                        stream=stream,
+                        store=store,
                     )
-                    if combined is None:
-                        logger.info(
-                            "【计划】📋 日计划无可执行派生信号 | %s",
-                            message.plan.signal_id,
-                        )
-                        stream.ack(message.message_id)
-                    else:
-                        pending[combined] = message
                     continue
 
                 # 预订阅指令: 只订阅行情, 不进执行引擎。
@@ -242,7 +246,9 @@ def main() -> None:
                     _transport_latency_label(sig.sent_at_ms),
                 )
 
-                _submit_trade(message, pending, pools, engine, opening_barrier, stream)
+                _submit_trade(
+                    message, pending, pools, engine, opening_barrier, stream, store,
+                )
 
         finally:
             if _shutdown_event.is_set():
@@ -252,9 +258,16 @@ def main() -> None:
             # 等待所有进行中的任务。先快照: as_completed 会遍历传入的容器,
             # 而工作线程的完成回调正在并发 pop 同一个 pending。
             for future in as_completed(list(pending)):
-                _reap_one(future, pending, stream)
-            # 关闭各线程的数据库连接
-            store.close()
+                _reap_one(future, pending, stream, store)
+            # Future 进入 done 后完成回调仍可能在工作线程里收尾。
+            # 先确认两个线程池都退出，再关 SQLite，避免回调读账本时
+            # 连接被主线程提前关掉。with 退出时再 shutdown 一次是无害的。
+            sell_pool.shutdown(wait=True)
+            buy_pool.shutdown(wait=True)
+            try:
+                store.close_all()
+            finally:
+                instance_lock.release()
             logger.info("【系统】👋 QMT跟单助手已退出")
 
 
@@ -263,12 +276,120 @@ def _strategy_allowed(strategy_id: str, allowed: set[str]) -> bool:
     return not allowed or strategy_id in allowed
 
 
+def _ack_if_not_live(message: StreamMessage, stream: RedisStreamClient) -> bool:
+    """非 live 消息只留审计日志并确认，绝不进入行情/资金/券商路径。"""
+    if message.signal is not None:
+        mode = message.signal.mode
+        label = message.signal.signal_id
+    elif message.plan is not None:
+        mode = message.plan.mode
+        label = message.plan.signal_id
+    elif message.watchlist is not None:
+        mode = message.watchlist.mode
+        label = "watchlist"
+    else:
+        return False
+    if str(mode).strip().lower() == "live":
+        return False
+    logger.warning(
+        "【Redis】⛔ 非实盘消息已忽略 | mode=%s | %s", mode, label,
+    )
+    stream.ack(message.message_id)
+    return True
+
+
+def _handle_plan_message(
+    *,
+    message: StreamMessage,
+    config,
+    allowed_strategies: set[str],
+    plan_executor: PlanExecutor,
+    pools: TradePools,
+    engine: OrderExecutionEngine,
+    opening_barrier: OpeningSellBarrier,
+    pending: dict[Future[Any], StreamMessage],
+    stream: RedisStreamClient,
+    store: SQLiteExecutionStore,
+) -> None:
+    """单条日计划的故障边界；失败只保留Redis待办，不能打退出监听循环。"""
+    plan = message.plan
+    if not config.execution.plan_enabled:
+        logger.warning(
+            "【计划】🚫 日计划执行已关闭 | plan_enabled=false | %s",
+            plan.signal_id,
+        )
+        stream.ack(message.message_id)
+        return
+    if not _strategy_allowed(plan.strategy_id, allowed_strategies):
+        logger.info(
+            "【计划】🛂 日计划忽略 | 策略 %s 不在白名单",
+            plan.strategy_id,
+        )
+        stream.ack(message.message_id)
+        return
+    try:
+        if not plan_executor.record(plan):
+            logger.info("【计划】⏭️ 重复日计划 | %s", plan.signal_id)
+        execute = _execute_recovered_safe if message.recovered else _execute_safe
+        combined = submit_plan_tasks(
+            plan,
+            plan_executor,
+            pools,
+            engine,
+            execute,
+            opening_barrier,
+        )
+    except PlanPayloadConflict as exc:
+        logger.critical(
+            "【计划】🛑 日计划编号冲突 | %s | 已拒绝且不执行 | %s",
+            plan.signal_id, exc,
+        )
+        stream.ack(message.message_id)
+        return
+    except Exception as exc:
+        logger.exception(
+            "【计划】❌ 日计划展开失败 | %s | 保留Redis待办 | %s",
+            plan.signal_id, exc,
+        )
+        return
+    if combined is None:
+        logger.info("【计划】📋 日计划无可执行派生信号 | %s", plan.signal_id)
+        stream.ack(message.message_id)
+        return
+    pending[combined] = message
+    combined.add_done_callback(
+        lambda future: _reap_one_safe(future, pending, stream, store)
+    )
+
+
 def _execute_safe(
     engine: OrderExecutionEngine,
     signal: TradeSignal,
     opening_barrier: OpeningSellBarrier,
 ) -> ExecutionResult:
     """在线程中安全执行信号，捕获异常防止线程崩溃。"""
+    return _execute_with_barrier(
+        engine, signal, opening_barrier, recover_existing=False,
+    )
+
+
+def _execute_recovered_safe(
+    engine: OrderExecutionEngine,
+    signal: TradeSignal,
+    opening_barrier: OpeningSellBarrier,
+) -> ExecutionResult:
+    return _execute_with_barrier(
+        engine, signal, opening_barrier, recover_existing=True,
+    )
+
+
+def _execute_with_barrier(
+    engine: OrderExecutionEngine,
+    signal: TradeSignal,
+    opening_barrier: OpeningSellBarrier,
+    *,
+    recover_existing: bool,
+) -> ExecutionResult:
     try:
         if signal.action == Action.BUY:
             preopen_wait = seconds_until_market_open()
@@ -289,21 +410,14 @@ def _execute_safe(
                     blocked,
                 )
             opening_barrier.wait_until_released()
-        return engine.execute(signal)
+        return engine.recover(signal) if recover_existing else engine.execute(signal)
     except Exception as exc:
         logger.exception(
             "%s | %s | 未处理异常 | %s",
             signal.console_event("失败"), signal.display_code, exc,
         )
-        # 返回一个失败结果让上层能 ACK
-        return ExecutionResult(
-            signal_id=signal.signal_id,
-            status=ExecutionStatus.FAILED_BROKER,
-            requested_qty=signal.amount,
-            filled_qty=0,
-            attempts=0,
-            message="unhandled exception in worker thread",
-        )
+        # 不能把未落库的异常伪装成终态；让 Future 保留异常，上层据此不 ACK。
+        raise
     finally:
         if signal.action == Action.SELL:
             opening_barrier.release(signal.signal_id)
@@ -316,6 +430,7 @@ def _submit_trade(
     engine: OrderExecutionEngine,
     opening_barrier: OpeningSellBarrier,
     stream: RedisStreamClient | None = None,
+    store: SQLiteExecutionStore | None = None,
 ) -> None:
     """登记盘前卖单后，把交易信号提交给对应方向的并发工作池。
 
@@ -325,11 +440,12 @@ def _submit_trade(
     signal = message.signal
     opening_barrier.register(signal)
     pool = pools[signal.action]
-    future = pool.submit(_execute_safe, engine, signal, opening_barrier)
+    execute = _execute_recovered_safe if message.recovered else _execute_safe
+    future = pool.submit(execute, engine, signal, opening_barrier)
     pending[future] = message
     if stream is not None:
         future.add_done_callback(
-            lambda f: _reap_one_safe(f, pending, stream)
+            lambda f: _reap_one_safe(f, pending, stream, store)
         )
 
 
@@ -337,10 +453,11 @@ def _reap_one_safe(
     future: Future[ExecutionResult],
     pending: dict[Future[ExecutionResult], StreamMessage],
     stream: RedisStreamClient,
+    store: SQLiteExecutionStore | None = None,
 ) -> None:
     """完成回调入口: 在工作线程里跑, 绝不能抛 —— 抛了只会进 futures 的日志。"""
     try:
-        _reap_one(future, pending, stream)
+        _reap_one(future, pending, stream, store)
     except Exception as exc:
         logger.exception("【系统】❌ 完成回调异常 | %s", exc)
 
@@ -348,6 +465,7 @@ def _reap_one_safe(
 def _reap_completed(
     pending: dict[Future[ExecutionResult], StreamMessage],
     stream: RedisStreamClient,
+    store: SQLiteExecutionStore | None = None,
 ) -> None:
     """清理所有已完成的任务，ACK 对应的 Redis 消息。
 
@@ -357,13 +475,14 @@ def _reap_completed(
     """
     for future in list(pending):
         if future.done():
-            _reap_one(future, pending, stream)
+            _reap_one(future, pending, stream, store)
 
 
 def _reap_one(
     future: Future[ExecutionResult],
     pending: dict[Future[ExecutionResult], StreamMessage],
     stream: RedisStreamClient,
+    store: SQLiteExecutionStore | None = None,
 ) -> None:
     """处理单个已完成任务：ACK + 日志。
 
@@ -387,6 +506,13 @@ def _reap_one(
                 "【计划】❌ 日计划结果处理异常 | %s | %s",
                 message.plan.signal_id, exc,
             )
+            return
+        if not all(_result_is_durably_terminal(result, store) for result in results):
+            logger.error(
+                "【计划】🛑 日计划存在未落库终态 | %s | 保留Redis待办",
+                message.plan.signal_id,
+            )
+            return
         stream.ack(message.message_id)
         return
     try:
@@ -405,9 +531,33 @@ def _reap_one(
             "%s | %s | 结果处理异常 | %s",
             message.signal.console_event("失败"), message.signal.display_code, exc,
         )
+        return
 
-    # 只有执行进入终态后才确认 Redis 消息, 避免处理中崩溃导致消息丢失。
+    if not _result_is_durably_terminal(result, store):
+        logger.error(
+            "%s | %s | 本机账本尚无明确终态 | 保留Redis待办",
+            message.signal.console_event("停止"), message.signal.display_code,
+        )
+        return
     stream.ack(message.message_id)
+
+
+def _result_is_durably_terminal(
+    result: ExecutionResult,
+    store: SQLiteExecutionStore | None,
+) -> bool:
+    """生产环境以 SQLite 状态为准；无 store 仅供现有纯单元测试兼容。"""
+    if store is None:
+        return is_terminal_execution_status(result.status)
+    try:
+        stored = store.get_signal(result.signal_id)
+    except Exception as exc:
+        logger.exception(
+            "【账本】❌ 读取信号终态失败 | signal_id=%s | %s",
+            result.signal_id, exc,
+        )
+        return False
+    return is_terminal_execution_status(stored.status)
 
 
 def _transport_latency_label(sent_at_ms: int | None) -> str:

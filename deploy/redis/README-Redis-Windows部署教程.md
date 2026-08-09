@@ -3,7 +3,7 @@
 适用于本项目的三服务器架构：**2 台 Windows 交易机 + 1 台 Windows Redis 服务器**。
 
 ```
-   聚宽模拟盘 (harvester)
+   聚宽模拟盘 (示例策略)
         │  XADD
         ▼
    ┌──────────────────────────────┐
@@ -12,9 +12,9 @@
    │  非默认端口 / 强随机口令       │
    └───┬──────────────────────┬───┘
        │ XREADGROUP           │ XREADGROUP
- group=qmt_executors_gj  group=qmt_executors_hx
+ group=qmt_executors_account_a  group=qmt_executors_account_b
        ▼                      ▼
-  Win 机 A (国金 QMT)     Win 机 B (华鑫 QMT)
+  Windows 交易机 A       Windows 交易机 B
 ```
 
 ---
@@ -109,7 +109,7 @@ C:\Redis\redis-cli.exe -p 6380 -a "<你的口令>" --no-auth-warning PING
 ```powershell
 New-NetFirewallRule -DisplayName "Redis-QMT" -Direction Inbound -Protocol TCP `
   -LocalPort 6380 -Action Allow `
-  -RemoteAddress 10.0.0.11,10.0.0.12   # ← 换成两台交易机的 IP
+  -RemoteAddress <交易机A_IP>,<交易机B_IP>
 ```
 
 云厂商的**安全组**也要做同样的限制（它在系统防火墙之前生效，是更硬的一道）。
@@ -130,15 +130,15 @@ $args = @("-p","6380","-a","<口令>","--no-auth-warning")
 & $cli @args XADD tidal_quant_signals '*' payload '{"action":"noop"}'
 
 # 两台交易机各建各的消费组 —— 名字必须不同！
-& $cli @args XGROUP CREATE tidal_quant_signals qmt_executors_gj '$'
-& $cli @args XGROUP CREATE tidal_quant_signals qmt_executors_hx '$'
+& $cli @args XGROUP CREATE tidal_quant_signals qmt_executors_account_a '$'
+& $cli @args XGROUP CREATE tidal_quant_signals qmt_executors_account_b '$'
 
 & $cli @args XINFO GROUPS tidal_quant_signals
 ```
 
 > **为什么 group 必须不同**：Redis 消费组是"组内分发"不是"广播"。两台机器用
-> 同一个 group，每条信号只会投递给其中一台 —— 开盘 5 只票会被随机劈成"国金买
-> 3 只、华鑫买 2 只"，而且日志里没有任何异常。
+> 同一个 group，每条信号只会投递给其中一台 —— 多条信号会被拆分给
+> 交易机 A 和 B，两台都拿不到完整清单，而且日志里没有任何异常。
 >
 > 这一点和机器是否物理独立**无关**：消费组状态存在服务端，不在客户端。
 > `state_db` 换机器就隔离了，`group` 不会。
@@ -154,7 +154,7 @@ $cli = "C:\Redis\redis-cli.exe"
 $args = @("-p","6380","-a","<口令>","--no-auth-warning")
 
 & $cli @args XADD tidal_quant_signals '*' payload '{"test":"persist"}'
-& $cli @args XREADGROUP GROUP qmt_executors_gj win-gj-01 COUNT 10 STREAMS tidal_quant_signals '>'
+& $cli @args XREADGROUP GROUP qmt_executors_account_a win-account-a-01 COUNT 10 STREAMS tidal_quant_signals '>'
 # 故意不 ACK，制造一条 pending
 
 net stop Redis
@@ -167,7 +167,7 @@ net start Redis
 **如果重启后 `XLEN` 是 0 或提示 `no such key`，说明 AOF 没生效，绝对不能接实盘。**
 回去检查 `appendonly yes` 和 `C:\Redis\data` 的写权限。
 
-为什么关键：09:28 的 plan 发出后、交易机还没消费完时 Redis 重启一次，不开 AOF
+为什么关键：盘前 plan 发出后、交易机还没消费完时 Redis 重启一次，不开 AOF
 的话当天的清仓单和买入单会**永久消失**，且没有任何报错 —— 执行端只会安静地
 什么都不做。
 
@@ -198,13 +198,13 @@ redis-cli -h <Redis服务器IP> -p 6380 -a <口令> --no-auth-warning PING
 **第一步**，在两台交易机上各开一个窗口，分别启动接收端（注意 group 不同）：
 
 ```powershell
-# 国金机
-python recv_test_signal.py --host <RedisIP> --port 6380 --password <口令> `
-    --group qmt_executors_gj_test --consumer win-gj-01
+# 交易机 A（先在脚本顶部填写 REDIS_HOST / REDIS_PORT）
+python recv_test_signal.py --password <口令> `
+    --group connectivity_machine_a_test --consumer machine-a-test
 
-# 华鑫机
-python recv_test_signal.py --host <RedisIP> --port 6380 --password <口令> `
-    --group qmt_executors_hx_test --consumer win-hx-01
+# 交易机 B
+python recv_test_signal.py --password <口令> `
+    --group connectivity_machine_b_test --consumer machine-b-test
 ```
 
 > 这里用的是**带 `_test` 后缀的独立消费组**，不是交易机配置里那个。消费组是
@@ -215,7 +215,7 @@ python recv_test_signal.py --host <RedisIP> --port 6380 --password <口令> `
 **第二步**，从任意一台机器发一整轮测试信号：
 
 ```powershell
-python send_test_signal.py --host <RedisIP> --port 6380 --password <口令>
+python send_test_signal.py --password <口令>
 ```
 
 **第三步**，确认**两台各自都收到了全部 4 条**（预订阅 / 日计划 / 卖半仓 / 清仓），
@@ -229,14 +229,14 @@ python send_test_signal.py --host <RedisIP> --port 6380 --password <口令>
 
 本次统计 | 共收到 4 条
   交易信号 2 | 日计划 1 | 预订阅 1 | 无法解析 0
-  group=qmt_executors_gj consumer=win-gj-01
+  group=connectivity_machine_a_test consumer=machine-a-test
 ```
 
 **如果两台加起来才 4 条**（比如一台 1 条、另一台 3 条），就是 group 配重了。
 用这条确认：
 
 ```powershell
-python send_test_signal.py --host <RedisIP> --port 6380 --password <口令> --kind inspect
+python send_test_signal.py --password <口令> --kind inspect
 ```
 
 看到只有一个消费组，就去改两份 config 的 `redis.group`。
@@ -244,35 +244,35 @@ python send_test_signal.py --host <RedisIP> --port 6380 --password <口令> --ki
 **第四步**，再发一条畸形消息，确认交易机不会被打崩：
 
 ```powershell
-python send_test_signal.py --host <RedisIP> --port 6380 --password <口令> --kind malformed
+python send_test_signal.py --password <口令> --kind malformed
 ```
 
 接收端应该打出 `⛔ rejected | KeyError: 'code'` 然后**继续正常运行**，
 后续信号照收。这条验证的是：Stream 是多策略共享的，别的策略换个 schema
 就可能产生本执行端不认识的消息，那种消息绝不能让当天的跟单收工。
 
-> 默认 `strategy_id` 是 `harvester_test`，会被交易机的 `allowed_strategy_ids`
-> 白名单挡掉，所以**不会真的下单**，只验证收信链路。想让信号真正进执行引擎，
-> 加 `--strategy-id harvester`，但**务必先把 `trading.enabled` 设成 false**。
+> 默认 `strategy_id` 是 `connectivity_test`，通常会被交易机的
+> `allowed_strategy_ids` 白名单挡掉，只验证收信链路。改成其他值时脚本会二次确认；
+> **务必先把 `trading.enabled` 设成 false**。
 
 ---
 
 ## 四、两台交易机的配置
 
-从 `config.example.yaml` 复制一份到各自机器上改名（比如 `config.gj.yaml`）。
+从 `config.example.yaml` 复制一份到各自机器上改名（比如 `config.account_a.yaml`）。
 `.gitignore` 已经把 `config*.yaml` 排除在版本库外，只留模板 —— 真实的 host、
 账号、QMT 路径、凭据都不会进 git。
 
 两台之间必须不同的项：
 
-| 配置项 | 国金机 | 华鑫机 |
+| 配置项 | 交易机 A | 交易机 B |
 |---|---|---|
-| **`redis.group`** | `qmt_executors_gj` | `qmt_executors_hx` |
-| **`redis.consumer`** | `win-gj-01` | `win-hx-01` |
-| `trading.account_id` | 国金账号 | 华鑫账号 |
-| `trading.miniqmt_path` | 国金 userdata_mini | 华鑫 userdata_mini |
-| `state_db` | `data/gj.db` | `data/hx.db` |
-| `log_dir` | `logs/gj` | `logs/hx` |
+| **`redis.group`** | `qmt_executors_account_a` | `qmt_executors_account_b` |
+| **`redis.consumer`** | `win-account-a-01` | `win-account-b-01` |
+| `trading.account_id` | `YOUR_ACCOUNT_A_ID` | `YOUR_ACCOUNT_B_ID` |
+| `trading.miniqmt_path` | 交易机 A `userdata_mini` | 交易机 B `userdata_mini` |
+| `state_db` | `data/account_a.db` | `data/account_b.db` |
+| `log_dir` | `logs/account_a` | `logs/account_b` |
 
 口令走环境变量，不写进文件（管理员 PowerShell，`setx /M` 写系统级）：
 
@@ -296,8 +296,8 @@ SIGNAL_REDIS_CONFIG = {
 启动后确认 banner 里这几项两台各不相同：
 
 ```
-【系统】🟢 Redis监听已启动 | stream=tidal_quant_signals | group=qmt_executors_gj |
-        consumer=win-gj-01 | 账户=8885417080 | 账本=data\gj.db
+【系统】🟢 Redis监听已启动 | stream=tidal_quant_signals | group=qmt_executors_account_a |
+        consumer=win-account-a-01 | 账户=YOUR_ACCOUNT_A_ID | 账本=data\account_a.db
 ```
 
 ---
@@ -307,8 +307,7 @@ SIGNAL_REDIS_CONFIG = {
 ### 时钟同步
 
 三台机器都要，且**指向同一个 NTP 源**。执行端判断"什么时候可以下买单"用的是
-本机时钟：快 5 秒会在 09:29:55 就把买单送到柜台（非交易时段废单），慢 5 秒则
-09:30:05 才动手，09:28 预发抢的那点时间白抢了。
+本机时钟快慢数秒都可能让买单过早被柜台拒绝，或在开盘后延迟提交。
 
 ```powershell
 w32tm /config /manualpeerlist:"ntp.aliyun.com,ntp1.aliyun.com" /syncfromflags:manual /update

@@ -19,17 +19,16 @@
 ────────────────────────────────────────────────────────────────────────
 选股完成后推送股票池（只订阅行情、不产生订单）：
 
-    run_daily(publish_watchlist_to_redis, "09:26")
+    publish_watchlist_to_redis(context, selected_codes)
 
-09:27 竞价止损：对清仓清单逐只发 sell_all 意图信号：
+需要清仓时，对清单逐只发 sell_all 意图信号：
 
     def auction_stop_loss(context):
         for stock in context.get_open_clear_codes():   # 示例，按实际逻辑取
             publish_sell_all_to_redis(context, stock, get_current_data()[stock].last_price)
 
-09:28 发送日计划（清仓清单 + 待买清单，执行端 09:30 先清仓、再按真实资金买入）：
+发送日计划（清仓清单 + 待买清单，执行端先卖后按真实资金买入）：
 
-    run_daily(send_daily_plan, "09:28")   # send_daily_plan 里调用
     publish_daily_plan_to_redis(context, codes_to_sell, codes_to_buy)
 
 精确买卖（旧协议，五参数签名固定，数量由策略指定）：
@@ -71,7 +70,7 @@ SIGNAL_REDIS_CONFIG = {
     "maxlen": 10000,
     "socket_connect_timeout": 1,
 }
-SIGNAL_STRATEGY_ID = "hunter"        # 与 Windows 端白名单 allowed_strategy_ids 对应
+SIGNAL_STRATEGY_ID = "YOUR_STRATEGY_ID"  # 与 Windows 端白名单 allowed_strategy_ids 对应
 SIGNAL_MAX_LIVE_LAG_SECONDS = 600    # context 时间与系统时间差超过它视为回测
 
 
@@ -208,10 +207,7 @@ def publish_trade_signal_to_redis(context, action, code, amount, price):
 
 
 def publish_watchlist_to_redis(context, codes):
-    """盘前预订阅：把当日股票池推给执行端只订阅行情，不触发交易。
-
-    用法: run_daily(publish_watchlist_to_redis, "09:26")
-    """
+    """盘前预订阅：把当日股票池推给执行端只订阅行情，不触发交易。"""
     try:
         codes = [str(item) for item in codes if item]
         if not codes:
@@ -252,7 +248,7 @@ def publish_daily_plan_to_redis(context, codes_to_sell, codes_to_buy):
     资金对 codes_to_buy 等分买入（auto_buy），已持仓代码自动跳过。
     signal_id 按日期生成，同一日重复发送会被执行端幂等处理。
 
-    用法: run_daily(send_daily_plan, "09:28")，send_daily_plan 内调用本函数。
+    调用时机由使用者自己的策略决定。
     """
     try:
         codes_to_sell = [str(code) for code in codes_to_sell or [] if code]

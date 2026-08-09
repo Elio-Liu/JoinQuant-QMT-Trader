@@ -11,13 +11,13 @@
 
 用法（两台机器的 group 必须不同，且都不能与交易机正在用的 group 相同！）：
 
-    # 国金机
-    python recv_test_signal.py --host 10.0.0.10 --port 6380 --password xxx \
-        --group qmt_executors_gj_test --consumer win-gj-01
+    # 先修改下方 REDIS_HOST / REDIS_PORT，再在交易机 A 运行
+    python recv_test_signal.py --password YOUR_REDIS_PASSWORD \
+        --group connectivity_machine_a_test --consumer machine-a-test
 
-    # 华鑫机
-    python recv_test_signal.py --host 10.0.0.10 --port 6380 --password xxx \
-        --group qmt_executors_hx_test --consumer win-hx-01
+    # 交易机 B（group 和 consumer 都要与 A 不同）
+    python recv_test_signal.py --password YOUR_REDIS_PASSWORD \
+        --group connectivity_machine_b_test --consumer machine-b-test
 
 用交易机的真实 group 会把消息从它嘴里抢走并 ACK 掉，交易机永远收不到，
 而且它的日志里没有任何异常。脚本对不像测试组的组名会二次确认。
@@ -43,6 +43,14 @@ try:
     import redis
 except ImportError:
     sys.exit("需要先安装 redis-py:  pip install redis")
+
+
+# GitHub 公开版只保留占位值，请勿提交真实 IP 或密码。
+# 部署时只需把 REDIS_HOST 改成 Redis 服务器地址。
+REDIS_HOST = "YOUR_REDIS_SERVER_IP"
+REDIS_PORT = 6380
+REDIS_PASSWORD = None
+REDIS_STREAM = "tidal_quant_signals"
 
 
 _running = True
@@ -119,10 +127,13 @@ def _looks_like_a_test_group(group):
 
 def main():
     parser = argparse.ArgumentParser(description="消费 Redis Stream 测试信号，只打印不下单")
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--port", type=int, default=6380)
-    parser.add_argument("--password", default=None)
-    parser.add_argument("--stream", default="tidal_quant_signals")
+    parser.add_argument(
+        "--host", default=REDIS_HOST,
+        help="Redis 服务器地址；默认读取脚本顶部 REDIS_HOST",
+    )
+    parser.add_argument("--port", type=int, default=REDIS_PORT)
+    parser.add_argument("--password", default=REDIS_PASSWORD)
+    parser.add_argument("--stream", default=REDIS_STREAM)
     parser.add_argument("--group", required=True,
                         help="消费组名。两台交易机必须不同！")
     parser.add_argument("--consumer", required=True, help="本机消费者名")
@@ -136,6 +147,10 @@ def main():
     parser.add_argument("--yes", action="store_true",
                         help="跳过消费组确认（非交互式运行时用）")
     args = parser.parse_args()
+
+    if not args.host or args.host == "YOUR_REDIS_SERVER_IP":
+        print("❌ 请先在脚本顶部填写 REDIS_HOST，或运行时传入 --host。")
+        return 2
 
     if not _looks_like_a_test_group(args.group) and not args.yes:
         print()

@@ -10,11 +10,30 @@ import json
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 
-from miniqmt_follower.models import DailyPlan, ExecutionStatus, StoredSignal, TradeSignal
+from miniqmt_follower.models import (
+    DailyPlan,
+    ExecutionStatus,
+    StoredAttempt,
+    StoredSignal,
+    TradeSignal,
+)
 
 logger = logging.getLogger(__name__)
+
+_MANUAL_RECOVERY_STATUSES = {
+    ExecutionStatus.FILLED,
+    ExecutionStatus.PARTIALLY_FILLED_TIMEOUT,
+    ExecutionStatus.FAILED_TIMEOUT,
+    ExecutionStatus.FAILED_BROKER,
+}
+
+
+class PlanPayloadConflict(ValueError):
+    """同一 plan_id 被重复用于不同买卖名单。"""
 
 
 class SQLiteExecutionStore:
@@ -32,18 +51,24 @@ class SQLiteExecutionStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._connections_lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
         self._init_db()
 
     # ------------------------------------------------------------------
     # 连接管理
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         """创建一个新的临时连接（供测试或特殊用途，不使用线程本地缓存）。"""
         conn = sqlite3.connect(str(self.path), isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA synchronous=NORMAL")
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """首次建表（仅 __init__ 调用一次，用临时连接）。"""
@@ -106,22 +131,39 @@ class SQLiteExecutionStore:
     def _get_conn(self) -> sqlite3.Connection:
         """获取当前线程的持久 SQLite 连接（懒初始化）。"""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(str(self.path), isolation_level=None)
+            conn = sqlite3.connect(
+                str(self.path), isolation_level=None, check_same_thread=False,
+            )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn = conn
+            with self._connections_lock:
+                self._connections.add(conn)
         return self._local.conn
 
     def close(self) -> None:
         """关闭当前线程的数据库连接。"""
         if hasattr(self._local, "conn") and self._local.conn is not None:
-            self._local.conn.close()
+            conn = self._local.conn
+            with self._connections_lock:
+                self._connections.discard(conn)
+            conn.close()
+            self._local.conn = None
+
+    def close_all(self) -> None:
+        """线程池停止后关闭所有工作线程创建的连接。"""
+        with self._connections_lock:
+            connections = tuple(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            conn.close()
+        if hasattr(self._local, "conn"):
             self._local.conn = None
 
     def __del__(self) -> None:
         """析构时尝试关闭连接（防止 ResourceWarning）。"""
         try:
-            self.close()
+            self.close_all()
         except Exception:
             pass
 
@@ -199,6 +241,27 @@ class SQLiteExecutionStore:
             logger.debug("💾 日计划已写入SQLite | plan_id=%s", plan.signal_id)
         except sqlite3.IntegrityError:
             logger.debug("💾 日计划已存在(审计去重) | plan_id=%s", plan.signal_id)
+            existing = conn.execute(
+                """
+                SELECT strategy_id, codes_to_sell, codes_to_buy
+                FROM plans WHERE plan_id = ?
+                """,
+                (plan.signal_id,),
+            ).fetchone()
+            expected = (
+                plan.strategy_id,
+                list(plan.codes_to_sell),
+                list(plan.codes_to_buy),
+            )
+            actual = (
+                str(existing["strategy_id"]),
+                json.loads(existing["codes_to_sell"]),
+                json.loads(existing["codes_to_buy"]),
+            )
+            if actual != expected:
+                raise PlanPayloadConflict(
+                    f"plan_id {plan.signal_id!r} 重复但内容不一致"
+                )
             return False
         return True
 
@@ -269,4 +332,96 @@ class SQLiteExecutionStore:
             signal_id=row["signal_id"],
             status=ExecutionStatus(row["status"]),
             filled_qty=int(row["filled_qty"]),
+        )
+
+    def get_signal_optional(self, signal_id: str) -> StoredSignal | None:
+        """读取信号；尚未登记时返回 None，供 Redis 遗留消息恢复分流。"""
+        try:
+            return self.get_signal(signal_id)
+        except KeyError:
+            return None
+
+    def list_attempts(self, signal_id: str) -> tuple[StoredAttempt, ...]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT attempt_no, broker_order_id, quantity, price, status, filled_qty
+            FROM order_attempts
+            WHERE signal_id = ?
+            ORDER BY attempt_no, id
+            """,
+            (signal_id,),
+        ).fetchall()
+        return tuple(
+            StoredAttempt(
+                attempt_no=int(row["attempt_no"]),
+                broker_order_id=str(row["broker_order_id"]),
+                quantity=int(row["quantity"]),
+                price=float(row["price"]),
+                status=str(row["status"]),
+                filled_qty=int(row["filled_qty"]),
+            )
+            for row in rows
+        )
+
+    def upsert_recovered_attempt(
+        self,
+        signal_id: str,
+        broker_order_id: str,
+        quantity: int,
+        price: float,
+        status: str,
+        filled_qty: int,
+    ) -> None:
+        """补记崩溃窗口内 QMT 已受理、但本机尚未来得及记录的委托。"""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT id FROM order_attempts WHERE broker_order_id = ?",
+            (broker_order_id,),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                """
+                UPDATE order_attempts
+                SET quantity = ?, price = ?, status = ?, filled_qty = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (quantity, price, status, filled_qty, row["id"]),
+            )
+            return
+        next_attempt = conn.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM order_attempts WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()[0]
+        self.record_attempt(
+            signal_id,
+            int(next_attempt),
+            broker_order_id,
+            quantity,
+            price,
+            status,
+            filled_qty,
+        )
+
+    def resolve_recovery(
+        self,
+        signal_id: str,
+        status: ExecutionStatus,
+        *,
+        filled_qty: int,
+    ) -> None:
+        """人工在 QMT 完成对账后，把不确定信号收口到明确终态。"""
+        current = self.get_signal(signal_id)
+        if current.status != ExecutionStatus.RECOVERY_REQUIRED:
+            raise ValueError(
+                f"只能处理 recovery_required 信号，当前为 {current.status.value}"
+            )
+        if status not in _MANUAL_RECOVERY_STATUSES:
+            allowed = ", ".join(sorted(item.value for item in _MANUAL_RECOVERY_STATUSES))
+            raise ValueError(f"人工对账终态只能为: {allowed}")
+        if int(filled_qty) < 0:
+            raise ValueError("filled_qty 不能小于0")
+        self.update_signal_status(
+            signal_id, status, filled_qty=int(filled_qty),
         )

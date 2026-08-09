@@ -9,24 +9,25 @@
 所以可以直接拷到任何一台机器上跑，不需要装项目、也不挑 Python 版本（3.6+）。
 
 用法：
+    # 先修改下方 REDIS_HOST / REDIS_PORT，再运行
+
     # 发一整轮（预订阅 + 日计划 + 卖半仓 + 清仓），最常用
-    python send_test_signal.py --host 10.0.0.10 --port 6380 --password xxx
+    python send_test_signal.py --password YOUR_REDIS_PASSWORD
 
     # 只发某一类
-    python send_test_signal.py --host ... --password ... --kind plan
-    python send_test_signal.py --host ... --password ... --kind sell_all
+    python send_test_signal.py --password YOUR_REDIS_PASSWORD --kind plan
+    python send_test_signal.py --password YOUR_REDIS_PASSWORD --kind sell_all
 
     # 发真实协议之外的畸形消息，验证交易机不会被打崩
-    python send_test_signal.py --host ... --password ... --kind malformed
+    python send_test_signal.py --password YOUR_REDIS_PASSWORD --kind malformed
 
     # 查看 Stream 和消费组现状（诊断"为什么只有一台收到"）
-    python send_test_signal.py --host ... --password ... --kind inspect
+    python send_test_signal.py --password YOUR_REDIS_PASSWORD --kind inspect
 
-注意：默认 strategy_id 用 harvester_test，交易机 config 里的
-allowed_strategy_ids 若只写了 ["harvester"]，这些测试信号会被白名单挡掉并
-直接 ACK —— 那也是一次有效的验证（说明白名单在工作）。想让它们真正进入执行
-引擎，加 --strategy-id harvester，但**务必先把 trading.enabled 设为 false**，
-否则会在真实账户上下单。
+注意：默认 strategy_id 用 connectivity_test，如果交易机白名单不包含它，
+测试信号会被挡掉并直接 ACK。这仍能验证收信链路和白名单。改成其他
+strategy_id 会进入二次确认；继续前务必先把 trading.enabled 设为 false，
+否则可能在真实账户上下单。
 """
 
 from __future__ import print_function
@@ -44,7 +45,13 @@ except ImportError:
     sys.exit("需要先安装 redis-py:  pip install redis")
 
 
-STREAM_DEFAULT = "tidal_quant_signals"
+# GitHub 公开版只保留占位值，请勿提交真实 IP 或密码。
+# 部署时只需把 REDIS_HOST 改成 Redis 服务器地址。
+REDIS_HOST = "YOUR_REDIS_SERVER_IP"
+REDIS_PORT = 6380
+REDIS_PASSWORD = None
+REDIS_STREAM = "tidal_quant_signals"
+TEST_STRATEGY_ID = "connectivity_test"
 
 
 def _now_ms():
@@ -185,10 +192,13 @@ def main():
         description="往 Redis Stream 发测试信号，验证跟单链路",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", required=True, help="Redis 服务器地址")
-    parser.add_argument("--port", type=int, default=6380)
-    parser.add_argument("--password", default=None)
-    parser.add_argument("--stream", default=STREAM_DEFAULT)
+    parser.add_argument(
+        "--host", default=REDIS_HOST,
+        help="Redis 服务器地址；默认读取脚本顶部 REDIS_HOST",
+    )
+    parser.add_argument("--port", type=int, default=REDIS_PORT)
+    parser.add_argument("--password", default=REDIS_PASSWORD)
+    parser.add_argument("--stream", default=REDIS_STREAM)
     parser.add_argument(
         "--kind", default="all",
         choices=["all", "watchlist", "plan", "sell_half", "sell_all", "buy",
@@ -196,9 +206,9 @@ def main():
         help="发送哪一类消息；inspect 只查看现状不发送（默认 all）",
     )
     parser.add_argument(
-        "--strategy-id", default="harvester_test",
-        help="默认 harvester_test（会被交易机白名单挡掉，只验证收信链路）。"
-             "改成 harvester 会真正进入执行引擎——先确认 trading.enabled=false！",
+        "--strategy-id", default=TEST_STRATEGY_ID,
+        help="默认 connectivity_test（通常会被实盘白名单挡掉）。"
+             "改成其他值会进入二次确认。",
     )
     parser.add_argument(
         "--codes", default="000001.XSHE,600000.XSHG,000002.XSHE",
@@ -207,6 +217,10 @@ def main():
     parser.add_argument("--interval", type=float, default=0.5,
                         help="多条消息之间的间隔秒数")
     args = parser.parse_args()
+
+    if not args.host or args.host == "YOUR_REDIS_SERVER_IP":
+        print("❌ 请先在脚本顶部填写 REDIS_HOST，或运行时传入 --host。")
+        return 2
 
     client = redis.Redis(
         host=args.host, port=args.port, password=args.password,
@@ -235,9 +249,9 @@ def main():
     if args.kind == "inspect":
         return inspect(client, args.stream)
 
-    if args.strategy_id == "harvester":
+    if args.strategy_id != TEST_STRATEGY_ID:
         print()
-        print("⚠️ strategy_id=harvester：这些信号会真正进入执行引擎。")
+        print("⚠️ 当前 strategy_id 不是默认测试值，信号可能进入执行引擎。")
         print("   请确认两台交易机的 trading.enabled 都是 false，否则会真实下单。")
         try:
             if input("   确认继续？输入 yes 回车： ").strip().lower() != "yes":

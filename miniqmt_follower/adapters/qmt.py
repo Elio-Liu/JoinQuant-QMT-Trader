@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 import threading
 import time
@@ -69,6 +70,7 @@ _TRANSIENT_REJECTION_KEYWORDS = (
 )
 
 _ORDER_ERROR_WAIT_SEC = 0.05
+_QMT_ORDER_REMARK_MAX_ASCII_BYTES = 24
 
 # 撤单复查用: 到达这些状态就说明"撤单"这件事已经没有意义了。
 _TERMINAL_ORDER_STATUSES = frozenset(
@@ -92,6 +94,23 @@ class QmtAdapterNotConfigured(RuntimeError):
     """QMT 运行环境或账号交易适配尚未配置。"""
 
     pass
+
+
+def _order_remark_for_signal_id(signal_id: str) -> str:
+    """生成 miniQMT 不会截断的稳定委托备注。
+
+    miniQMT 只保留 24 个英文字符。长 signal_id 如果直接写入，
+    同一 plan 的多笔委托会被截成同一前缀，重启后无法安全核单。
+    """
+    raw = str(signal_id)
+    try:
+        encoded = raw.encode("ascii")
+    except UnicodeEncodeError:
+        encoded = b""
+    if raw and len(encoded) <= _QMT_ORDER_REMARK_MAX_ASCII_BYTES:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return "tq" + digest[: _QMT_ORDER_REMARK_MAX_ASCII_BYTES - 2]
 
 
 def classify_qmt_rejection(reason: str | None) -> BrokerRejectionKind:
@@ -474,6 +493,7 @@ class QmtBrokerAdapter:
     def submit_order(self, signal: TradeSignal, quantity: int, price: float) -> str:
         qmt_code = jq_code_to_qmt_code(signal.code)
         order_type = self._STOCK_BUY if signal.action == Action.BUY else self._STOCK_SELL
+        order_remark = _order_remark_for_signal_id(signal.signal_id)
 
         try:
             with self._trading_lock:
@@ -485,7 +505,7 @@ class QmtBrokerAdapter:
                     self._FIX_PRICE,
                     float(price),
                     self._strategy_name,
-                    signal.signal_id,  # order_remark — 方便在 QMT 客户端追溯到信号
+                    order_remark,
                 )
         except Exception as exc:
             raise BrokerSubmissionUncertain(
@@ -494,7 +514,7 @@ class QmtBrokerAdapter:
 
         if order_id is None or (isinstance(order_id, int) and order_id < 0):
             rejection = self._take_order_error_by_remark(
-                signal.signal_id, wait_timeout=_ORDER_ERROR_WAIT_SEC,
+                order_remark, wait_timeout=_ORDER_ERROR_WAIT_SEC,
             )
             reason = (
                 rejection.reason
@@ -591,6 +611,20 @@ class QmtBrokerAdapter:
         # 缓存没有（可能刚下单还没刷新），返回保守值
         return OrderSnapshot(order_id=order_id, status=BrokerOrderStatus.OPEN, filled_qty=0)
 
+    def query_orders_by_signal_id(self, signal_id: str) -> tuple[OrderSnapshot, ...]:
+        """直接向 QMT 查询并按 order_remark 精确匹配，绕过短缓存。"""
+        with self._trading_lock:
+            orders: list[Any] = self._trader.query_stock_orders(self._account)
+        accepted_remarks = {
+            str(signal_id),  # 兼容历史短 ID 和不截断备注的大 QMT
+            _order_remark_for_signal_id(signal_id),
+        }
+        return tuple(
+            self._snapshot_from_qmt_order(order)
+            for order in orders
+            if str(getattr(order, "order_remark", "") or "") in accepted_remarks
+        )
+
     def _refresh_orders_cache(self) -> None:
         """从 QMT 全量拉取订单列表并整体替换缓存。
 
@@ -599,40 +633,62 @@ class QmtBrokerAdapter:
         """
         with self._trading_lock:
             orders: list[Any] = self._trader.query_stock_orders(self._account)
-        fresh: dict[str, OrderSnapshot] = {}
-        for o in orders:
-            oid = str(o.order_id)
-            status = _qmt_order_status_to_broker_status(o.order_status)
-            callback_error = (
-                self._take_order_error_by_id(oid)
-                if status == BrokerOrderStatus.REJECTED
-                else None
-            )
-            raw_status_msg = str(getattr(o, "status_msg", "") or "").strip()
-            rejection_reason = None
-            rejection_code = None
-            if status == BrokerOrderStatus.REJECTED:
-                rejection_reason = raw_status_msg or (
-                    callback_error.reason if callback_error is not None else "QMT order rejected"
-                )
-                rejection_code = (
-                    callback_error.error_code if callback_error is not None else None
-                )
-            fresh[oid] = OrderSnapshot(
-                order_id=oid,
-                status=status,
-                filled_qty=int(getattr(o, "traded_volume", 0)),
-                rejection_reason=rejection_reason,
-                rejection_code=rejection_code,
-                rejection_kind=(
-                    classify_qmt_rejection(rejection_reason)
-                    if status == BrokerOrderStatus.REJECTED
-                    else None
-                ),
-            )
+        fresh = {
+            str(order.order_id): self._snapshot_from_qmt_order(order)
+            for order in orders
+        }
         with self._orders_cache_lock:
             self._orders_cache = fresh
             self._orders_cache_time = time.monotonic()
+
+    def _snapshot_from_qmt_order(self, order: Any) -> OrderSnapshot:
+        oid = str(order.order_id)
+        status = _qmt_order_status_to_broker_status(order.order_status)
+        callback_error = (
+            self._take_order_error_by_id(oid)
+            if status == BrokerOrderStatus.REJECTED
+            else None
+        )
+        raw_status_msg = str(getattr(order, "status_msg", "") or "").strip()
+        rejection_reason = None
+        rejection_code = None
+        if status == BrokerOrderStatus.REJECTED:
+            rejection_reason = raw_status_msg or (
+                callback_error.reason if callback_error is not None else "QMT order rejected"
+            )
+            rejection_code = (
+                callback_error.error_code if callback_error is not None else None
+            )
+        quantity = 0
+        for attr in ("order_volume", "volume", "order_qty"):
+            raw_quantity = getattr(order, attr, None)
+            if raw_quantity is not None:
+                try:
+                    quantity = int(raw_quantity)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        raw_price = getattr(order, "price", None)
+        if raw_price is None:
+            raw_price = getattr(order, "order_price", 0.0)
+        try:
+            price = float(raw_price or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        return OrderSnapshot(
+            order_id=oid,
+            status=status,
+            filled_qty=int(getattr(order, "traded_volume", 0)),
+            rejection_reason=rejection_reason,
+            rejection_code=rejection_code,
+            rejection_kind=(
+                classify_qmt_rejection(rejection_reason)
+                if status == BrokerOrderStatus.REJECTED
+                else None
+            ),
+            quantity=quantity,
+            price=price,
+        )
 
     def cancel_order(self, order_id: str) -> None:
         """提交撤单请求。

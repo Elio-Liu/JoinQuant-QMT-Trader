@@ -61,7 +61,7 @@ Key design decisions in this pipeline:
 - **Each attempt refreshes state**: every broker submission uses a fresh quote and fresh MiniQMT cash/position query.
 - **Cancel confirmation**: a cancel request is not treated as completion. The engine waits for `FILLED`, `CANCELED`, or `REJECTED`, then reconciles fills that arrive during cancellation before re-submitting. If the cancel state remains uncertain, the process latches a trading halt and later queued signals cannot submit.
 - **Adaptive polling**: `_wait_for_terminal_or_timeout` polls at ≤50ms for the first second, then falls back to `poll_interval_sec`.
-- **Opening SELL barrier**: the strategy publishes SELLs at 09:27 and publishes no BUY at 09:29. MiniQMT submits those SELLs in parallel. After 09:30, the first ordinary SELL attempt receives only a 0.5-second report grace, then uses the existing cancel-confirm/reconcile/reprice flow. BUY execution waits until every ordinary pre-open SELL has completed or explicitly terminated.
+- **Opening SELL barrier**: pre-open SELL signals are submitted in parallel, while BUY execution waits until the market opens and every ordinary pre-open SELL has completed or explicitly terminated. After 09:30, the first ordinary SELL attempt receives only a 0.5-second report grace, then uses the existing cancel-confirm/reconcile/reprice flow.
 - **Limit-down exception to the barrier**: once a limit-down SELL has a positive broker order ID and both its attempt and `QUEUED_LIMIT_DOWN` state are persisted, it releases the opening barrier but keeps that one low-limit order queued until fill or 14:56:30. It is not cancelled or re-submitted just to unblock BUYs.
 - **Auction queue pricing**: during 9:15–9:30, `pricing._auction_queue_price()` overrides the normal book/slippage price with `last_price × (1 ± auction_aggressive_pct)` (default 2%), clamped into `[low_limit, high_limit]`. Pre-open signals **miss the 9:25 opening call auction entirely** — the open price is already fixed — so they queue for the 9:30 continuous session, where fills take the *counterparty's* price level by level. Aggressive quoting therefore buys time priority, not a worse fill. **Do not "just quote the limit price"** for ordinary orders: the unfilled part stays resting at the limit price. Dedicated locked-limit queue modes are the explicit exception. The clamp is mandatory, and missing `high_limit`/`low_limit` falls back to normal pricing rather than quoting uncapped. Set `auction_aggressive_pct: 0` to disable. Tests decouple from the clock by monkeypatching `pricing._in_call_auction` in `setUpModule`.
 - **Cancel confirmation is budgeted separately** (`cancel_confirm_timeout_sec`, default 30s) and deliberately **not** charged to `max_total_duration_sec`. Re-quotes run back to back, so the final attempt always butts up against the total budget and its cancel necessarily lands after it — funding the cancel wait from the same budget makes it time out on entry, and a routine unfilled cancel then trips the `_trading_halt_reason` kill switch that stops every later signal for the rest of the process's life (stop-losses included). The engine also cannot re-quote until the cancel reaches a terminal state, since the filled quantity is unknown until then; waiting past the budget is correct.
@@ -71,6 +71,7 @@ Key design decisions in this pipeline:
 - **Intent quantities resolve from the live account**: `sizing.py` computes `sell_all` (all closeable), `sell_half` (half floored to a 100-share lot; <1 lot sells everything), and `auto_buy` (min(cash ÷ N, total assets × `max_single_position_pct`), floored to a lot). Exact `buy`/`sell` with `amount` keep the legacy path.
 - **A-share price cage**: `pricing._apply_stock_dynamic_price_cage()` clamps stock candidates into the dynamic effective range (2% or ±10 ticks from the live book reference, whichever is wider) and the daily limit band; ETFs/funds skip the cage.
 - **ACK after terminal state**: The Redis message is only acknowledged after the engine writes the final status to SQLite. If the process crashes mid-execution, the message remains pending in the consumer group and will be redelivered (idempotency protects against double-execution).
+- **Pending recovery checks QMT first**: on restart, messages previously owned by the same stable consumer are reclaimed immediately; stale messages from another consumer in the same account group wait for `redis.pending_claim_idle_ms`. New MiniQMT submissions use a deterministic 24-ASCII-character order remark derived from `signal_id` (short IDs remain unchanged) because MiniQMT truncates longer remarks. Recovered signals query QMT by that exact remark before any new submission. An uncertain result persists `RECOVERY_REQUIRED`, halts that account, and stays unacknowledged until an operator stops the service, reconciles QMT, and runs `python -m miniqmt_follower.recovery_cli`.
 - **No implied FIFO within a side**: each side uses a multi-worker pool so several opening orders can reach the broker promptly. The explicit opening barrier controls SELL-before-BUY ordering; `signal_id` idempotency controls duplicates. Position queries are never cached; order snapshots retain only a 50ms polling cache.
 
 ### Adapter isolation (Protocol pattern)
@@ -112,8 +113,8 @@ Signals are JSON objects written to Redis Stream (message field `payload`). The 
 
 ```json
 {
-  "signal_id": "hunter-20260608093001-000001XSHE-buy-1000",
-  "strategy_id": "hunter",
+  "signal_id": "strategy-a-20260608093001-000001XSHE-buy-1000",
+  "strategy_id": "strategy_a",
   "mode": "live",
   "action": "buy",
   "code": "000001.XSHE",
@@ -192,7 +193,7 @@ Tests use only stdlib `unittest` and inject fakes:
 
 No real Redis, QMT, or network is needed to run the full test suite. `xtquant` only imports on Windows with miniQMT installed, so anything touching real QMT APIs must stay behind the adapter boundary or lazy imports for tests to keep passing on macOS/Linux.
 
-`tests/test_harvester_strategy_contract.py` reads the local strategy deployment copy when present and skips when it is absent.
+A local-only contract test may read a private strategy deployment copy when present and skips when it is absent.
 
 ## QMT Broker Adapter Status
 
