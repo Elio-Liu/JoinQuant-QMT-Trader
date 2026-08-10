@@ -44,7 +44,7 @@ class TradingConfig:
     account_id: str = ""
     miniqmt_path: str = ""
     session_id: int = 0
-    strategy_name: str = "tidal_quant"
+    strategy_name: str = "jq_qmt_follower"
 
 
 @dataclass(frozen=True)
@@ -205,7 +205,7 @@ def load_config(path: str | Path) -> RuntimeConfig:
             host=str(redis_raw["host"]),
             port=int(redis_raw.get("port", 6379)),
             password=password,
-            stream=str(redis_raw.get("stream", "tidal_quant_signals")),
+            stream=str(redis_raw.get("stream", "jq_qmt_signals")),
             group=str(redis_raw.get("group", "qmt_executors")),
             consumer=str(redis_raw.get("consumer", "win-qmt-01")),
             block_ms=int(redis_raw.get("block_ms", 1000)),
@@ -305,7 +305,7 @@ def load_config(path: str | Path) -> RuntimeConfig:
             account_id=str(trading_raw.get("account_id", "")),
             miniqmt_path=str(trading_raw.get("miniqmt_path", "")),
             session_id=int(trading_raw.get("session_id", 0)),
-            strategy_name=str(trading_raw.get("strategy_name", "tidal_quant")),
+            strategy_name=str(trading_raw.get("strategy_name", "jq_qmt_follower")),
         ),
         market_data=MarketDataConfig(
             pre_subscribe_codes=_validated_string_list(

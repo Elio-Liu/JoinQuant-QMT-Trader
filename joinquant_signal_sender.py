@@ -66,7 +66,7 @@ SIGNAL_REDIS_CONFIG = {
     "host": "YOUR_REDIS_HOST",   # 部署前替换；生产地址不要提交到仓库
     "port": 6379,
     "password": None,            # 无密码可留 None；有密码填字符串
-    "stream": "tidal_quant_signals",  # 必须与 Windows 端 config.yaml 一致
+    "stream": "jq_qmt_signals",  # 必须与 Windows 端 config.yaml 一致
     "maxlen": 10000,
     "socket_connect_timeout": 1,
 }

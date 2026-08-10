@@ -12,10 +12,9 @@
 # ============================================================================
 
 # Redis Stream 消费组客户端。
-# 下限 4.5：本项目用到 health_check_interval / retry_on_timeout /
-# socket_keepalive（跨网络半死连接的三件套）与 xgroup_create(mkstream=True)。
-# 上限 <8：交易系统不接受依赖大版本自动跳变，升级前请先跑一遍测试套件。
-redis>=4.5,<8
+# 固定为已验证版本，避免多台交易机自动安装出不同版本。
+# 不升级到默认使用 RESP3 的 8.x，以保持与现有 Redis 服务器兼容。
+redis==7.4.0
 
 # config.yaml 解析。
 PyYAML>=6.0,<7

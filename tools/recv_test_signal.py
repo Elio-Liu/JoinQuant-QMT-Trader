@@ -50,7 +50,7 @@ except ImportError:
 REDIS_HOST = "YOUR_REDIS_SERVER_IP"
 REDIS_PORT = 6380
 REDIS_PASSWORD = None
-REDIS_STREAM = "tidal_quant_signals"
+REDIS_STREAM = "jq_qmt_signals"
 
 
 _running = True

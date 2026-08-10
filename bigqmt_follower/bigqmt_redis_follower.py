@@ -27,7 +27,7 @@ CONFIG = {
     "redis_host": "",
     "redis_port": 6379,
     "redis_password": "",
-    "redis_stream": "tidal_quant_signals",
+    "redis_stream": "jq_qmt_signals",
     "redis_group": "bigqmt_executors",
     "redis_block_ms": 500,
     "redis_reconnect_sec": 3.0,

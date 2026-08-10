@@ -33,5 +33,7 @@ logs/
 .claude/
 strategies/
 CLAUDE.md
+# Redis 服务器部署方式与环境强相关，仅保留本地维护。
+deploy/
 # 本地测试套件（含私有策略相关用例），不进入版本库
 tests/

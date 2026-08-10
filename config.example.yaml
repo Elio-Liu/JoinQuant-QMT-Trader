@@ -5,7 +5,7 @@ redis:
   host: YOUR_REDIS_HOST # 独立 Redis 服务器地址；同 VPC 内优先填内网 IP。
   port: 6380 # 非默认端口能挡掉绝大多数自动化扫描；须与 redis.conf 一致。
   password: ${REDIS_PASSWORD} # 走环境变量，凭据不进版本库。
-  stream: tidal_quant_signals # 必须与聚宽侧函数里的 stream 保持一致。
+  stream: jq_qmt_signals # 必须与聚宽侧函数里的 stream 保持一致。
   group: qmt_executors # 消费组名称。同一账户严禁多端（会重复下单）；多台交易机（多账户）
                        # 时每台必须用不同 group：每个 group 独立拿到 Stream 完整副本。
   consumer: win-qmt-01 # 当前执行器名称，组内唯一；多机建议按机命名（win-qmt-02...）。
@@ -101,7 +101,7 @@ trading:
   account_id: YOUR_ACCOUNT_ID # miniQMT 资金账号。
   miniqmt_path: 'C:\\path\\to\\userdata_mini' # miniQMT 的 userdata_mini 目录。
   session_id: 0 # miniQMT 会话 ID，通常为 0。
-  strategy_name: tidal_quant # 写入 QMT 委托备注、用于客户端筛选的策略名称。
+  strategy_name: jq_qmt_follower # 写入 QMT 委托备注、用于客户端筛选的策略名称。
 
 state_db: data/miniqmt_follower.db # SQLite 本地执行账本路径，用于幂等与订单状态记录。
 log_level: INFO # 控制台日志级别；文件日志始终记录 DEBUG 明细。
