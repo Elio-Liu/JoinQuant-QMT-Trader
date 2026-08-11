@@ -29,6 +29,7 @@ from miniqmt_follower.models import (
     Action,
     ExecutionResult,
     TradeSignal,
+    format_stock_label,
     is_terminal_execution_status,
 )
 from miniqmt_follower.opening import OpeningSellBarrier, seconds_until_market_open
@@ -210,14 +211,20 @@ def main() -> None:
                         )
                         stream.ack(message.message_id)
                         continue
-                    logger.info(
-                        "【行情】📡 预订阅 | 策略=%s | %s只 | %s",
-                        message.watchlist.strategy_id,
-                        len(message.watchlist.codes),
-                        ",".join(message.watchlist.codes),
-                    )
                     try:
                         market_data.subscribe(message.watchlist.codes)
+                        code_labels = [
+                            format_stock_label(
+                                code, market_data.instrument_name(code),
+                            )
+                            for code in message.watchlist.codes
+                        ]
+                        logger.info(
+                            "【行情】📡 预订阅 | 策略=%s | %s只 | %s",
+                            message.watchlist.strategy_id,
+                            len(message.watchlist.codes),
+                            ",".join(code_labels),
+                        )
                     except Exception as exc:
                         logger.exception(
                             "【行情】❌ 预订阅失败 | 策略=%s | %s",

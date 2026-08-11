@@ -126,6 +126,12 @@ _ACTION_EMOJIS: dict[Action, str] = {
 }
 
 
+def format_stock_label(code: str, stock_name: str | None = None) -> str:
+    """日志展示用证券标识：中文名(六码)，取不到名称时回退六码。"""
+    short_code = str(code).split(".", 1)[0]
+    return f"{stock_name}({short_code})" if stock_name else short_code
+
+
 @dataclass(frozen=True)
 class TradeSignal:
     """一条来自 Redis Stream 的订单信号。
@@ -156,12 +162,12 @@ class TradeSignal:
 
     @property
     def label(self) -> str:
-        """日志用简短标识: 代码+方向+数量, 比完整 signal_id 更易扫读。
+        """日志用简短标识: 中文名(六码)+方向+数量, 比完整 signal_id 更易扫读。
 
         完整 signal_id 仍以 DEBUG 级别记录（只进文件不上控制台), 需要精确核对
         SQLite 记录或排查幂等去重时可以从文件日志里找。
         """
-        return f"{self.code} {self.action.value} {self.amount}股"
+        return f"{self.display_code} {self.action.value} {self.amount}股"
 
     @property
     def action_label(self) -> str:
@@ -176,10 +182,7 @@ class TradeSignal:
     @property
     def display_code(self) -> str:
         """日志用展示标识: 有中文名时显示 名称(代码), 否则仅显示代码。"""
-        short_code = self.code.split(".", 1)[0]
-        if self.stock_name:
-            return f"{self.stock_name}({short_code})"
-        return short_code
+        return format_stock_label(self.code, self.stock_name)
 
     def with_stock_name(self, stock_name: str | None) -> "TradeSignal":
         """返回补上中文名的新实例; 名字为空或解析失败时保持原样。"""

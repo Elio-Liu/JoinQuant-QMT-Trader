@@ -91,7 +91,7 @@ def calculate_order_price(signal: TradeSignal, quote: Quote, config: ExecutionCo
 
     logger.debug(
         "💹 定价计算 | 代码=%s 方向=%s 模式=%s 最新价=%.3f 卖一=%s 买一=%s 委托价=%.3f",
-        signal.code,
+        signal.display_code,
         signal.action.value,
         mode_label,
         quote.last_price,

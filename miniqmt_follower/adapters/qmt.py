@@ -18,6 +18,7 @@ from miniqmt_follower.models import (
     OrderSnapshot,
     Quote,
     TradeSignal,
+    format_stock_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -236,9 +237,16 @@ class QmtMarketDataAdapter:
                 return
             try:
                 self.xtdata.subscribe_quote(qmt_code, period="tick")
-                logger.debug("📡 已订阅行情 | code=%s", qmt_code)
+                logger.debug(
+                    "📡 已订阅行情 | %s",
+                    format_stock_label(qmt_code, self.instrument_name(qmt_code)),
+                )
             except Exception as exc:
-                logger.warning("【行情】⚠️ %s | 订阅失败，改用实时请求 | %s", qmt_code, exc)
+                logger.warning(
+                    "【行情】⚠️ %s | 订阅失败，改用实时请求 | %s",
+                    format_stock_label(qmt_code, self.instrument_name(qmt_code)),
+                    exc,
+                )
             # 失败也记入集合, 避免每次取价都重试订阅拖慢热路径。
             self._subscribed.add(qmt_code)
 
@@ -249,7 +257,9 @@ class QmtMarketDataAdapter:
         ticks = self.xtdata.get_full_tick([qmt_code])
         tick = ticks.get(qmt_code)
         if not tick:
-            raise RuntimeError(f"no tick data for {code} (qmt: {qmt_code})")
+            raise RuntimeError(
+                f"no tick data for {format_stock_label(code, self.instrument_name(code))}"
+            )
         last_price = float(tick.get("lastPrice") or tick.get("last_price"))
         high_limit, low_limit = self._limit_prices_of(qmt_code)
         return Quote(
@@ -284,10 +294,14 @@ class QmtMarketDataAdapter:
         try:
             detail = self.xtdata.get_instrument_detail(qmt_code)
         except Exception as exc:
-            logger.warning("【行情】⚠️ %s | 合约静态信息查询失败 | %s", qmt_code, exc)
+            logger.warning(
+                "【行情】⚠️ %s | 合约静态信息查询失败 | %s",
+                format_stock_label(qmt_code),
+                exc,
+            )
             return None
         if not detail:
-            logger.warning("【行情】⚠️ %s | 合约静态信息为空", qmt_code)
+            logger.warning("【行情】⚠️ %s | 合约静态信息为空", format_stock_label(qmt_code))
             return None
         self._instrument_detail_cache[qmt_code] = detail
         return detail
@@ -538,7 +552,7 @@ class QmtBrokerAdapter:
             "📤 委托已提交 | QMT单号=%s 信号=%s 代码=%s 数量=%s 价格=%.3f",
             order_id,
             signal.label,
-            qmt_code,
+            signal.display_code,
             quantity,
             price,
         )

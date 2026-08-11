@@ -246,6 +246,21 @@ def jq_code_to_qmt_code(code):
     return code
 
 
+def _display_stock_label(code, stock_name=None):
+    """日志展示用证券标识：中文名(六码)，取不到名称时回退六码。"""
+    short_code = str(code).split(".", 1)[0]
+    return "%s(%s)" % (stock_name, short_code) if stock_name else short_code
+
+
+def _gateway_instrument_label(gateway, code):
+    formatter = getattr(gateway, "instrument_label", None)
+    if callable(formatter):
+        return formatter(code)
+    name_resolver = getattr(gateway, "instrument_name", None)
+    name = name_resolver(code) if callable(name_resolver) else None
+    return _display_stock_label(code, name)
+
+
 def _normalize_qmt_instrument(instrument_id, exchange_id=""):
     code = str(instrument_id or "")
     if "." in code:
@@ -648,8 +663,20 @@ class BigQmtGateway(object):
         ticks = self.context.get_full_tick([qmt_code])
         tick = ticks.get(qmt_code)
         if not tick:
-            raise RuntimeError("无法取得行情: %s" % qmt_code)
+            raise RuntimeError("无法取得行情: %s" % self.instrument_label(code))
         return tick
+
+    def instrument_label(self, code):
+        qmt_code = jq_code_to_qmt_code(code)
+        getter = getattr(self.context, "get_instrument_detail", None)
+        if getter is None:
+            return _display_stock_label(qmt_code)
+        try:
+            detail = getter(qmt_code) or {}
+        except Exception:
+            return _display_stock_label(qmt_code)
+        name = detail.get("InstrumentName") or detail.get("instrument_name")
+        return _display_stock_label(qmt_code, str(name).strip() if name else None)
 
     def limit_prices(self, code):
         """取当日 (涨停价, 跌停价), 按代码+交易日缓存; 取不到返回 (None, None)。
@@ -672,7 +699,7 @@ class BigQmtGateway(object):
         try:
             detail = getter(qmt_code)
         except Exception as exc:
-            _log("WARN", "涨跌停价查询失败 %s: %s" % (qmt_code, exc))
+            _log("WARN", "涨跌停价查询失败 %s: %s" % (_display_stock_label(qmt_code), exc))
             return (None, None)
         if not detail:
             return (None, None)
@@ -1022,6 +1049,7 @@ class BigQmtRuntime(object):
         active = {
             "message": message,
             "signal": signal,
+            "code_label": _gateway_instrument_label(self.gateway, signal["code"]),
             "requested_qty": int(signal["amount"]),
             "target_qty": None,
             "filled_qty": 0,
@@ -1201,7 +1229,7 @@ class BigQmtRuntime(object):
             "下单 %s %s %s股@%.3f 第%s次"
             % (
                 signal["action"],
-                jq_code_to_qmt_code(signal["code"]),
+                active["code_label"],
                 quantity,
                 price,
                 active["attempt"],
@@ -1457,7 +1485,11 @@ class BigQmtRuntime(object):
         if active is None:
             return
         message = active["message"]
-        _log("INFO", "信号终态 %s status=%s" % (active["signal"]["signal_id"], status))
+        _log(
+            "INFO",
+            "信号终态 %s | %s status=%s"
+            % (active["code_label"], active["signal"]["signal_id"], status),
+        )
         self._ack_message(message["message_id"], message.get("parent_plan_id"))
         if active.get("is_preopen_sell") and not active.get("barrier_released"):
             self._preopen_sell_count = max(0, self._preopen_sell_count - 1)
