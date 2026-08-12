@@ -5,7 +5,7 @@ import hashlib
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from miniqmt_follower.config import TradingConfig
@@ -375,6 +375,11 @@ class QmtBrokerAdapter:
         self._orders_cache: dict[str, OrderSnapshot] = {}  # order_id → snapshot
         self._orders_cache_time: float = 0.0
         self._orders_cache_lock = threading.RLock()
+        # 只登记本进程 order_stock 成功返回的订单。QMT 会推送账户内所有订单，
+        # 手工单或其他程序的回调绝不能改变 follower 的订单状态。
+        self._owned_order_remarks: dict[str, str] = {}
+        self._owned_trade_ids: dict[str, set[str]] = {}
+        self._owned_trade_filled_qty: dict[str, int] = {}
         # 全量刷新的单飞锁，与上面的缓存锁分开：见 get_order_snapshot。
         self._orders_refresh_lock = threading.Lock()
         # ---- 报单失败回调缓存: 与交易 API 锁分离，避免阻塞 QMT 回调线程 ----
@@ -401,12 +406,18 @@ class QmtBrokerAdapter:
 
         adapter = self
 
-        class _OrderErrorCallback(XtQuantTraderCallback):
+        class _OrderStateCallback(XtQuantTraderCallback):
             def on_order_error(self, error):
                 adapter._cache_order_error(error)
 
+            def on_stock_order(self, order):
+                adapter._cache_owned_order_update(order)
+
+            def on_stock_trade(self, trade):
+                adapter._cache_owned_trade_update(trade)
+
         # 保留强引用，避免回调对象被回收。
-        self._callback = _OrderErrorCallback()
+        self._callback = _OrderStateCallback()
         self._trader.register_callback(self._callback)
         self._trader.start()
 
@@ -431,8 +442,13 @@ class QmtBrokerAdapter:
 
     def query_available_cash(self) -> float:
         """查询账户当前可用资金。"""
+        started = time.monotonic()
         with self._trading_lock:
             asset = self._trader.query_stock_asset(self._account)
+        logger.debug(
+            "⏱️ QMT资金查询耗时 | %.1fms",
+            (time.monotonic() - started) * 1000,
+        )
         # xtquant asset 对象的常见属性名, 按优先级尝试
         # xtquant 的规范字段是 cash，放最前；其余为兼容旧版本/大 QMT 命名。
         for attr in ("cash", "m_dAvailable", "available_cash", "m_dBalance"):
@@ -509,6 +525,7 @@ class QmtBrokerAdapter:
         order_type = self._STOCK_BUY if signal.action == Action.BUY else self._STOCK_SELL
         order_remark = _order_remark_for_signal_id(signal.signal_id)
 
+        started = time.monotonic()
         try:
             with self._trading_lock:
                 order_id = self._trader.order_stock(
@@ -522,9 +539,18 @@ class QmtBrokerAdapter:
                     order_remark,
                 )
         except Exception as exc:
+            logger.debug(
+                "⏱️ QMT报单调用失败 | %s | %.1fms | %s",
+                signal.label, (time.monotonic() - started) * 1000, exc,
+            )
             raise BrokerSubmissionUncertain(
                 f"QMT order submission state is uncertain: {exc}"
             ) from exc
+
+        logger.debug(
+            "⏱️ QMT报单调用耗时 | %s | %.1fms",
+            signal.label, (time.monotonic() - started) * 1000,
+        )
 
         if order_id is None or (isinstance(order_id, int) and order_id < 0):
             rejection = self._take_order_error_by_remark(
@@ -547,6 +573,7 @@ class QmtBrokerAdapter:
             self._orders_cache[oid] = OrderSnapshot(
                 order_id=oid, status=BrokerOrderStatus.OPEN, filled_qty=0,
             )
+            self._owned_order_remarks[oid] = order_remark
 
         logger.debug(
             "📤 委托已提交 | QMT单号=%s 信号=%s 代码=%s 数量=%s 价格=%.3f",
@@ -603,12 +630,100 @@ class QmtBrokerAdapter:
                 self._order_errors_by_remark.pop(cached.order_remark, None)
             return cached
 
+    def _cache_owned_order_update(self, order: Any) -> None:
+        """接收订单状态回调，仅采信本服务报出的匹配订单。
+
+        回调线程只更新内存，不能调用 QMT、Redis 或 SQLite。外部手工单、其他程序
+        的订单以及字段不完整的回调全部忽略，原有轮询会继续兜底。
+        """
+        raw_order_id = getattr(order, "order_id", None)
+        order_id = str(raw_order_id) if raw_order_id is not None else ""
+        order_remark = str(getattr(order, "order_remark", "") or "")
+        with self._orders_cache_lock:
+            expected_remark = self._owned_order_remarks.get(order_id)
+        if not order_id or expected_remark is None or order_remark != expected_remark:
+            logger.debug(
+                "📭 忽略非本服务订单回调 | QMT单号=%s | 备注匹配=%s",
+                order_id or "<empty>",
+                bool(expected_remark is not None and order_remark == expected_remark),
+            )
+            return
+
+        snapshot = self._snapshot_from_qmt_order(order)
+        with self._orders_cache_lock:
+            current = self._orders_cache.get(order_id)
+            if current is not None and snapshot.filled_qty < current.filled_qty:
+                snapshot = replace(snapshot, filled_qty=current.filled_qty)
+            if current is not None and current.status in _TERMINAL_ORDER_STATUSES and (
+                snapshot.status not in _TERMINAL_ORDER_STATUSES
+                or snapshot.filled_qty < current.filled_qty
+            ):
+                logger.debug(
+                    "📭 忽略订单状态回退回调 | QMT单号=%s | 当前=%s | 回调=%s",
+                    order_id, current.status.value, snapshot.status.value,
+                )
+                return
+            self._orders_cache[order_id] = snapshot
+        logger.debug(
+            "📬 已采信订单回调 | QMT单号=%s | 状态=%s | 成交=%s",
+            order_id, snapshot.status.value, snapshot.filled_qty,
+        )
+
+    def _cache_owned_trade_update(self, trade: Any) -> None:
+        """接收成交回调，单调更新成交量但不擅自标记订单终态。"""
+        # 成交回调没有 order_status，订单状态回调和原有轮询仍负责最终状态。
+        raw_order_id = getattr(trade, "order_id", None)
+        order_id = str(raw_order_id) if raw_order_id is not None else ""
+        order_remark = str(getattr(trade, "order_remark", "") or "")
+        trade_id = str(getattr(trade, "traded_id", "") or "")
+        try:
+            filled_qty = int(getattr(trade, "traded_volume", 0) or 0)
+        except (TypeError, ValueError):
+            filled_qty = 0
+        with self._orders_cache_lock:
+            expected_remark = self._owned_order_remarks.get(order_id)
+            if (
+                not order_id
+                or expected_remark is None
+                or order_remark != expected_remark
+                or not trade_id
+                or filled_qty <= 0
+            ):
+                logger.debug("📭 忽略非本服务成交回调 | QMT单号=%s", order_id or "<empty>")
+                return
+            seen_trade_ids = self._owned_trade_ids.setdefault(order_id, set())
+            if trade_id in seen_trade_ids:
+                logger.debug("📭 忽略重复成交回调 | QMT单号=%s | 成交号=%s", order_id, trade_id)
+                return
+            seen_trade_ids.add(trade_id)
+            cumulative = self._owned_trade_filled_qty.get(order_id, 0) + filled_qty
+            self._owned_trade_filled_qty[order_id] = cumulative
+            current = self._orders_cache.get(order_id)
+            if current is not None:
+                self._orders_cache[order_id] = replace(
+                    current, filled_qty=max(current.filled_qty, cumulative),
+                )
+        if current is None:
+            logger.debug("📭 忽略非本服务成交回调 | QMT单号=%s", order_id or "<empty>")
+            return
+        logger.debug(
+            "📬 已采信成交回调 | QMT单号=%s | 本次=%s | 累计=%s",
+            order_id, filled_qty, cumulative,
+        )
+
     def _orders_cache_is_stale(self) -> bool:
         with self._orders_cache_lock:
             return time.monotonic() - self._orders_cache_time >= _ORDERS_CACHE_TTL
 
     def get_order_snapshot(self, order_id: str) -> OrderSnapshot:
         """查询单个订单快照，带 50ms 短期缓存避免轮询时重复全量查询。"""
+        with self._orders_cache_lock:
+            callback_snapshot = self._orders_cache.get(order_id)
+        if (
+            callback_snapshot is not None
+            and callback_snapshot.status in _TERMINAL_ORDER_STATUSES
+        ):
+            return callback_snapshot
         if self._orders_cache_is_stale():
             # 单飞放在专用锁上, 而不是压在缓存锁里: QMT 全量查询是一次同步的
             # 跨进程调用, 把缓存锁攥着等它返回, 会让其余轮询线程连"读一眼旧
@@ -645,13 +760,41 @@ class QmtBrokerAdapter:
         QMT 查询在缓存锁之外完成，只有最后的整体替换持锁。调用方应持有
         _orders_refresh_lock 以保证单飞。
         """
+        started = time.monotonic()
         with self._trading_lock:
             orders: list[Any] = self._trader.query_stock_orders(self._account)
+        logger.debug(
+            "⏱️ QMT全量查单耗时 | %.1fms | %s笔",
+            (time.monotonic() - started) * 1000, len(orders),
+        )
         fresh = {
             str(order.order_id): self._snapshot_from_qmt_order(order)
             for order in orders
         }
         with self._orders_cache_lock:
+            for order_id, current in self._orders_cache.items():
+                refreshed = fresh.get(order_id)
+                preserved_current = current
+                if refreshed is not None and refreshed.filled_qty > current.filled_qty:
+                    preserved_current = replace(current, filled_qty=refreshed.filled_qty)
+                if (
+                    order_id in self._owned_order_remarks
+                    and current.status in _TERMINAL_ORDER_STATUSES
+                    and (
+                        refreshed is None
+                        or refreshed.status not in _TERMINAL_ORDER_STATUSES
+                        or refreshed.filled_qty < current.filled_qty
+                    )
+                ):
+                    fresh[order_id] = preserved_current
+                elif (
+                    order_id in self._owned_order_remarks
+                    and refreshed is not None
+                    and refreshed.filled_qty < current.filled_qty
+                ):
+                    fresh[order_id] = replace(
+                        refreshed, filled_qty=current.filled_qty,
+                    )
             self._orders_cache = fresh
             self._orders_cache_time = time.monotonic()
 
@@ -716,8 +859,13 @@ class QmtBrokerAdapter:
         先向 QMT 复查该单的真实状态：已是终态就说明撤单目的已经达成，直接返回；
         只有"复查后仍非终态、撤单又失败"才是真的不确定，那时才抛。
         """
+        started = time.monotonic()
         with self._trading_lock:
             cancel_result: int = self._trader.cancel_order_stock(self._account, int(order_id))
+        logger.debug(
+            "⏱️ QMT撤单调用耗时 | QMT单号=%s | %.1fms | 返回=%s",
+            order_id, (time.monotonic() - started) * 1000, cancel_result,
+        )
 
         # 无论成功与否都让下一次查询穿透缓存，拿 QMT 的真实状态。
         self._invalidate_order_cache(order_id)

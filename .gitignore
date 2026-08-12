@@ -37,3 +37,6 @@ CLAUDE.md
 deploy/
 # 本地测试套件（含私有策略相关用例），不进入版本库
 tests/
+
+# 华鑫交易机本地手动实盘信号；参数与 signal_id 不进版本库。
+/send_manual_trade_signal.py
