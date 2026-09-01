@@ -1,3 +1,14 @@
+"""Redis Stream 消费组封装: 收信号、确认消息与接管遗留待办。
+
+用消费组替代 Pub/Sub, 保证 Windows 程序离线期间订单信号不丢失;
+提供 read_forever 持续消费、ack 终态确认、claim_stale_pending 重启接管,
+以及 publish_signal 本地测试写入。收信循环对网络故障按退避重连自愈。
+
+本模块约定:
+- 消息解析失败收敛为 rejected 消息并 ACK, 绝不因一条坏消息打崩消费循环;
+- ACK 只发生在执行引擎写入终态之后, 崩溃未确认的消息可由 pending 扫描恢复。
+"""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +22,7 @@ from typing import Any
 
 from miniqmt_follower.config import RedisConfig
 from miniqmt_follower.models import DailyPlan, TradeSignal
+from miniqmt_follower.strategy_models import CandidatePlan
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +46,7 @@ class WatchlistCommand:
 class StreamMessage:
     """Redis Stream 中的一条消息。
 
-    message_id 是 Redis 生成的流 ID。signal 与 watchlist/plan 三选一:
+    message_id 是 Redis 生成的流 ID。signal 与 watchlist/plan/candidate_plan 四选一:
     交易信号填 signal, 预订阅指令(action=subscribe)填 watchlist,
     日计划(action=plan)填 plan。
 
@@ -47,6 +59,7 @@ class StreamMessage:
     signal: TradeSignal | None = None
     watchlist: WatchlistCommand | None = None
     plan: DailyPlan | None = None
+    candidate_plan: CandidatePlan | None = None
     rejected: str | None = None
     recovered: bool = False
 
@@ -323,7 +336,7 @@ class RedisStreamClient:
 
 
 def _parse_message(message_id: str, fields: dict[str, str]) -> StreamMessage:
-    """把一条 Stream entry 解析为交易信号、预订阅指令或日计划。
+    """把一条 Stream entry 解析为交易信号、预订阅指令或计划。
 
     任何解析失败都收敛成 rejected 消息而不是抛异常: 这个生成器驱动着整个消费
     循环, 一条畸形消息不能把当天的跟单打掉。Stream 是多策略共享的, 别的策略
@@ -350,6 +363,16 @@ def _parse_message(message_id: str, fields: dict[str, str]) -> StreamMessage:
             )
             logger.debug("📨 预订阅指令已解析 | msg_id=%s 数量=%s", message_id, len(watchlist.codes))
             return StreamMessage(message_id=message_id, watchlist=watchlist)
+
+        if action == "candidate_plan":
+            candidate_plan = CandidatePlan.from_dict(raw)
+            logger.debug(
+                "📨 候选计划已解析 | msg_id=%s plan_id=%s 数量=%s",
+                message_id,
+                candidate_plan.plan_id,
+                len(candidate_plan.candidates),
+            )
+            return StreamMessage(message_id=message_id, candidate_plan=candidate_plan)
 
         if action == "plan":
             plan = DailyPlan.from_dict(raw)

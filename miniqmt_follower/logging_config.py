@@ -63,15 +63,21 @@ class _FileFormatter(logging.Formatter):
         return formatted
 
 
-def setup_logging(level: int | str = logging.INFO, log_dir: str | Path = "logs") -> None:
+def setup_logging(
+    level: int | str = logging.INFO,
+    log_dir: str | Path = "logs",
+    file_level: int | str = logging.DEBUG,
+) -> None:
     """初始化项目的日志系统。
 
-    Args:
-        level: 日志级别，DEBUG/INFO/WARNING/ERROR，默认 INFO。
-        log_dir: 日志文件目录，自动创建；默认 "logs"。
+    level 控制控制台日志级别(DEBUG/INFO/WARNING/ERROR)，log_dir 为日志文件
+    目录(自动创建，默认 "logs")；file_level 控制文件日志级别，默认 DEBUG
+    保留完整明细，生产可设 INFO 减少热路径写盘，排障时改回。
     """
     if isinstance(level, str):
         level = getattr(logging, level.upper(), logging.INFO)
+    if isinstance(file_level, str):
+        file_level = getattr(logging, file_level.upper(), logging.DEBUG)
 
     root = logging.getLogger()
     # 根 logger 必须放行 DEBUG，具体展示范围由两个 handler 各自控制。
@@ -81,13 +87,17 @@ def setup_logging(level: int | str = logging.INFO, log_dir: str | Path = "logs")
     # 清空已有 handler，避免重复配置（比如测试中多次调用 setup_logging）
     root.handlers.clear()
 
-    # ---- 控制台 handler ----
+    # ---------------------------------------------------------------------------
+    # 控制台 handler
+    # ---------------------------------------------------------------------------
     console = logging.StreamHandler()
     console.setLevel(level)
     console.setFormatter(_ColoredFormatter())
     root.addHandler(console)
 
-    # ---- 文件 handler: 按天轮转，保留 30 天 ----
+    # ---------------------------------------------------------------------------
+    # 文件 handler（按天轮转，保留 30 天）
+    # ---------------------------------------------------------------------------
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
     file_handler = TimedRotatingFileHandler(
@@ -97,11 +107,13 @@ def setup_logging(level: int | str = logging.INFO, log_dir: str | Path = "logs")
         backupCount=30,
         encoding="utf-8",
     )
-    file_handler.setLevel(logging.DEBUG)  # 文件始终记录 DEBUG 及以上，便于事后排查
+    file_handler.setLevel(file_level)  # 文件级别可配; 排障时设 DEBUG 拿全量明细
     file_handler.setFormatter(_FileFormatter())
     root.addHandler(file_handler)
 
-    # ---- 降低第三方库日志噪音 ----
+    # ---------------------------------------------------------------------------
+    # 降低第三方库日志噪音
+    # ---------------------------------------------------------------------------
     _silence_noisy_libraries()
 
 

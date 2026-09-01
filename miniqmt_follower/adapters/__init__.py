@@ -1,1 +1,1 @@
-"""Runtime adapters for market data and broker integrations."""
+"""行情数据与券商交易的运行时适配器。"""

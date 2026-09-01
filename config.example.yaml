@@ -28,67 +28,117 @@ redis:
   # Stream 是多策略共享的；实盘时务必填写自己的 strategy_id，挡住其他策略的信号。
   allowed_strategy_ids: ["YOUR_STRATEGY_ID"]
 
+# 交易机共享日程：执行层市场时段、报单护栏与日终生命周期的唯一时间源。
+machine_schedule:
+  # 市场时段边界：用于竞价定价、盘前卖出屏障和开盘放行。
+  market_session:
+    # A 股集合竞价开始；从此时起启用竞价保护和竞价激进定价。
+    call_auction_start_at: "09:15:00"
+    # 盘前普通卖单开始进入开盘卖出屏障识别的时刻（包含该时刻）。
+    preopen_sell_start_at: "09:25:00"
+    # 连续竞价开始；开盘买单屏障在此时放行，竞价保护同时结束。
+    continuous_trading_start_at: "09:30:00"
+    # 尾盘集合竞价开始；所有涨跌停排队撤单必须早于该边界完成。
+    closing_call_auction_start_at: "14:57:00"
+    # 正常收盘边界，仅用于交易机校验与生命周期判断。
+    market_close_at: "15:00:00"
+
+  # 报单安全护栏：限定末次卖出提交及涨跌停排队撤单收尾。
+  order_guard:
+    # 本地策略最后允许产生并提交新卖单的时刻（包含该时刻）。
+    strategy_sell_last_submit_at: "14:56:00"
+    # 跌停排队单的撤单收尾时刻；必须晚于最后报卖、早于尾盘集合竞价。
+    limit_down_queue_cancel_at: "14:56:30"
+    # 涨停排队单的撤单收尾时刻；必须晚于最后报卖、早于尾盘集合竞价。
+    limit_up_queue_cancel_at: "14:56:30"
+
+  # 日终生命周期：在收盘和全部排队撤单完成后执行。
+  lifecycle:
+    # 基于 QMT 真实账户输出日结并关闭策略日；必须晚于市场收盘与全部撤单。
+    daily_summary_at: "15:02:00"
+
 # 订单执行参数。修改后重启 python main.py 生效。
 execution:
-  buy_slippage_pct: 0.003 # slippage 模式下买入价相对最新价的上浮比例。
-  sell_slippage_pct: 0.003 # slippage 模式下卖出价相对最新价的下浮比例。
-  order_timeout_sec: 3 # 单次委托等待秒数；超时后撤单并等待真实终态。
+  # 统一挂单包络: 所有时段(竞价排队/开盘窗口/盘中)买卖单都以
+  # 最新价×(1±quote_band_pct) 挂出, 最大化一次挂单成交率; 成交价仍按
+  # 对手方挂单价逐档确定, 委托价只是价格包络。0=按最新价原价挂单(不推荐)。
+  quote_band_pct: 0.015
+  order_timeout_sec: 2 # 单次委托等待秒数；超时后撤单并等待真实终态。
+                       # 让委托在柜台多躺几秒, 回报迟到/被插队的单子
+                       # 有机会自己成交, 少撤少挂; 按券商撤单速度调整。
   max_attempts: 3 # 单条信号最多下单尝试次数，包含首次和重挂。
-  max_total_duration_sec: 15 # 单条信号从开始到停止的最大总执行时间（秒）。
+  max_total_duration_sec: 90 # 单条信号从开始到停止的最大总执行时间（秒）。
+                             # 可按机器放宽, 给整条重挂链留足预算。
   # 撤单后等待券商回报真实终态的最长时间，独立于 max_total_duration_sec。
   # 超过它才认定"撤单终态不明"并停止后续交易，所以不要调得太小：
   # 最后一次重挂必然贴着总预算边界，若与总预算共用，普通的未成交撤单就会误触停机。
-  cancel_confirm_timeout_sec: 30
+  # 2026-08-19 实测开盘撮合期撤单回执可超过 30s，建议 60：给券商更多回执时间，
+  # 少误熔断；代价是真不确定时多裸奔 30s。
+  cancel_confirm_timeout_sec: 60
   # 注：曾有 max_deviation_from_signal_price_pct / exempt_sell_from_deviation_guard
   # 两项「行情价偏离参考价就拒单」的风控，已移除。本执行端是跟单器，拦下的委托会让
   # 实盘持仓与聚宽模拟盘永久分叉且无补单机制，一致性优先。旧配置里留着这两个键也无妨，
   # 会被直接忽略。
   poll_interval_sec: 0.2 # 稳态查单轮询间隔（秒）。
-  # book=按对手盘加减 tick 定价（买入=卖一+offset，卖出=买一-offset），追求首挂即成交；
-  # 止损卖出直接吃买一价比"最新价-滑点"更快锁定成交。盘口缺失时自动回退 slippage。
-  pricing_mode: book
-  book_tick_offset: 2 # 股票 tick=0.01；主板股票 2 tick = 2 分钱的成交裕量。
-  # 9:15~9:30 排队委托的激进报价幅度（买 +2%／卖 -2%），只买 9:30 撮合的时间优先，
-  # 成交价仍由对手方挂单价决定；报价强制夹在涨跌停内，取不到涨跌停价则回退常规定价。
-  # 设为 0 关闭。切勿改成挂涨跌停价：吃不完的剩余会留在涨跌停价被反向扫单。
-  auction_aggressive_pct: 0.02
-  skip_sell_when_limit_down: false # 已由 limit_down_sell_mode 取代，保留兼容旧配置。
-  # 旧兼容开关；limit_up_buy_mode 非空时以新模式为准。
-  skip_buy_when_limit_up: true
-  # 跌停锁盘时卖单的处理模式。queue=挂跌停价排队至截止时间，开板即按价格优先成交。
-  # 策略端 L2 跌停排队逃生依赖此模式：炸开跌停的窗口只有几秒，排队是唯一逃生口。
-  limit_down_sell_mode: "queue"
-  queue_sell_poll_interval_sec: 3 # 排队期间的慢轮询间隔（秒）；排队单不撤不重挂，无需快轮询。
-  queue_sell_deadline: "14:56:30" # 排队截止时间，到点撤单收尾（避开深市 14:57 尾盘集合竞价）。
-  # 排队单占用卖出 worker 至成交或截止；超限的新排队请求降级 skip。
-  # 必须 ≤ 卖出线程数(--workers，默认8) - 2，保证止损卖出永远有可用线程。
-  max_concurrent_queue_sells: 2
-  # 涨停锁盘买单的处理模式。queue=确认涨停价且卖一无档后，挂涨停价保留队列位置。
-  # 聚宽信号代表模拟盘已成交; 实盘遇涨停排队买入以保持一致, 不因时序差异丢单。
-  limit_up_buy_mode: "queue"
-  queue_buy_deadline: "14:56:30" # 截止仍未完全成交时撤单并等待真实终态。
-  # 默认买入线程数为 8；最多允许 5 只涨停股全天排队，保留 3 个 worker 处理普通买单。
+  # 定价模式(两个选项):
+  #   slippage — 按 quote_band_pct 挂单(默认, 推荐)
+  #   book     — 按对手盘加减 tick 定价(买入=卖一+book_tick_offset个tick,
+  #              卖出=买一-同数tick), 追求首挂即成交; 盘口缺失自动回退 slippage。
+  pricing_mode: slippage
+  # book 模式下加减的 tick 数(仅 pricing_mode=book 时生效); 股票 tick=0.01。
+  book_tick_offset: 2
+  # 涨跌停处理模式、半仓不足一手语义与单票集中度上限等"策略层执行开关"：
+  #   本地策略引擎模式(config.strategy.yaml 存在)下必须写在策略文件的
+  #   execution 节点（四个键严格必填），主配置再携带会被拒绝启动；
+  #   纯跟单模式(无 config.strategy.yaml)下可写回主配置的 execution 节点。
+  # 此处只保留排队轮询与并发容量等机器侧参数。
+  queue_sell_poll_interval_sec: 3 # 跌停排队期间的慢轮询间隔（秒）；排队单不撤不重挂，无需快轮询。
+  # 跌停排队并发上限；队列单在 qmt-queue 专用线程池慢轮询，此值只决定队列池容量。
+  # 建议与涨停侧一致（队列池容量 = 两侧之和 = 10）。
+  max_concurrent_queue_sells: 5
+  # 涨停排队并发上限；与上面同池，队列池容量 = 两侧上限之和。
   max_concurrent_queue_buys: 5
   # 意图型信号（日计划）：收到 plan 后先提交盘前卖单，买单等待至09:30及卖单屏障释放。
   plan_enabled: true               # 日计划执行开关；无 plan 消息时不影响旧协议。
   # 兼容旧配置保留；当前不按该字段延时，买入等待由开盘屏障控制。
   plan_execute_at: "09:30:00"
-  # 单票买入金额上限 = 总资产（现金+股票市值）× 该比例，取值 (0, 1]。
-  # 这是单票集中度风控，不是等分逻辑的一部分：等分负责把资金摊到几只票上，
-  # 它负责无论摊给几只、单票都不能太重。目标股 ≥3 只时 可用资金/N 天然低于它、
-  # 不会生效；只有 1~2 只时才真正咬合 —— 而那恰恰是最需要它的场景
-  # （满仓押一只连板股，当天高开跳水就是一次不可接受的回撤）。
-  max_single_position_pct: 0.5
   # 买入资金的手续费缓冲：委托金额上限按 可用资金×(1-该值) 计算。
   # 不留缓冲时"用满可用资金"的委托会被柜台以资金不足废单，而重试拿到的是同一个
   # 报价 —— max_attempts 次尝试会全烧在同一笔必然失败的委托上。
   cash_fee_buffer_pct: 0.003
-  # sell_half 意图信号在半仓取整不足一手（<200股）时的处理：
-  #   sell_all=全卖当前持仓（默认） / skip=跳过不卖。
-  sell_half_insufficient_lot_mode: "sell_all"
   # 信号过期秒数：执行端按聚宽发送时刻（sent_at_ms）+ 该值判断是否过期，
   # 到点仍未开始执行的信号直接终态并 ACK，不下单；0=不过期。
   signal_expire_seconds: 600
+  # 执行侧行情快照时效门控：连续竞价时段取到的快照超过该秒数时重取（约1秒有界），
+  # 仍超龄则带告警提交；0=关闭。防止开盘第一秒用 9:25 的旧盘口报价。
+  # 集合竞价期间(9:15~9:30)无成交、快照时间戳冻结，开盘后 60 秒宽限期内自动豁免，
+  # 不再误判为超龄；建议 3。
+  quote_max_age_sec: 3
+  # 开盘首挂窗口与耐心（报价幅度已统一为上方 quote_band_pct）：
+  opening_aggressive_window_sec: 60  # 连续竞价开始后该窗口（秒）内: 快照超龄重取
+                                     # 收紧为 3 次, 首挂耐心用下方 timeout。
+  opening_order_timeout_sec: 0   # 窗口内买单首笔委托等待秒数，0=用 order_timeout_sec。
+                                 # 撤单确认慢的券商（实测~16s）建议 10，快的可设 2。
+  # 开盘首挂价格感知等待（复盘教训）：首笔买单超时未成交时，先看
+  # 最新价再决定撤不撤 —— 偏离挂单价 ≤ opening_price_gap_wait_pct 则继续等
+  # （每秒用新鲜行情重判，最多等 opening_price_gap_wait_max_sec 秒，受
+  # max_total_duration_sec 总预算约束），价格甩开阈值才撤单追价；行情取不到宁等不撤。
+  # 高开奔涨停的票要把阈值设小（1.5% 报价包络下挂单价离涨停仅 ~2%，0.01 合适）；
+  # 等待上限 + 开盘超时 + 一次追单预算需 < max_total_duration_sec。任一值为 0 = 关闭。
+  opening_price_gap_wait_pct: 0.01
+  opening_price_gap_wait_max_sec: 6
+  # 价格感知等待的行情重判节奏（秒）：等待循环每轮取行情下判断的间隔。
+  # 默认 0.2（每秒 5 判，价格甩开最多 0.2s 反应）；1.0 = 旧行为每秒一轮。
+  opening_price_gap_wait_poll_sec: 0.2
+  # 幽灵单检测与自动重挂（复盘教训）：报单受理后订单若在
+  # ghost_order_detect_grace_sec 秒内始终不出现在 QMT 账户委托清单，视为疑似
+  # 幽灵单（本地返回单号但从未送达柜台）。引擎三重校验：①绕过缓存直查委托
+  # （可见=回报滞后，继续等）；②冻结资金（>0=有在途委托，熔断）；③持仓成交
+  # 痕迹（有痕迹=疑似已成交回报丢失，熔断）。三查全空才确认幽灵单并按
+  # ghost_order_auto_resubmit 自动重挂剩余数量（无单可撤，直接新报单；
+  # 连续幽灵重挂超 2 次熔断）。grace=0 完全关闭、维持旧行为；建议 3。
+  ghost_order_detect_grace_sec: 0
+  ghost_order_auto_resubmit: true
 
 market_data:
   # 启动时预订阅的聚宽格式代码列表。如果策略会自行推送当日股票池和持仓，
@@ -104,5 +154,8 @@ trading:
   strategy_name: jq_qmt_follower # 写入 QMT 委托备注、用于客户端筛选的策略名称。
 
 state_db: data/miniqmt_follower.db # SQLite 本地执行账本路径，用于幂等与订单状态记录。
-log_level: INFO # 控制台日志级别；文件日志始终记录 DEBUG 明细。
+log_level: INFO # 控制台日志级别；文件日志级别见 log_file_level。
+log_file_level: DEBUG # 文件日志级别。生产环境可设 INFO 进一步减少写盘;
+                      # 排障时改回 DEBUG 拿到完整明细。热路径的 ⏱️ 耗时
+                      # 日志另有 20ms 阈值门控, 与这里无关。
 log_dir: logs # 按天轮转的日志目录。

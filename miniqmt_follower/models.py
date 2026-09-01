@@ -1,5 +1,17 @@
+"""定义跟单系统共享的数据类、枚举与日志展示工具。
+
+集中维护交易信号、行情快照、执行配置、订单快照、执行结果等核心数据模型,
+以及信号/日计划的反序列化入口(from_dict)与日志展示标识的派生逻辑,
+供执行引擎、收信循环与 SQLite 账本共同引用, 保证两端契约一致。
+
+本模块约定:
+- 数据类一律 frozen, 派生实例经 replace() 生成, 不原地修改;
+- 日志展示标识(中文名/六码/方向/短 id)统一由本模块派生, 不改契约字段。
+"""
+
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -20,6 +32,10 @@ class BrokerOrderStatus(StrEnum):
     FILLED = "filled"
     CANCELED = "canceled"
     REJECTED = "rejected"
+    # 本地合成状态(不来自 QMT 状态映射): 报单受理后超过宽限期仍不出现在
+    # QMT 账户委托清单 —— 疑似幽灵单(本地受理但从未送达柜台), 触发执行引擎
+    # 的三重校验(直查委托/冻结资金/持仓), 全空则自动重挂剩余数量。
+    NOT_VISIBLE = "not_visible"
 
 
 class BrokerRejectionKind(StrEnum):
@@ -156,9 +172,21 @@ class TradeSignal:
     quantity_mode: str = "exact"
     # auto_buy 的等分基数（待买只数）；派生信号由 PlanExecutor 填充，缺省按 1 处理。
     budget_group_size: int | None = None
+    # QMT 本地策略协调器生成的固定金额预算。仅 quantity_mode=fixed_budget 使用；
+    # Redis 外部协议不接受该模式，避免云端越过本地资金分配规则。
+    budget_amount: float | None = None
+    # 本地策略上午减仓可覆盖旧 execution 配置；外部 Redis 不解析该字段。
+    sell_half_insufficient_lot_mode: str | None = None
     # 证券中文名, 由执行端启动/收单时从行情适配器解析一次后填充;
     # 为空时日志只显示代码。不参与信号契约, from_dict 不会解析它。
     stock_name: str = ""
+    # 交易目的标签(如 建仓/清仓/止损/卖半锁盈): 仅用于终端日志展示, 不参与
+    # signal_id 幂等键, 也不进 SQLite 账本。空值时按动作方向兜底(买入/卖出)。
+    purpose: str = ""
+    # 盘前挂单标记: 本地引擎第一波开盘买单设为 True, 执行端据此跳过"睡到
+    # 开盘+等待卖单屏障", 让委托在 9:25-9:30 排队、9:30:00 开盘价撮合。
+    # 仅内部信号使用, 不参与信号契约, from_dict 不会解析它。
+    preopen_submit: bool = False
 
     @property
     def label(self) -> str:
@@ -173,6 +201,11 @@ class TradeSignal:
     def action_label(self) -> str:
         """终端展示用买卖方向。"""
         return "买单" if self.action == Action.BUY else "卖单"
+
+    @property
+    def purpose_label(self) -> str:
+        """终端展示用交易目的; 空值时按动作方向兜底为 买入/卖出。"""
+        return self.purpose or ("买入" if self.action == Action.BUY else "卖出")
 
     @property
     def task_id(self) -> str:
@@ -192,11 +225,22 @@ class TradeSignal:
 
     @property
     def console_prefix(self) -> str:
-        return f"【{self.action_label}】{_ACTION_EMOJIS[self.action]} 信号#{self.task_id}"
+        """信号常规日志前缀: 【目的·方向】方向 emoji 信号#四位短 id。
+
+        无目的标签时保持旧格式【方向】, 与历史日志一致。
+        """
+        direction = (
+            f"{self.purpose}·{self.action_label}" if self.purpose else self.action_label
+        )
+        return f"【{direction}】{_ACTION_EMOJIS[self.action]} 信号#{self.task_id}"
 
     def console_event(self, event: str) -> str:
+        """事件日志前缀: 按事件名映射 emoji, 未命中时退回通用 ℹ️ 图标。"""
         emoji = _CONSOLE_EVENT_EMOJIS.get(event, "ℹ️")
-        return f"【{self.action_label}】{emoji} 信号#{self.task_id}"
+        direction = (
+            f"{self.purpose}·{self.action_label}" if self.purpose else self.action_label
+        )
+        return f"【{direction}】{emoji} 信号#{self.task_id}"
 
     @classmethod
     def from_dict(cls, raw: dict) -> "TradeSignal":
@@ -243,6 +287,7 @@ class TradeSignal:
             expire_at=str(expire_at) if expire_at else None,
             quantity_mode=quantity_mode,
             budget_group_size=int(budget_raw) if budget_raw is not None else None,
+            purpose=str(raw.get("purpose") or ""),
         )
 
 
@@ -261,6 +306,9 @@ class Quote:
     bid1: float | None = None
     high_limit: float | None = None
     low_limit: float | None = None
+    # 行情快照时间(本地时间): 最后一笔成交时间与最近一帧行情推送到达时间的
+    # 较新者; None 表示行情源未提供, 时效门控自动跳过。
+    quote_time: dt.datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -268,13 +316,15 @@ class ExecutionConfig:
     """执行参数, 全部来自配置文件, 方便盘中调参后重启生效。
 
     pricing_mode:
-    - "slippage": 最新成交价 ± 固定百分比滑点(原有行为)。
+    - "slippage": 最新成交价 ± quote_band_pct(统一挂单包络)。
     - "book": 盘口价定价, 买入=卖一价+book_tick_offset个tick, 卖出=买一价-offset,
       追求首次挂单即成交; 对应盘口缺失时自动回退 slippage 模式。
     """
 
-    buy_slippage_pct: float = 0.003
-    sell_slippage_pct: float = 0.003
+    # 统一挂单包络: 所有时段(竞价排队/开盘窗口/盘中)买卖单都以
+    # 最新价×(1±quote_band_pct) 挂出, 最大化一次挂单成交率; 成交价仍按对手方
+    # 挂单价逐档确定, 委托价只是价格包络。0 = 按最新价原价挂单(不推荐)。
+    quote_band_pct: float = 0.015
     order_timeout_sec: float = 3.0
     max_attempts: int = 3
     max_total_duration_sec: float = 15.0
@@ -287,12 +337,6 @@ class ExecutionConfig:
     poll_interval_sec: float = 0.2
     pricing_mode: str = "slippage"
     book_tick_offset: int = 2
-    # 9:15~9:30 排队委托的激进报价幅度 (买 = 最新价×(1+pct), 卖 = 最新价×(1-pct))。
-    # 这些委托不参与 9:25 的开盘集合竞价 (开盘价那时已定), 而是排队等 9:30 连续
-    # 竞价开撮 —— 成交价按对手方挂单价逐档确定, 所以激进报价买的是"时间优先排位",
-    # 不是更差的成交价。风险只在吃不完的剩余会留在报价上, 故幅度要远小于涨跌停带,
-    # 且结果强制夹进 [跌停价, 涨停价]。设为 0 关闭该行为, 回退常规 book/slippage。
-    auction_aggressive_pct: float = 0.02
     # 跌停无买盘的卖单 / 涨停无卖盘的买单直接跳过 (SKIPPED_* 终态),
     # 防止排队委托占满超时预算和同方向 worker。默认关闭以兼容无盘口行情源。
     skip_sell_when_limit_down: bool = False
@@ -305,14 +349,12 @@ class ExecutionConfig:
     #   "none"  — 旧回退路径: 照常按滑点定价下单
     limit_down_sell_mode: str = ""
     queue_sell_poll_interval_sec: float = 3.0
-    queue_sell_deadline: str = "14:56:30"
     # 排队单会占用 worker 线程直到成交或截止; 超过该并发数的新排队请求降级为 skip,
     # 确保始终有 worker 留给正常信号。建议 ≤ --workers 减 2。
     max_concurrent_queue_sells: int = 2
     # 涨停锁盘时 BUY 的处理模式；留空时由旧 skip_buy_when_limit_up 开关推导。
     # queue 模式只在行情同时确认涨停价与卖一空档时启用，挂涨停价保留队列位置。
     limit_up_buy_mode: str = ""
-    queue_buy_deadline: str = "14:56:30"
     max_concurrent_queue_buys: int = 5
     # 意图型信号（日计划）参数。
     plan_enabled: bool = True       # 是否启用日计划执行（无 plan 消息时不影响旧协议）
@@ -337,6 +379,37 @@ class ExecutionConfig:
     # 信号过期秒数: 执行端按 sent_at_ms(发送时刻毫秒) + 该值判断是否已过期;
     # 0 = 不过期。旧协议 expire_at 绝对时间字段仍优先兼容。
     signal_expire_seconds: int = 600
+    # 执行侧行情快照时效门控: 连续竞价时段取到的快照超过该秒数时重取(有界),
+    # 仍超龄则带告警提交; 0 = 关闭。与策略侧 max_tick_age_sec 互补,
+    # 这里是下单路径的守门人(教训: 开盘用 9:25 旧盘口报价, 挂单永远追不上)。
+    quote_max_age_sec: float = 0.0
+    # 开盘首挂窗口与耐心: 连续竞价开始后 opening_aggressive_window_sec 秒内,
+    # (a) 快照超龄重取次数收紧(开盘窗口内 3 次); (b) 窗口内 BUY 首笔委托等待
+    # opening_order_timeout_sec 秒才撤, 0 = 用 order_timeout_sec。
+    # 撤单确认慢的券商(实测 ~16s)首挂必须耐心, 撤单快的可设小值;
+    # 差异一律落在各机配置, 代码不做券商特判。
+    opening_aggressive_window_sec: float = 60.0
+    opening_order_timeout_sec: float = 0.0
+    # 开盘首挂价格感知等待: 开盘窗口内 BUY 首笔委托超时未成交时, 先看最新价再
+    # 决定撤不撤 —— 偏离挂单价 ≤ opening_price_gap_wait_pct 则继续等(每秒用
+    # 新鲜行情重判, 最多等 opening_price_gap_wait_max_sec 秒, 受总预算约束),
+    # 价格甩开阈值才撤单追价。行情取不到时宁等不撤。任一值为 0 = 关闭,
+    # 维持"超时即撤单追价"的旧行为。
+    opening_price_gap_wait_pct: float = 0.0
+    opening_price_gap_wait_max_sec: float = 0.0
+    # 开盘价格感知等待的行情重判节奏(秒): 等待循环内每轮"取行情 + 判断"的
+    # 间隔。默认 0.2 —— 开盘分秒必争, 价格甩开时最多 0.2s 内反应, 而旧行为
+    # 每秒一轮(1.0)会让追价反应最多晚 1s。0 = 回退 1.0(旧行为)。
+    opening_price_gap_wait_poll_sec: float = 0.2
+    # 幽灵单检测与自动重挂: 报单后 ghost_order_detect_grace_sec 秒内订单始终
+    # 不出现在 QMT 账户委托清单, 视为疑似幽灵单(本地受理但从未送达柜台)。
+    # 引擎按三重校验判定: ①绕过缓存直查委托(可见=回报滞后, 继续等);
+    # ②冻结资金(>0 = 有在途委托, 熔断); ③持仓成交痕迹(有痕迹 = 疑似已成交
+    # 回报丢失, 熔断)。三查全空才确认幽灵单, 按 ghost_order_auto_resubmit
+    # 自动重挂剩余数量(无单可撤, 直接走新 attempt), 连续幽灵重挂超 2 次熔断。
+    # grace=0 关闭检测, 完全维持旧行为(不可见按健康排队单继续等)。
+    ghost_order_detect_grace_sec: float = 0.0
+    ghost_order_auto_resubmit: bool = True
 
     def effective_limit_down_sell_mode(self) -> str:
         """归一化跌停卖出模式; 缺省时由旧开关 skip_sell_when_limit_down 推导。"""

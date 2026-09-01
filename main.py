@@ -1,4 +1,11 @@
+"""Windows 侧执行服务的根目录启动入口。
+
+在导入 miniqmt_follower 之前先做 Python 版本闸门，把低版本环境的报错前移，
+再委托给 app.main() 拉起跟单主循环。
+"""
+
 import sys
+from pathlib import Path
 
 # 版本闸门必须在 import miniqmt_follower 之前跑完，否则先炸出来的是从包深处
 # 冒上来的 ImportError("cannot import name 'StrEnum' from 'enum'") —— 在交易机
@@ -12,10 +19,14 @@ if sys.version_info < (3, 11):
 
 from miniqmt_follower import app  # noqa: E402 —— 必须在版本闸门之后
 
+# 默认配置路径锚定在 main.py 同级目录: 把 config.yaml / config.strategy.yaml
+# 放在 main.py 旁边, 无论从哪个工作目录执行 ``python main.py`` 都能找到。
+_DEFAULT_CONFIG = str(Path(__file__).resolve().parent / "config.yaml")
+
 
 def main():
-    """项目根目录快捷入口: python main.py。"""
-    app.main()
+    """项目根目录快捷入口: python main.py (配置默认取本文件同级的 config.yaml)。"""
+    app.main(default_config=_DEFAULT_CONFIG)
 
 
 if __name__ == "__main__":

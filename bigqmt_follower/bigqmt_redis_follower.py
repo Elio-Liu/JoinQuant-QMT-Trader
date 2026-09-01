@@ -1,5 +1,15 @@
 # -*- coding: utf-8 -*-
-"""大 QMT 内置策略：消费 Redis Stream 并执行股票交易信号。"""
+"""大 QMT 内置策略：消费 Redis Stream 并执行股票交易信号。
+
+与 miniQMT 版 miniqmt_follower 协议对齐：解析 trade/watchlist/plan 消息，按买卖
+方向 FIFO 执行真实委托，靠 signal_id 幂等去重并只在信号终态后 ACK。竞价排队
+报价(统一 quote_band_pct 包络 + 价格笼子贴边回退)、涨跌停锁盘排队、开盘卖单
+屏障、开盘首挂耐心、撤单确认 60s 熔断等规则均与 miniQMT 版同义。
+
+本模块约定:
+- 注释与日志为简体中文、emoji 风格；日志字符串一字不改。
+- 委托经 BigQmtGateway 收口大 QMT 全局函数，运行时状态由 BigQmtRuntime 维护。
+"""
 
 from __future__ import print_function
 
@@ -19,6 +29,9 @@ except ImportError:  # pragma: no cover - 兼容少量仍使用 Python 2 的旧 
     import Queue as queue_module
 
 
+# ---------------------------------------------------------------------------
+# 配置与时段常量
+# ---------------------------------------------------------------------------
 CONFIG = {
     "trading_enabled": False,
     "account_id": "",
@@ -32,16 +45,19 @@ CONFIG = {
     "redis_block_ms": 500,
     "redis_reconnect_sec": 3.0,
     "pricing_mode": "book",
-    "buy_slippage_pct": 0.003,
-    "sell_slippage_pct": 0.003,
+    # 统一挂单包络(与 miniQMT 版 quote_band_pct 同义): 竞价排队与滑点回退共用,
+    # 买卖单都以最新价×(1±该比例)挂出, 最大化一次挂单成交率; 0 关闭。
+    "quote_band_pct": 0.015,
     "book_tick_offset": 2,
-    # 9:15~9:30 排队委托的激进报价幅度; 0 关闭。与 miniQMT 版 auction_aggressive_pct 同义。
-    "auction_aggressive_pct": 0.02,
     "order_timeout_sec": 3.0,
+    # 开盘首挂耐心(与 miniQMT 版 opening_order_timeout_sec 同义): 开盘窗口
+    # 60s 内的买单首笔按该秒数等待成交; 盘前挂单的买单为 距开盘+该秒数。
+    "opening_order_timeout_sec": 2.0,
     "order_visibility_timeout_sec": 3.0,
     # 撤单请求发出后等待终态回报的时长, 从"发出撤单那一刻"独立计时,
     # 不与 max_total_duration_sec 共用预算 —— 超过它才熔断。
-    "cancel_confirm_timeout_sec": 30.0,
+    # 与 miniQMT 版一致(2026-08-19 事件后放宽): 开盘撮合期撤单回执实测可超 30s。
+    "cancel_confirm_timeout_sec": 60.0,
     "max_attempts": 3,
     "max_total_duration_sec": 15.0,
     # 涨跌停锁盘处理, 与 miniQMT 版同义:
@@ -69,8 +85,21 @@ _MARKET_OPEN = datetime.time(9, 30)
 _PREOPEN_SELL_START = datetime.time(9, 25)
 # 盘前卖单首笔: 开盘后只给 0.5s 回报宽限再进入撤单流程 (与 miniQMT 一致)。
 _OPENING_SELL_RECONCILE_GRACE_SEC = 0.5
+# 开盘首挂窗口(与 miniQMT 版 opening_aggressive_window_sec 同义): 连续竞价开始
+# 后的前 60s 内, 买单首笔用 opening_order_timeout_sec 作为耐心等待成交。
+_OPENING_WINDOW_SEC = 60.0
 
 
+def _in_opening_window():
+    """当前是否处于开盘首挂窗口(连续竞价开始后 60s)。测试可替换本模块级函数。"""
+    now = datetime.datetime.now()
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return 0 <= (now - market_open).total_seconds() <= _OPENING_WINDOW_SEC
+
+
+# ---------------------------------------------------------------------------
+# 通用工具函数
+# ---------------------------------------------------------------------------
 def _in_call_auction():
     """当前是否处于 9:15~9:30 竞价排队时段。测试可替换本模块级函数。"""
     return _AUCTION_START <= datetime.datetime.now().time() < _MARKET_OPEN
@@ -253,6 +282,7 @@ def _display_stock_label(code, stock_name=None):
 
 
 def _gateway_instrument_label(gateway, code):
+    """优先用网关的中文名格式化接口，取不到再回退名称解析。"""
     formatter = getattr(gateway, "instrument_label", None)
     if callable(formatter):
         return formatter(code)
@@ -262,6 +292,7 @@ def _gateway_instrument_label(gateway, code):
 
 
 def _normalize_qmt_instrument(instrument_id, exchange_id=""):
+    """把"代码 + 交易所"补成带点的完整合约号；已带点则原样返回。"""
     code = str(instrument_id or "")
     if "." in code:
         return code
@@ -360,7 +391,7 @@ def _auction_queue_price(action, last_price, config, tick_size, limits):
     所以只做有界的百分比激进报价, 并强制夹进 [跌停价, 涨停价];
     取不到涨跌停价则整个回退常规定价 —— 宁可排位靠后, 不能裸奔。
     """
-    pct = float(config.get("auction_aggressive_pct", 0) or 0)
+    pct = float(config.get("quote_band_pct", 0) or 0)
     if pct <= 0:
         return None
     if not _in_call_auction():
@@ -404,9 +435,9 @@ def calculate_order_price(signal, tick, config, limits=None):
         if pricing_base is None:
             pricing_base = last_price
             if action == "buy":
-                raw_price = pricing_base * (1.0 + float(config["buy_slippage_pct"]))
+                raw_price = pricing_base * (1.0 + float(config["quote_band_pct"]))
             else:
-                raw_price = pricing_base * (1.0 - float(config["sell_slippage_pct"]))
+                raw_price = pricing_base * (1.0 - float(config["quote_band_pct"]))
         else:
             offset = int(config.get("book_tick_offset", 0)) * tick_size
             raw_price = pricing_base + offset if action == "buy" else pricing_base - offset
@@ -434,6 +465,9 @@ def _apply_stock_dynamic_price_cage(action, tick, candidate_price, tick_size, li
         percent_boundary = _round_to_tick_half_up(reference * 1.02, tick_size)
         dynamic_boundary = max(percent_boundary, reference + 10 * tick_size)
         price = min(candidate_price, dynamic_boundary)
+        if price == dynamic_boundary:
+            # 贴住笼顶回退 1 tick: 102% 边界经 tick 取整可能越界被交易所拒单。
+            price = max(price - tick_size, 0.0)
     else:
         reference = (
             _first_positive(tick.get("bidPrice"))
@@ -443,6 +477,9 @@ def _apply_stock_dynamic_price_cage(action, tick, candidate_price, tick_size, li
         percent_boundary = _round_to_tick_half_up(reference * 0.98, tick_size)
         dynamic_boundary = min(percent_boundary, reference - 10 * tick_size)
         price = max(candidate_price, dynamic_boundary)
+        if price == dynamic_boundary:
+            # 贴住笼底抬升 1 tick, 同理避免取整越界被拒单。
+            price = price + tick_size
     if limits:
         high_limit, low_limit = limits
         if high_limit is not None:
@@ -452,6 +489,9 @@ def _apply_stock_dynamic_price_cage(action, tick, candidate_price, tick_size, li
     return price
 
 
+# ---------------------------------------------------------------------------
+# Redis 消费线程
+# ---------------------------------------------------------------------------
 class RedisStreamWorker(object):
     """仅负责 Redis I/O 的后台线程，不调用任何大 QMT API。"""
 
@@ -466,6 +506,7 @@ class RedisStreamWorker(object):
         self._thread = None
 
     def connect(self):
+        """建立 Redis 连接；无 factory 时懒加载 redis 包并缺省使用 redis.Redis。"""
         factory = self.redis_factory
         if factory is None:
             try:
@@ -482,6 +523,7 @@ class RedisStreamWorker(object):
         )
 
     def ensure_group(self):
+        """确保消费组已创建；已存在(BUSYGROUP)视为正常，其余异常上抛。"""
         try:
             self.client.xgroup_create(
                 self.config["redis_stream"],
@@ -495,6 +537,7 @@ class RedisStreamWorker(object):
                 raise
 
     def process_ack_queue(self):
+        """把 ack 队列里的消息 id 全部 ACK；失败时放回队列并上抛触发重连。"""
         while True:
             try:
                 message_id = self.ack_queue.get_nowait()
@@ -509,6 +552,7 @@ class RedisStreamWorker(object):
                 raise
 
     def read_once(self):
+        """读取一批流消息并解析入队；格式错误的消息记日志后直接 ACK 丢弃。"""
         response = self.client.xreadgroup(
             self.config["redis_group"],
             self.consumer_name,
@@ -527,6 +571,7 @@ class RedisStreamWorker(object):
                 self.inbound_queue.put(message)
 
     def run(self):
+        """后台主循环：连接、建组后循环 ACK 与读取，断线按重连间隔重试。"""
         while not self._stop_event.is_set():
             try:
                 self.connect()
@@ -550,6 +595,7 @@ class RedisStreamWorker(object):
                 self._stop_event.wait(float(self.config.get("redis_reconnect_sec", 3.0)))
 
     def start(self):
+        """以守护线程启动后台循环；已在运行时跳过。"""
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self.run, name="bigqmt-redis")
@@ -557,6 +603,7 @@ class RedisStreamWorker(object):
         self._thread.start()
 
     def stop(self):
+        """置停止事件，让后台循环退出。"""
         self._stop_event.set()
 
 
@@ -649,6 +696,9 @@ def _order_rejection_reason(order_info):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# 大 QMT 网关适配
+# ---------------------------------------------------------------------------
 class BigQmtGateway(object):
     """把大 QMT 全局交易函数收口为可注入、可测试的接口。"""
 
@@ -659,6 +709,7 @@ class BigQmtGateway(object):
         self._limit_cache_day = ""
 
     def latest_tick(self, code):
+        """取某只股票的最新行情快照；取不到时抛 RuntimeError。"""
         qmt_code = jq_code_to_qmt_code(code)
         ticks = self.context.get_full_tick([qmt_code])
         tick = ticks.get(qmt_code)
@@ -667,6 +718,7 @@ class BigQmtGateway(object):
         return tick
 
     def instrument_label(self, code):
+        """取证券的中文名(六码)用于日志；取不到名称时回退六码。"""
         qmt_code = jq_code_to_qmt_code(code)
         getter = getattr(self.context, "get_instrument_detail", None)
         if getter is None:
@@ -711,6 +763,7 @@ class BigQmtGateway(object):
         return prices
 
     def available_cash(self):
+        """查询账户可用资金；取不到时抛 RuntimeError 让上层不下单。"""
         accounts = get_trade_detail_data(
             self.config["account_id"], self.config["account_type"], "account"
         )
@@ -722,6 +775,7 @@ class BigQmtGateway(object):
         return float(value)
 
     def available_position(self, code):
+        """查询某只股票的可卖持仓数量；未持仓返回 0。"""
         qmt_code = jq_code_to_qmt_code(code)
         positions = get_trade_detail_data(
             self.config["account_id"], self.config["account_type"], "position"
@@ -759,6 +813,7 @@ class BigQmtGateway(object):
         return 0
 
     def query_total_assets(self):
+        """查询账户总资产；取不到时抛 RuntimeError。"""
         accounts = get_trade_detail_data(
             self.config["account_id"], self.config["account_type"], "account"
         )
@@ -770,6 +825,7 @@ class BigQmtGateway(object):
         return float(value)
 
     def list_orders(self):
+        """取本策略当日的委托列表；老接口不认 strategy_name 时回退全量查询。"""
         try:
             return get_trade_detail_data(
                 self.config["account_id"],
@@ -783,6 +839,7 @@ class BigQmtGateway(object):
             ) or []
 
     def submit(self, signal, quantity, price, remark):
+        """按方向调用 passorder 报单，备注 remark 用于委托回报归属。"""
         op_type = 23 if signal["action"] == "buy" else 24
         passorder(
             op_type,
@@ -799,6 +856,7 @@ class BigQmtGateway(object):
         )
 
     def can_cancel(self, order_id):
+        """判断某委托当前是否可撤。"""
         return bool(
             can_cancel_order(
                 order_id, self.config["account_id"], self.config["account_type"]
@@ -806,6 +864,7 @@ class BigQmtGateway(object):
         )
 
     def cancel(self, order_id):
+        """请求撤销指定委托，返回是否受理。"""
         return bool(
             cancel(
                 order_id,
@@ -816,6 +875,9 @@ class BigQmtGateway(object):
         )
 
 
+# ---------------------------------------------------------------------------
+# 运行时执行状态机
+# ---------------------------------------------------------------------------
 class BigQmtRuntime(object):
     """单次大 QMT 运行期内按买卖方向分别 FIFO 的内存执行状态机。"""
 
@@ -841,6 +903,7 @@ class BigQmtRuntime(object):
 
     @property
     def pending_count(self):
+        """两个方向待执行消息的总数。"""
         return sum(len(items) for items in self.pending_by_action.values())
 
     @property
@@ -853,6 +916,7 @@ class BigQmtRuntime(object):
         return None
 
     def on_timer(self, context):
+        """定时器驱动的主循环：拉取入站消息、启动新信号并推进活动订单。"""
         if self.gateway is None:
             self.gateway = self.gateway_factory(context, self.config)
         self._drain_inbound(context)
@@ -881,10 +945,12 @@ class BigQmtRuntime(object):
                         self._advance_active(action)
 
     def _allowed_strategy(self, strategy_id):
+        """白名单过滤；白名单为空时放行所有策略。"""
         allowed = self.config.get("allowed_strategy_ids") or []
         return not allowed or str(strategy_id) in allowed
 
     def _drain_inbound(self, context):
+        """排空入站队列：按 watchlist/plan/trade 分流并做白名单与幂等过滤。"""
         while True:
             try:
                 message = self.worker.inbound_queue.get_nowait()
@@ -991,6 +1057,7 @@ class BigQmtRuntime(object):
         }
 
     def _start_next(self, action):
+        """从指定方向取出下一条信号，解析意图数量并提交首笔委托。"""
         message = self.pending_by_action[action].popleft()
         signal = message["signal"]
 
@@ -1096,6 +1163,7 @@ class BigQmtRuntime(object):
         raise ValueError("invalid quantity_mode: %s" % quantity_mode)
 
     def _submit_attempt(self, action):
+        """按最新行情与资源提交一次委托；首次缩量后冻结执行目标数量。"""
         active = self.active_by_action[action]
         signal = active["signal"]
         target_qty = active.get("target_qty")
@@ -1112,7 +1180,9 @@ class BigQmtRuntime(object):
             bid1 = _first_positive(tick.get("bidPrice"))
             ask1 = _first_positive(tick.get("askPrice"))
 
-            # ---- 涨跌停锁盘处理 (与 miniQMT 版一致) ----
+            # ---------------------------------------------------------------------------
+            # 涨跌停锁盘处理（与 miniQMT 版一致）
+            # ---------------------------------------------------------------------------
             # 跌停无买盘 → 卖单挂跌停价排队等开板, 或按配置跳过;
             # 涨停确认锁盘 → 买单挂涨停价排队, 或按配置跳过。
             queue_mode = None
@@ -1213,6 +1283,26 @@ class BigQmtRuntime(object):
             active["order_deadline"] = self._deadline_after_auction(
                 active["submitted_at"], 0
             ) + _OPENING_SELL_RECONCILE_GRACE_SEC
+        elif (
+            active["attempt"] == 1
+            and signal["action"] == "buy"
+            and active.get("queue_mode") is None
+            and float(self.config.get("opening_order_timeout_sec", 0) or 0) > 0
+        ):
+            # 开盘首挂耐心(与 miniQMT 一致): 盘前挂单的买单=距开盘+耐心秒数;
+            # 开盘窗口内的买单=耐心秒数。开盘撮合回执可能迟到 1~2 秒,
+            # 0.5s 就撤会向已成交的单发多余撤单。
+            patience = float(self.config["opening_order_timeout_sec"])
+            if _in_call_auction():
+                active["order_deadline"] = self._deadline_after_auction(
+                    active["submitted_at"], patience
+                )
+            elif _in_opening_window():
+                active["order_deadline"] = active["submitted_at"] + patience
+            else:
+                active["order_deadline"] = self._order_deadline(
+                    active["submitted_at"]
+                )
         else:
             active["order_deadline"] = self._order_deadline(active["submitted_at"])
         active["visibility_deadline"] = self._deadline_after_auction(
@@ -1254,6 +1344,7 @@ class BigQmtRuntime(object):
         active["deal_filled_hint"] = active.get("deal_filled_hint", 0) + volume
 
     def _refresh_active_orders(self):
+        """拉取活动委托并按备注匹配更新对应活动单；查询失败则熔断。"""
         try:
             orders = self.gateway.list_orders()
         except Exception as exc:
@@ -1263,6 +1354,7 @@ class BigQmtRuntime(object):
             self._apply_order(order)
 
     def _apply_order(self, order_info):
+        """把委托回报映射到备注匹配的活动单，记录单号、状态与本次成交。"""
         remark = str(getattr(order_info, "m_strRemark", ""))
         active = self._active_for_remark(remark)
         if active is None:
@@ -1284,6 +1376,7 @@ class BigQmtRuntime(object):
         active["attempt_filled"] = max(active.get("attempt_filled", 0), traded)
 
     def _active_for_remark(self, remark):
+        """按备注在两个方向的活动单里找匹配；空备注返回 None。"""
         if not remark:
             return None
         for action in self.ACTION_ORDER:
@@ -1293,6 +1386,7 @@ class BigQmtRuntime(object):
         return None
 
     def _advance_active(self, action):
+        """推进指定方向活动单的状态机：等待单号/排队/在途/撤单确认。"""
         active = self.active_by_action[action]
         now = self.clock()
         order_class = active.get("order_class")
@@ -1379,6 +1473,7 @@ class BigQmtRuntime(object):
                 self._halt("撤单终态等待超时: %s" % active.get("order_id"))
 
     def _handle_terminal_attempt(self, action, order_class):
+        """按终态累计成交并决定补挂剩余、终止或熔断后的收尾。"""
         active = self.active_by_action[action]
         if active.get("attempt_accounted"):
             return
@@ -1455,6 +1550,7 @@ class BigQmtRuntime(object):
         self._submit_attempt(action)
 
     def _order_deadline(self, submitted_at):
+        """普通委托的撤单截止时刻；竞价时段顺延到开盘后计时。"""
         return self._deadline_after_auction(
             submitted_at, float(self.config["order_timeout_sec"])
         )
@@ -1468,6 +1564,7 @@ class BigQmtRuntime(object):
         return time.mktime(moment.timetuple())
 
     def _deadline_after_auction(self, started_at, duration):
+        """竞价时段提交的委托把计时起点顺延到 9:30 开盘，避免开盘前被误撤。"""
         normal_deadline = started_at + duration
         moment = datetime.datetime.fromtimestamp(started_at)
         auction_start = moment.replace(hour=9, minute=15, second=0, microsecond=0)
@@ -1481,6 +1578,7 @@ class BigQmtRuntime(object):
         return normal_deadline
 
     def _finish_active(self, action, status):
+        """把活动单落终态、ACK 消息并释放开盘屏障计数。"""
         active = self.active_by_action[action]
         if active is None:
             return
@@ -1508,6 +1606,7 @@ class BigQmtRuntime(object):
             self.worker.ack_queue.put(message_id)
 
     def _flush_pending_halted(self, action):
+        """熔断后把该方向剩余待执行信号以 FAILED_BROKER 落终态并 ACK。"""
         while self.pending_by_action[action]:
             message = self.pending_by_action[action].popleft()
             _log(
@@ -1518,6 +1617,7 @@ class BigQmtRuntime(object):
             self._ack_message(message["message_id"], message.get("parent_plan_id"))
 
     def _halt(self, reason):
+        """置熔断标志并把活动单以 FAILED_BROKER 收尾，后续信号统一终态。"""
         self.halted = True
         self.halt_reason = reason
         _log("ERROR", "交易执行端熔断: %s" % reason)
@@ -1528,10 +1628,14 @@ class BigQmtRuntime(object):
                 self._finish_active(action, "FAILED_BROKER")
 
 
+# ---------------------------------------------------------------------------
+# 策略入口与回调
+# ---------------------------------------------------------------------------
 _RUNTIME = None
 
 
 def validate_config(config):
+    """校验 CONFIG 必填项与取值域，不合法时抛 RuntimeError 阻止启动。"""
     if not config.get("trading_enabled"):
         raise RuntimeError("CONFIG.trading_enabled 必须显式设为 True")
     if not str(config.get("account_id", "")).strip():
@@ -1606,21 +1710,25 @@ def handlebar(ContextInfo):
 
 
 def qmt_timer(ContextInfo):
+    """500ms 定时器回调，驱动运行时状态机推进。"""
     if _RUNTIME is not None:
         _RUNTIME.on_timer(ContextInfo)
 
 
 def order_callback(ContextInfo, orderInfo):
+    """大 QMT 委托主推回调，转发给运行时记录订单状态。"""
     if _RUNTIME is not None:
         _RUNTIME.on_order(orderInfo)
 
 
 def deal_callback(ContextInfo, dealInfo):
+    """大 QMT 成交主推回调，转发给运行时做去重成交提示。"""
     if _RUNTIME is not None:
         _RUNTIME.on_deal(dealInfo)
 
 
 def stop(ContextInfo):
+    """停止 Redis 后台线程并清空运行时句柄。"""
     global _RUNTIME
     if _RUNTIME is not None:
         _RUNTIME.worker.stop()

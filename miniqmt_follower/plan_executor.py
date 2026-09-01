@@ -28,14 +28,35 @@ class PlanExecutor:
         """记录 plan 已收到（审计用，非硬去重）。"""
         return self.store.try_accept_plan(plan)
 
+    @staticmethod
+    def _held_position_map(broker) -> dict[str, int] | None:
+        """单次账户快照得到 code→总持仓 对照表; 不可用时返回 None 走逐票回退。
+
+        逐票 query_position 每次都是 _trading_lock 内的全量持仓扫描, 5 只候选
+        就是 5 次全量扫描, 撞在 9:25~9:30 盘前卖单抢锁的窗口。快照一次带回
+        全部持仓; 快照字段严格、查询失败会抛异常, 此时回退逐票查询保住展开。
+        """
+        try:
+            snapshot = broker.query_account_snapshot()
+        except Exception:
+            return None
+        return {position.code: position.total_qty for position in snapshot.positions}
+
     def derived_signals(self, plan: DailyPlan) -> Iterator[TradeSignal]:
         """展开派生信号: 清仓清单 → sell_all；待买清单过滤已有持仓 → auto_buy。"""
         for code in plan.codes_to_sell:
             yield _derived_signal(plan, code, Action.SELL, "sell_all", None)
-        buy_codes = tuple(
-            code for code in plan.codes_to_buy
-            if self.broker.query_position(code) <= 0
-        )
+        held = self._held_position_map(self.broker)
+        if held is None:
+            buy_codes = tuple(
+                code for code in plan.codes_to_buy
+                if self.broker.query_position(code) <= 0
+            )
+        else:
+            buy_codes = tuple(
+                code for code in plan.codes_to_buy
+                if held.get(code, 0) <= 0
+            )
         for code in buy_codes:
             yield _derived_signal(plan, code, Action.BUY, "auto_buy", len(buy_codes))
 
@@ -47,6 +68,7 @@ def _derived_signal(
     quantity_mode: str,
     budget_group_size: int | None,
 ) -> TradeSignal:
+    """生成一条确定性 id 的派生信号, 代码经清洗后拼入 signal_id 保证稳定幂等。"""
     safe = _SIGNAL_CODE_RE.sub("", str(code))
     return TradeSignal(
         signal_id=f"{plan.signal_id}-{action.value}-{safe}",
@@ -60,6 +82,7 @@ def _derived_signal(
         sent_at_ms=plan.sent_at_ms,
         quantity_mode=quantity_mode,
         budget_group_size=budget_group_size,
+        purpose="清仓" if action == Action.SELL else "建仓",
     )
 
 

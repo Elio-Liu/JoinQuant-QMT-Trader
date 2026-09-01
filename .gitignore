@@ -18,9 +18,11 @@ secrets.*
 
 # 实盘配置只留模板。真实的 host / 端口 / 账号 / QMT 路径 / 凭据一律不进版本库；
 # 每台交易机在本地从 config.example.yaml 复制一份改名即可（如 config.gj.yaml）。
+# 也包括 QMT 本地策略参数 config.strategy.yaml；真实策略阈值不进入版本库。
 config*.yaml
 config*.json
 !config.example.yaml
+!config.strategy.example.yaml
 
 # Runtime state
 data/
@@ -31,6 +33,8 @@ data/
 logs/
 
 .claude/
+# 本地 agent 工作流状态（task 报告 / review diff），不进入版本库
+.superpowers/
 strategies/
 CLAUDE.md
 # Redis 服务器部署方式与环境强相关，仅保留本地维护。
@@ -38,5 +42,12 @@ deploy/
 # 本地测试套件（含私有策略相关用例），不进入版本库
 tests/
 
-# 华鑫交易机本地手动实盘信号；参数与 signal_id 不进版本库。
+# 交易机本地手动实盘信号脚本；参数与 signal_id 不进版本库。
 /send_manual_trade_signal.py
+
+# 链路图产物(含私有规则时点, 仅本机)
+docs/diagrams/
+
+docs/
+
+tools/

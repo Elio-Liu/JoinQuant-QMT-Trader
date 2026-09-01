@@ -2,7 +2,13 @@
 
 核心职责: 接收 TradeSignal → 幂等去重 → 行情定价 → 下单 → 轮询 → 成交/撤单/重挂 → 终态记录。
 
-对 BrokerAdapter / MarketDataAdapter 只依赖 Protocol, 不耦合具体实现。
+对外只依赖 BrokerAdapter / MarketDataAdapter 两个 Protocol, 不耦合 miniQMT 具体实现;
+测试可注入假适配器独立验证整个状态机。
+
+本模块约定:
+- signal_id 是唯一幂等键, 重复信号直接忽略、绝不二次下单。
+- 撤单必须确认到终态才算完成, 终态不明时熔断整条交易通道。
+- 每次委托都基于最新行情与最新资金/持仓重新定价、裁量数量。
 """
 
 from __future__ import annotations
@@ -12,9 +18,11 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Protocol
 
+from miniqmt_follower.config import MachineScheduleConfig
 from miniqmt_follower.models import (
     Action,
     BrokerOrderRejected,
@@ -33,6 +41,7 @@ from miniqmt_follower.opening import is_preopen_sell
 from miniqmt_follower.pricing import calculate_order_price, tick_size_for
 from miniqmt_follower.sizing import resolve_sell_all, resolve_sell_half, shares_for_budget
 from miniqmt_follower.store import SQLiteExecutionStore
+from miniqmt_follower.strategy_models import AccountSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,7 @@ class MarketDataAdapter(Protocol):
     """
 
     def latest_quote(self, code: str) -> Quote:
+        """返回某只股票的最新行情快照(最新价 + 买卖一档)。"""
         pass
 
     def instrument_name(self, code: str) -> str | None:
@@ -77,7 +87,12 @@ class BrokerAdapter(Protocol):
         """查询某只股票的总持仓（含当日不可卖部分），用于"已有持仓不补仓"。"""
         pass
 
+    def query_account_snapshot(self) -> AccountSnapshot:
+        """单次查询资产与全部持仓快照, 供预算/plan 展开等批量读取场景。"""
+        pass
+
     def submit_order(self, signal: TradeSignal, quantity: int, price: float) -> str:
+        """向券商提交一笔委托, 返回券商订单号。"""
         pass
 
     def query_orders_by_signal_id(self, signal_id: str) -> tuple[OrderSnapshot, ...]:
@@ -85,14 +100,29 @@ class BrokerAdapter(Protocol):
         pass
 
     def get_order_snapshot(self, order_id: str) -> OrderSnapshot:
+        """按订单号查询券商最新的订单状态快照。"""
         pass
 
     def cancel_order(self, order_id: str) -> None:
+        """对指定订单发起撤单请求。"""
         pass
 
 
 class _TradingHalted(RuntimeError):
     """交易通道已熔断，禁止新的委托触达券商。"""
+
+
+class _GhostOrderSuspected(RuntimeError):
+    """订单超过宽限期仍不出现在 QMT 账户委托清单，疑似幽灵单。
+
+    由适配器以 NOT_VISIBLE 快照表达、轮询路径翻译成此异常；执行引擎捕获后
+    走三重校验决定重挂还是熔断，绝不当作普通轮询异常直接熔断。
+    """
+
+    def __init__(self, order_id: str, snapshot: OrderSnapshot):
+        super().__init__(f"order {order_id} not visible in QMT order list")
+        self.order_id = order_id
+        self.snapshot = snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +157,7 @@ _BROKER_STATUS_LABELS: dict[BrokerOrderStatus, str] = {
     BrokerOrderStatus.FILLED: "完全成交",
     BrokerOrderStatus.CANCELED: "已撤销",
     BrokerOrderStatus.REJECTED: "已拒绝",
+    BrokerOrderStatus.NOT_VISIBLE: "不可见",
 }
 
 _TERMINAL_ORDER_STATUSES = {
@@ -137,6 +168,64 @@ _TERMINAL_ORDER_STATUSES = {
 
 _QUEUE_BUY_POLL_INTERVAL_SEC = 3.0
 _OPENING_SELL_RECONCILE_GRACE_SEC = 0.5
+# 行情取数失败的重试次数与退避间隔: 行情抖动不应直接杀死信号。
+_QUOTE_RETRY_MAX = 3
+_QUOTE_RETRY_DELAY_SEC = 0.2
+# 连续竞价时段行情快照超龄时的有界重取次数与间隔(合计约 1 秒)。
+_QUOTE_STALE_RETRY_MAX = 10
+_QUOTE_STALE_RETRY_DELAY_SEC = 0.1
+# 开盘首挂窗口内行情源繁忙, 超龄重取从 10 次收紧到 3 次, 不拖累首笔委托耗时。
+_QUOTE_STALE_RETRY_OPENING_MAX = 3
+# 集合竞价期间(9:15-9:30)没有成交, QMT 快照时间戳冻结在最后一笔成交,
+# 9:30 开盘时读到的快照天然"超龄"。开盘后该宽限期内直接采信竞价快照。
+_OPENING_SNAPSHOT_GRACE_SEC = 60
+# 幽灵单自动重挂的连续上限: 超过即熔断。防交易通道坏死时空转刷单
+# (每次报单都秒回单号却从不进柜台, 竞价时段重试上限会被放大到数百次)。
+_GHOST_RESUBMIT_MAX = 2
+# 价格类拒单后的强制刷新: 宽限豁免不再适用, 快照时间戳不前进就持续重取,
+# 最多等这么久; 行情源确实停摆则带告警返回现有快照交盘口锚定兜底。
+_PRICE_REJECT_QUOTE_REFRESH_SEC = 2.0
+_PRICE_REJECT_QUOTE_REFRESH_POLL_SEC = 0.3
+# 价格类拒单后的退避下限: 给行情源一点推送时间, 别把全部尝试烧在同一旧快照上。
+_PRICE_REJECT_BACKOFF_SEC = 0.2
+
+
+def _current_datetime() -> dt.datetime:
+    """当前本地时间; 独立成函数便于测试替换, 与真实时钟解耦。"""
+    return dt.datetime.now()
+
+
+def _in_continuous_session(machine_schedule: MachineScheduleConfig) -> bool:
+    """时效门控只在连续竞价时段生效: 盘前/集合竞价快照本来就不更新。
+
+    测试可替换本模块级函数与真实时钟解耦。
+    """
+    session = machine_schedule.market_session
+    now = dt.datetime.now().time()
+    return (
+        session.continuous_trading_start_at
+        <= now
+        < session.closing_call_auction_start_at
+    )
+
+
+def _in_opening_timeout_window(
+    machine_schedule: MachineScheduleConfig, window_sec: float
+) -> bool:
+    """首挂耐心窗口: 连续竞价开始后的前 window_sec 秒。测试可替换本模块级函数。"""
+    if window_sec <= 0:
+        return False
+    session = machine_schedule.market_session
+    now = dt.datetime.now()
+    if now.time() < session.continuous_trading_start_at:
+        return False
+    open_dt = now.replace(
+        hour=session.continuous_trading_start_at.hour,
+        minute=session.continuous_trading_start_at.minute,
+        second=session.continuous_trading_start_at.second,
+        microsecond=0,
+    )
+    return 0 <= (now - open_dt).total_seconds() <= window_sec
 
 
 @dataclass(frozen=True)
@@ -160,64 +249,59 @@ def _broker_label(status: BrokerOrderStatus) -> str:
 # 竞价时段保护
 # ---------------------------------------------------------------------------
 
-_AUCTION_START = dt.time(9, 15)
-_MARKET_OPEN = dt.time(9, 30)
+def _seconds_until_market_open(machine_schedule: MachineScheduleConfig) -> float:
+    """配置的竞价时段内返回距连续竞价的秒数, 其他时间返回 0。
 
-
-def _seconds_until_market_open() -> float:
-    """竞价时段(9:15~9:30)返回距开盘的秒数, 其他时间返回 0。
-
-    策略常在 9:25~9:30 之间发信号(选股在竞价结束时完成), 此时提交的委托会在
-    券商排队、开盘才撮合。若仍按 order_timeout_sec 判超时, 会把排队中的开盘单
-    撤掉。因此竞价时段把单次轮询和总时长限制都顺延到开盘之后。
+    竞价时段提交的委托会在券商排队、连续竞价开始才撮合。若仍按
+    order_timeout_sec 判超时, 会把排队中的开盘单撤掉。因此竞价时段把
+    单次轮询和总时长限制都顺延到连续竞价之后。
     测试可通过替换本模块级函数关闭该行为。
     """
     now = dt.datetime.now()
-    if _AUCTION_START <= now.time() < _MARKET_OPEN:
-        open_dt = now.replace(hour=_MARKET_OPEN.hour, minute=_MARKET_OPEN.minute, second=0, microsecond=0)
+    market_session = machine_schedule.market_session
+    if (
+        market_session.call_auction_start_at
+        <= now.time()
+        < market_session.continuous_trading_start_at
+    ):
+        open_at = market_session.continuous_trading_start_at
+        open_dt = now.replace(
+            hour=open_at.hour,
+            minute=open_at.minute,
+            second=open_at.second,
+            microsecond=0,
+        )
         return (open_dt - now).total_seconds()
     return 0.0
 
 
-def _seconds_until_queue_sell_deadline(deadline_hhmmss: str) -> float:
-    """返回距跌停排队截止时刻的秒数; 已过截止或格式非法返回 0。
+def _seconds_until_queue_sell_cancel(cancel_at: dt.time) -> float:
+    """返回距跌停排队截止时刻的秒数; 已过截止返回 0。
 
-    截止默认 14:56:30, 避开深市 14:57 尾盘集合竞价; 到点主动撤单,
+    截止时刻已在启动前校验为早于尾盘集合竞价; 到点主动撤单,
     让本地台账在收盘前落终态 (券商收盘也会自动废单, 主动撤是为了记账确定性)。
     测试可通过替换本模块级函数控制排队时长。
     """
-    try:
-        parts = [int(p) for p in str(deadline_hhmmss).split(":")]
-        deadline_time = dt.time(*parts)
-    except (ValueError, TypeError):
-        logger.error("❌ queue_sell_deadline 格式非法: %r | 跌停排队降级为跳过", deadline_hhmmss)
-        return 0.0
     now = dt.datetime.now()
-    deadline_dt = now.replace(
-        hour=deadline_time.hour,
-        minute=deadline_time.minute,
-        second=deadline_time.second,
+    cancel_dt = now.replace(
+        hour=cancel_at.hour,
+        minute=cancel_at.minute,
+        second=cancel_at.second,
         microsecond=0,
     )
-    return max(0.0, (deadline_dt - now).total_seconds())
+    return max(0.0, (cancel_dt - now).total_seconds())
 
 
-def _seconds_until_queue_buy_deadline(deadline_hhmmss: str) -> float:
-    """返回距涨停买单排队截止时刻的秒数；已过截止或格式非法返回 0。"""
-    try:
-        parts = [int(p) for p in str(deadline_hhmmss).split(":")]
-        deadline_time = dt.time(*parts)
-    except (ValueError, TypeError):
-        logger.error("❌ queue_buy_deadline 格式非法: %r | 涨停排队降级为跳过", deadline_hhmmss)
-        return 0.0
+def _seconds_until_queue_buy_cancel(cancel_at: dt.time) -> float:
+    """返回距涨停买单排队截止时刻的秒数；已过截止返回 0。"""
     now = dt.datetime.now()
-    deadline_dt = now.replace(
-        hour=deadline_time.hour,
-        minute=deadline_time.minute,
-        second=deadline_time.second,
+    cancel_dt = now.replace(
+        hour=cancel_at.hour,
+        minute=cancel_at.minute,
+        second=cancel_at.second,
         microsecond=0,
     )
-    return max(0.0, (deadline_dt - now).total_seconds())
+    return max(0.0, (cancel_dt - now).total_seconds())
 
 
 # 批次预算闩锁保留的最近批次数。一天一个 plan, 32 条足够覆盖任何回看窗口。
@@ -259,14 +343,26 @@ class OrderExecutionEngine:
         market_data: MarketDataAdapter,
         broker: BrokerAdapter,
         config: ExecutionConfig,
+        machine_schedule: MachineScheduleConfig,
         *,
         on_limit_down_queued: Callable[[str], None] | None = None,
+        queue_executor: ThreadPoolExecutor | None = None,
+        stop_event: threading.Event | None = None,
     ):
         self.store = store
         self.market_data = market_data
         self.broker = broker
         self.config = config
+        self.machine_schedule = machine_schedule
         self._on_limit_down_queued = on_limit_down_queued or (lambda _signal_id: None)
+        # 排队单专用线程池: 配置后跌停排队卖出挂单落库即移交慢轮询,
+        # 卖出 worker 不再被全天占用; None 时保持原同步行为。
+        self._queue_executor = queue_executor
+        # 优雅退出事件: 排队慢轮询必须可被打断, 否则挂着排队单的进程
+        # 退出时要等到排队截止(14:56:30)才肯收工。
+        self._stop_event = stop_event
+        self._queued_futures: dict[str, Future] = {}
+        self._queued_futures_lock = threading.Lock()
         self._trading_halt_reason: str | None = None
         self._broker_submission_lock = threading.Lock()
         # 跌停排队卖出的并发闸: 排队单占用 worker 直到成交或截止,
@@ -295,8 +391,10 @@ class OrderExecutionEngine:
             cached = self._budget_cache.get(batch_key) if batch_key else None
             if cached is not None:
                 return cached
-            available_cash = self.broker.query_available_cash()
-            total_assets = self.broker.query_total_assets()
+            # 单次账户快照一次带回可用资金与总资产, 省掉第二次锁获取与跨进程查询。
+            account = self.broker.query_account_snapshot()
+            available_cash = account.available_cash
+            total_assets = account.total_assets
             budget = min(
                 available_cash / max(signal.budget_group_size or 1, 1),
                 total_assets * self.config.max_single_position_pct,
@@ -320,6 +418,29 @@ class OrderExecutionEngine:
         if stored is None:
             return self.execute(signal)
         attempts = self.store.list_attempts(signal.signal_id)
+        # 排队单已移交本进程专用线程跟踪时, pending 扫描的重投不得再派工:
+        # 否则 recover 会以排队截止为限在卖出 worker 里同步轮询, 数十秒内
+        # 占满整个卖出池, 盘中止损卖单全部饿死。占位结果非终态, 上层会
+        # 重新挂接排队 future 的补 ACK 回调(幂等)。
+        if stored.status in {
+            ExecutionStatus.QUEUED_LIMIT_DOWN,
+            ExecutionStatus.QUEUED_LIMIT_UP,
+        }:
+            with self._queued_futures_lock:
+                queued = self._queued_futures.get(signal.signal_id)
+            if queued is not None and not queued.done():
+                logger.info(
+                    "%s | %s | 排队单仍由专用线程跟踪 | 重投不重复派工",
+                    signal.console_event("重试"), signal.display_code,
+                )
+                return ExecutionResult(
+                    signal_id=signal.signal_id,
+                    status=stored.status,
+                    requested_qty=signal.amount,
+                    filled_qty=stored.filled_qty,
+                    attempts=len(attempts),
+                    message="queue order still tracked by dedicated worker",
+                )
         if stored.status == ExecutionStatus.RECOVERY_REQUIRED:
             halt_reason = self._set_trading_halt(
                 f"unresolved recovery required for {signal.signal_id}"
@@ -465,15 +586,21 @@ class OrderExecutionEngine:
         initial: OrderSnapshot,
         stored_status: ExecutionStatus,
     ) -> OrderSnapshot:
+        """恢复核单时等待排队单进入终态或到达排队截止, 复用正常排队的慢轮询语义。"""
         if stored_status == ExecutionStatus.QUEUED_LIMIT_DOWN:
-            wait_sec = _seconds_until_queue_sell_deadline(self.config.queue_sell_deadline)
+            wait_sec = _seconds_until_queue_sell_cancel(
+                self.machine_schedule.order_guard.limit_down_queue_cancel_at
+            )
         else:
-            wait_sec = _seconds_until_queue_buy_deadline(self.config.queue_buy_deadline)
+            wait_sec = _seconds_until_queue_buy_cancel(
+                self.machine_schedule.order_guard.limit_up_queue_cancel_at
+            )
         deadline = time.monotonic() + max(0.0, wait_sec)
         current = initial
         while (
             current.status not in _TERMINAL_ORDER_STATUSES
             and time.monotonic() < deadline
+            and not self._stop_requested()
         ):
             interval = self.config.queue_sell_poll_interval_sec
             if interval > 0:
@@ -530,21 +657,21 @@ class OrderExecutionEngine:
         )
 
     def execute(self, signal: TradeSignal) -> ExecutionResult:
+        """执行一条信号的完整生命周期: 幂等去重 → 过期/意图解析 → 下单轮询主循环 → 终态落库。
+
+        幂等闸与过期判断先于任何行情/账户查询, 重复或过期信号不触达券商。
+        """
         # 延迟打点起点: 从工作线程真正开始处理这条信号算起。
         exec_started = time.monotonic()
-        # 日志展示用中文名: 每条信号解析一次, 整条时间线统一显示 名称(代码)。
-        if not signal.stock_name:
-            signal = signal.with_stock_name(self.market_data.instrument_name(signal.code))
-        code_label = signal.display_code
         logger.debug("⚡ 开始执行信号 | signal_id=%s", signal.signal_id)
 
-        # ---- 幂等去重 ----
+        # ---- 幂等去重(最优先): 重复信号连中文名解析与任何行情/账户查询都不做 ----
         if not self.store.try_accept_signal(signal):
             existing = self.store.get_signal(signal.signal_id)
             logger.info(
                 "%s | %s | 已有状态 %s | 成交 %s股",
                 signal.console_event("重复"),
-                code_label,
+                signal.display_code,
                 _status_label(existing.status),
                 existing.filled_qty,
             )
@@ -557,12 +684,33 @@ class OrderExecutionEngine:
                 message="signal_id already accepted",
             )
 
+        # 日志展示用中文名: 只在首次受理时解析一次, 整条时间线统一显示 名称(代码)。
+        if not signal.stock_name:
+            signal = signal.with_stock_name(self.market_data.instrument_name(signal.code))
+        code_label = signal.display_code
+
         logger.debug(
             "🔖 信号已登记 | %s @%.2f 策略=%s",
             signal.label,
             signal.reference_price,
             signal.strategy_id,
         )
+
+        # 过期判断先于意图解析: 过期信号不做任何持仓/资金/行情查询, 也不触达券商。
+        expire_status = self._signal_expiry_status(signal)
+        if expire_status is not None:
+            status, message = expire_status
+            if status == ExecutionStatus.FAILED_RISK:
+                logger.error(
+                    "%s | %s | 过期时间非法 %r | 未下单",
+                    signal.console_event("失败"), code_label, signal.expire_at,
+                )
+            else:
+                logger.warning(
+                    "%s | %s | %s | 未下单",
+                    signal.console_event("过期"), code_label, message,
+                )
+            return self._finish(signal, status, 0, 0, message)
 
         if signal.quantity_mode != "exact":
             try:
@@ -612,22 +760,8 @@ class OrderExecutionEngine:
             )
             signal = replace(
                 signal, amount=resolved, quantity_mode="exact", budget_group_size=None,
+                budget_amount=None,
             )
-
-        expire_status = self._signal_expiry_status(signal)
-        if expire_status is not None:
-            status, message = expire_status
-            if status == ExecutionStatus.FAILED_RISK:
-                logger.error(
-                    "%s | %s | 过期时间非法 %r | 未下单",
-                    signal.console_event("失败"), code_label, signal.expire_at,
-                )
-            else:
-                logger.warning(
-                    "%s | %s | %s | 未下单",
-                    signal.console_event("过期"), code_label, message,
-                )
-            return self._finish(signal, status, 0, 0, message)
 
         # 上一笔订单撤单终态不明确时，禁止任何后续信号继续触达券商。
         halt_reason = self._current_trading_halt_reason()
@@ -649,20 +783,51 @@ class OrderExecutionEngine:
             logger.warning("%s | %s | 数量非法 %s股", signal.console_event("风控"), code_label, signal.amount)
             return self._finish(signal, ExecutionStatus.FAILED_RISK, 0, 0, "amount must be positive")
 
+        return self._execute_main_loop(
+            signal,
+            exec_started=exec_started,
+            remaining_qty=signal.amount,
+            total_filled=0,
+            attempts=0,
+            target_qty=None,
+        )
+
+    def _execute_main_loop(
+        self,
+        signal: TradeSignal,
+        *,
+        exec_started: float,
+        remaining_qty: int,
+        total_filled: int,
+        attempts: int,
+        target_qty: int | None,
+        initial_quote: Quote | None = None,
+    ) -> ExecutionResult:
+        """下单 → 轮询 → 成交/撤单/重挂主循环。
+
+        从 execute() 的前置部分(幂等/意图/过期/熔断)之后进入; 涨停排队续跑
+        也携带余量从这里重入, 开板后的常规定价语义与整体执行完全一致。
+        initial_quote 供续跑场景复用刚取到的行情, 避免重复取数(测试里
+        FakeMarketData 按队列消费, 重复取数会改变消费序列)。
+        """
+        code_label = signal.display_code
+
         # ---- 主循环: 下单 → 轮询 → 成交/撤单/重挂 ----
         started = time.monotonic()
-        target_qty: int | None = None
-        remaining_qty = signal.amount
-        total_filled = 0
-        attempts = 0
 
         # 竞价时段收到的信号: 委托在券商排队至开盘撮合, 总时长限制顺延到开盘之后。
-        auction_extra = _seconds_until_market_open()
+        auction_extra = _seconds_until_market_open(self.machine_schedule)
         if auction_extra > 0:
             logger.info(
                 "%s | %s | 距开盘 %.0f秒 | 委托排队等待撮合",
                 signal.console_event("竞价"), code_label, auction_extra,
             )
+        # 连续幽灵单重挂计数: 超过上限熔断, 防交易通道坏死时按竞价放大后的
+        # 重试次数空转刷单。
+        ghost_resubmits = 0
+        # 本信号执行内的价格类拒单计数: >0 时后续重挂强制刷新行情并改盘口锚定
+        # 报价, 不再沿用竞价/开盘的百分比激进报价(旧快照+激进价=连续拒单)。
+        price_rejects = 0
         while remaining_qty > 0 and attempts < self._effective_max_attempts():
             # 总时长限制
             elapsed = time.monotonic() - started
@@ -682,7 +847,17 @@ class OrderExecutionEngine:
 
             # ---- 每次委托都重新获取行情和账户可用资源 ----
             try:
-                quote = self.market_data.latest_quote(signal.code)
+                if initial_quote is not None:
+                    quote = initial_quote
+                    initial_quote = None
+                else:
+                    quote = self._latest_quote_with_retry(signal)
+                    if price_rejects > 0:
+                        # 价格拒单后必须刷新到新行情才允许重挂(开盘宽限豁免
+                        # 不再适用), 拿不到新行情则保留现有快照交盘口锚定兜底。
+                        quote = self._refresh_quote_after_price_rejection(
+                            signal, quote
+                        )
 
                 # ---- 跌停锁盘卖单: 排队模式 ----
                 # 开板窗口往往只有几秒, 放弃排队 = 放弃唯一逃生口。挂跌停价
@@ -698,7 +873,7 @@ class OrderExecutionEngine:
                     # 交给 _queue_sell_at_limit_down 内部走保守的降级跳过。
                     # 拿得到跌停价时, 必须确认价格真的贴在跌停上才进排队 ——
                     # 否则一次普通的买一档缺失就会把清仓单挂成跌停价并锁死
-                    # 一个排队 worker 到 14:56:30 且全天不重新定价。
+                    # 一个排队 worker 占用到配置的排队撤单时刻，且全天不重新定价。
                     if quote.low_limit is None or quote.low_limit <= 0 or (
                         self._is_confirmed_limit_down(signal, quote)
                     ):
@@ -757,7 +932,10 @@ class OrderExecutionEngine:
                         "skipped: locked limit book, no counterparty side",
                     )
 
-                order_price = calculate_order_price(signal, quote, self.config)
+                order_price = calculate_order_price(
+                    signal, quote, self.config, self.machine_schedule,
+                    prefer_book=price_rejects > 0,
+                )
                 if signal.action == Action.BUY:
                     order_id, attempt_qty = self._submit_buy_with_cash_lock(
                         signal, remaining_qty, order_price,
@@ -831,7 +1009,15 @@ class OrderExecutionEngine:
                     signal.console_event("重试"), code_label, attempts,
                     exc.kind.value, exc.reason,
                 )
-                self._sleep_before_retry()
+                if exc.kind == BrokerRejectionKind.PRICE:
+                    price_rejects += 1
+                    logger.warning(
+                        "%s | %s | 价格拒单×%d | 下一挂强制刷新行情并改盘口锚定报价",
+                        signal.console_event("重试"), code_label, price_rejects,
+                    )
+                self._sleep_before_retry(
+                    price_rejection=exc.kind == BrokerRejectionKind.PRICE
+                )
                 continue
             except BrokerSubmissionUncertain as exc:
                 attempts = attempt_no
@@ -865,12 +1051,104 @@ class OrderExecutionEngine:
 
             # ---- 轮询等终态 ----
             try:
-                snapshot = self._wait_for_terminal_or_timeout(
-                    order_id,
-                    opening_sell_first_attempt=(
-                        attempts == 1 and is_preopen_sell(signal)
-                    ),
+                first_timeout = (
+                    self._first_attempt_timeout(signal) if attempts == 1 else None
                 )
+                snapshot = self._wait_for_terminal_or_timeout(
+                    order_id, timeout=first_timeout,
+                )
+                # 开盘首挂价格感知等待: 首笔未成交先看价格再决定撤不撤。
+                # 等待时间有上限且从总预算里扣, 异常沿既有路径处置(查单异常
+                # 仍会走到下面的 except → 交易熔断)。
+                snapshot = self._maybe_wait_on_opening_gap(
+                    signal, order_id, order_price, snapshot, first_timeout,
+                    budget_room=max(
+                        0.0,
+                        self.config.max_total_duration_sec
+                        + auction_extra
+                        - (time.monotonic() - started),
+                    ),
+                    attempt_qty=attempt_qty,
+                )
+            except _GhostOrderSuspected as exc:
+                # 疑似幽灵单: 报单受理后宽限期内从未出现在 QMT 委托清单。
+                # 三重校验全空才确认并重挂(无单可撤, 直接走下一 attempt);
+                # 直查可见 = 回报滞后, 恢复轮询原单; 任一有疑 = 熔断对账。
+                verdict, detail, visible_snapshot = self._diagnose_ghost_order(
+                    signal, exc.order_id, attempt_qty,
+                )
+                if verdict == "visible":
+                    logger.warning(
+                        "%s | %s | 幽灵单警报解除: 直查委托可见(回报滞后) | %s",
+                        signal.console_event("重试"), code_label, detail,
+                    )
+                    assert visible_snapshot is not None
+                    try:
+                        snapshot = self._wait_for_terminal_or_timeout(
+                            exc.order_id,
+                            timeout=(
+                                self._first_attempt_timeout(signal)
+                                if attempts == 1 else None
+                            ),
+                        )
+                    except _GhostOrderSuspected as second:
+                        verdict, detail, visible_snapshot = (
+                            "doubt", f"直查后二次不可见({second})", None,
+                        )
+                        snapshot = second.snapshot
+                if verdict == "doubt":
+                    halt_reason = self._set_trading_halt(
+                        f"order {exc.order_id} not visible in QMT and {detail}; "
+                        "restart only after manual MiniQMT reconciliation"
+                    )
+                    logger.critical(
+                        "%s | %s | 订单不可见且%s, 停止后续交易 | QMT单号=%s",
+                        signal.console_event("停止"), code_label, detail, exc.order_id,
+                    )
+                    self.store.update_attempt(
+                        exc.order_id, exc.snapshot.status.value, exc.snapshot.filled_qty,
+                    )
+                    return self._defer_for_recovery(
+                        signal, total_filled, attempts, halt_reason,
+                    )
+                if verdict == "ghost":
+                    ghost_resubmits += 1
+                    if (
+                        not self.config.ghost_order_auto_resubmit
+                        or ghost_resubmits > _GHOST_RESUBMIT_MAX
+                    ):
+                        stop_reason = (
+                            "自动重挂已关闭"
+                            if not self.config.ghost_order_auto_resubmit
+                            else f"连续幽灵重挂超过{_GHOST_RESUBMIT_MAX}次"
+                        )
+                        halt_reason = self._set_trading_halt(
+                            f"order {exc.order_id} is a ghost order ({detail}); "
+                            f"{stop_reason} — restart only after manual "
+                            "MiniQMT reconciliation"
+                        )
+                        logger.critical(
+                            "%s | %s | 幽灵单已确认(%s), 但%s, 停止后续交易 | QMT单号=%s",
+                            signal.console_event("停止"), code_label, detail,
+                            stop_reason, exc.order_id,
+                        )
+                        self.store.update_attempt(
+                            exc.order_id, exc.snapshot.status.value, exc.snapshot.filled_qty,
+                        )
+                        return self._defer_for_recovery(
+                            signal, total_filled, attempts, halt_reason,
+                        )
+                    logger.warning(
+                        "%s | %s | ⚠️ 幽灵单已确认 | %s | 本次0成交, 无单可撤, "
+                        "立即重挂剩余%s股(第%d次幽灵重挂)",
+                        signal.console_event("重试"), code_label, detail,
+                        remaining_qty, ghost_resubmits,
+                    )
+                    self.store.update_attempt(
+                        exc.order_id, exc.snapshot.status.value, exc.snapshot.filled_qty,
+                    )
+                    self._sleep_before_retry()
+                    continue
             except Exception as exc:
                 halt_reason = self._set_trading_halt(
                     f"order {order_id} state is uncertain: {exc}; "
@@ -958,7 +1236,15 @@ class OrderExecutionEngine:
                     rejection_kind.value, rejection_reason, total_filled, target_qty,
                     remaining_qty,
                 )
-                self._sleep_before_retry()
+                if rejection_kind == BrokerRejectionKind.PRICE:
+                    price_rejects += 1
+                    logger.warning(
+                        "%s | %s | 价格拒单×%d | 下一挂强制刷新行情并改盘口锚定报价",
+                        signal.console_event("重试"), code_label, price_rejects,
+                    )
+                self._sleep_before_retry(
+                    price_rejection=rejection_kind == BrokerRejectionKind.PRICE
+                )
                 continue
 
             # ---- 本笔订单已终态但信号仍有剩余，下一轮重新查资源和行情 ----
@@ -993,9 +1279,9 @@ class OrderExecutionEngine:
         status = ExecutionStatus.PARTIALLY_FILLED_TIMEOUT if total_filled else ExecutionStatus.FAILED_TIMEOUT
         return self._finish(signal, status, total_filled, attempts, "attempt or duration limit reached")
 
-    # -------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
     # 内部方法
-    # -------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
 
     def _effective_max_attempts(self) -> int:
         """竞价时段放宽尝试次数上限。
@@ -1008,7 +1294,7 @@ class OrderExecutionEngine:
         竞价时段改为按"剩余秒数 ÷ 退避间隔"给出足够次数, 让重试均匀铺满到开盘。
         总时长仍受 max_total_duration_sec + auction_extra 约束, 不会无限重试。
         """
-        auction_extra = _seconds_until_market_open()
+        auction_extra = _seconds_until_market_open(self.machine_schedule)
         if auction_extra <= 0:
             return self.config.max_attempts
         interval = max(self._retry_backoff_sec(), 0.05)
@@ -1020,15 +1306,166 @@ class OrderExecutionEngine:
         竞价时段用较长间隔(把重试铺满到开盘, 顺便少打柜台); 连续竞价时段保持
         原来的快速重试 —— 抢单场景下每一次行情刷新都值钱。
         """
-        auction_extra = _seconds_until_market_open()
+        auction_extra = _seconds_until_market_open(self.machine_schedule)
         if auction_extra > 0:
             return min(1.0, max(0.2, auction_extra / 20.0))
         return min(self.config.poll_interval_sec, 0.05)
 
-    def _sleep_before_retry(self) -> None:
+    def _sleep_before_retry(self, *, price_rejection: bool = False) -> None:
         delay = self._retry_backoff_sec()
+        if price_rejection:
+            # 价格拒单后给行情源一点推送时间, 别把全部尝试烧在同一旧快照上。
+            delay = max(delay, _PRICE_REJECT_BACKOFF_SEC)
         if delay > 0:
             time.sleep(delay)
+
+    def _latest_quote_with_retry(self, signal: TradeSignal) -> Quote:
+        """取行情快照, 失败短暂退避重试 —— 行情抖动不应直接杀死信号。
+
+        对比券商拒单有分类重试, 行情一次性取数失败直接终态是对称性缺陷:
+        9:25~9:30 行情源丢档、未订阅代码首次取价失败都会命中, 改为
+        退避重试几次; 全部失败仍抛异常, 终态语义与改动前一致。
+        成功路径再交给时效门控(连续竞价时段不用旧盘口报价)。
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, _QUOTE_RETRY_MAX + 1):
+            try:
+                quote = self.market_data.latest_quote(signal.code)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "%s | %s | 行情取数失败 第%d/%d次 | %s",
+                    signal.console_event("重试"), signal.display_code,
+                    attempt, _QUOTE_RETRY_MAX, exc,
+                )
+                if attempt < _QUOTE_RETRY_MAX:
+                    time.sleep(_QUOTE_RETRY_DELAY_SEC)
+                continue
+            return self._refresh_stale_quote(signal, quote)
+        raise last_error  # type: ignore[misc]
+
+    def _refresh_stale_quote(self, signal: TradeSignal, quote: Quote) -> Quote:
+        """快照超龄时有界重取; 仍不新鲜则带告警提交, 不让时效门控杀死信号。"""
+        max_age = self.config.quote_max_age_sec
+        if (
+            max_age <= 0
+            or quote.quote_time is None
+            or not _in_continuous_session(self.machine_schedule)
+        ):
+            return quote
+        now = _current_datetime()
+        if self._auction_quote_within_opening_grace(quote, now):
+            return quote
+        retry_max = (
+            _QUOTE_STALE_RETRY_OPENING_MAX
+            if _in_opening_timeout_window(
+                self.machine_schedule, self.config.opening_aggressive_window_sec
+            )
+            else _QUOTE_STALE_RETRY_MAX
+        )
+        for attempt in range(1, retry_max + 1):
+            age = (_current_datetime() - quote.quote_time).total_seconds()
+            if age <= max_age:
+                if attempt > 1:
+                    logger.debug(
+                        "%s | %s | 行情快照已更新 | 第%d次重取 | 时效 %.2fs",
+                        signal.console_event("重试"), signal.display_code,
+                        attempt, age,
+                    )
+                return quote
+            logger.warning(
+                "%s | %s | 行情快照超龄 %.1fs(>%ss) | 第%d/%d次重取",
+                signal.console_event("重试"), signal.display_code,
+                age, max_age, attempt, retry_max,
+            )
+            time.sleep(_QUOTE_STALE_RETRY_DELAY_SEC)
+            try:
+                quote = self.market_data.latest_quote(signal.code)
+            except Exception as exc:
+                logger.warning(
+                    "%s | %s | 快照重取失败, 保留现有快照 | %s",
+                    signal.console_event("重试"), signal.display_code, exc,
+                )
+                return quote
+        logger.warning(
+            "%s | %s | 行情快照仍超龄 | 带告警提交",
+            signal.console_event("重试"), signal.display_code,
+        )
+        return quote
+
+    def _refresh_quote_after_price_rejection(
+        self, signal: TradeSignal, quote: Quote
+    ) -> Quote:
+        """价格拒单后的强制刷新: 冻结的竞价快照不再豁免, 等行情推进或变新鲜。
+
+        2026-08-31 复盘: 开盘宽限豁免让重挂反复用 09:25 的冻结盘口报同
+        一个价, 连拒 20 次全被交易所价格笼子拒掉。这里反过来——快照时间戳不
+        前进就持续重取(有界), 拿到推进后的行情才交给下一挂定价; 行情源确实
+        停摆时带告警返回现有快照, 由盘口锚定报价兜底, 不新增熔断面。
+        """
+        if quote.quote_time is None:
+            return quote
+        deadline = time.monotonic() + _PRICE_REJECT_QUOTE_REFRESH_SEC
+        prev_time = quote.quote_time
+        while time.monotonic() < deadline:
+            if quote.quote_time != prev_time and quote.last_price > 0:
+                logger.debug(
+                    "%s | %s | 价格拒单后行情已推进 | 重挂采用新快照",
+                    signal.console_event("重试"), signal.display_code,
+                )
+                return quote
+            age = (_current_datetime() - quote.quote_time).total_seconds()
+            if 0 <= age <= self.config.quote_max_age_sec:
+                return quote
+            time.sleep(_PRICE_REJECT_QUOTE_REFRESH_POLL_SEC)
+            try:
+                fresh = self.market_data.latest_quote(signal.code)
+            except Exception as exc:
+                logger.warning(
+                    "%s | %s | 价格拒单后行情重取失败 | %s",
+                    signal.console_event("重试"), signal.display_code, exc,
+                )
+                continue
+            if fresh is not None and fresh.last_price > 0:
+                quote = fresh
+        logger.warning(
+            "%s | %s | 价格拒单后行情仍未推进 | 带告警按现有快照盘口锚定重挂",
+            signal.console_event("重试"), signal.display_code,
+        )
+        return quote
+
+    def _auction_quote_within_opening_grace(
+        self, quote: Quote, now: dt.datetime
+    ) -> bool:
+        """竞价时段冻结的快照在开盘后宽限期内视为有效, 免于超龄重取。"""
+        if quote.quote_time is None or quote.quote_time.date() != now.date():
+            return False
+        session = self.machine_schedule.market_session
+        if not (
+            session.call_auction_start_at
+            <= quote.quote_time.time()
+            < session.continuous_trading_start_at
+        ):
+            return False
+        continuous_start = dt.datetime.combine(
+            now.date(), session.continuous_trading_start_at
+        )
+        return (
+            0
+            <= (now - continuous_start).total_seconds()
+            <= _OPENING_SNAPSHOT_GRACE_SEC
+        )
+
+    def _forget_queued_future(self, signal_id: str, future: Future) -> None:
+        """从排队 future 表移除该 signal_id 的引用, 仅当登记的仍是同一个 future 时才删。"""
+        with self._queued_futures_lock:
+            if self._queued_futures.get(signal_id) is future:
+                del self._queued_futures[signal_id]
+
+    def queue_future_for(self, signal_id: str) -> Future | None:
+        """排队单专用线程的 future, 供上层在终态时补发 ACK。"""
+        with self._queued_futures_lock:
+            return self._queued_futures.get(signal_id)
 
     def _resolve_intent_amount(self, signal: TradeSignal) -> int:
         """意图型信号 → 具体股数（sell_all/sell_half 查持仓, auto_buy 查资金+行情）。"""
@@ -1039,14 +1476,25 @@ class OrderExecutionEngine:
         if signal.quantity_mode == "sell_half":
             return resolve_sell_half(
                 self.broker.query_available_position(signal.code),
-                self.config.sell_half_insufficient_lot_mode,
+                signal.sell_half_insufficient_lot_mode
+                or self.config.sell_half_insufficient_lot_mode,
             )
         if signal.quantity_mode == "auto_buy":
-            quote = self.market_data.latest_quote(signal.code)
+            quote = self._latest_quote_with_retry(signal)
             return shares_for_budget(
                 budget=self._per_stock_budget(signal),
                 price=quote.last_price,
                 fee_buffer_pct=self.config.cash_fee_buffer_pct,
+            )
+        if signal.quantity_mode == "fixed_budget":
+            if signal.action != Action.BUY or signal.budget_amount is None:
+                raise ValueError("fixed_budget requires BUY and budget_amount")
+            quote = self._latest_quote_with_retry(signal)
+            # 协调器分配预算时已扣除策略 YAML 的现金预留；此处不重复扣费。
+            return shares_for_budget(
+                budget=signal.budget_amount,
+                price=quote.last_price,
+                fee_buffer_pct=0.0,
             )
         raise ValueError(f"invalid quantity_mode: {signal.quantity_mode}")
 
@@ -1088,29 +1536,67 @@ class OrderExecutionEngine:
                     % (signal.sent_at_ms, seconds, overdue_ms),
                 )
         return None
+    def _first_attempt_timeout(self, signal: TradeSignal) -> float | None:
+        """首笔委托的轮询超时; None 表示走默认 order_timeout_sec(+竞价顺延)。
+
+        - 盘前卖单保持原有语义: 距开盘秒数 + 0.5s 报告宽限;
+        - 盘前挂单买单(preopen_submit): 距开盘秒数 + opening_order_timeout_sec
+          —— 开盘撮合的回执可能迟到 1~2 秒, 0.5s 就撤会向已成交的单发多余撤单;
+        - 开盘窗口内的买单: opening_order_timeout_sec(>0 时) ——
+          首挂即决战, 撤单确认慢的券商下 0.5s 就撤等于放弃。
+        """
+        if is_preopen_sell(signal, self.machine_schedule):
+            return (
+                _seconds_until_market_open(self.machine_schedule)
+                + _OPENING_SELL_RECONCILE_GRACE_SEC
+            )
+        if (
+            signal.action == Action.BUY
+            and signal.preopen_submit
+            and self.config.opening_order_timeout_sec > 0
+        ):
+            return (
+                _seconds_until_market_open(self.machine_schedule)
+                + self.config.opening_order_timeout_sec
+            )
+        if (
+            signal.action == Action.BUY
+            and self.config.opening_order_timeout_sec > 0
+            and _in_opening_timeout_window(
+                self.machine_schedule, self.config.opening_aggressive_window_sec
+            )
+        ):
+            return self.config.opening_order_timeout_sec
+        return None
+
     def _wait_for_terminal_or_timeout(
         self,
         order_id: str,
         *,
-        opening_sell_first_attempt: bool = False,
+        timeout: float | None = None,
     ) -> OrderSnapshot:
         """轮询订单直到终态或单次委托超时。
 
-        使用自适应轮询策略: 前 1 秒用快速间隔, 之后降速。
+        timeout=None 时用 order_timeout_sec + 竞价顺延; 显式传入则覆盖
+        (开盘首挂耐心窗口用)。使用自适应轮询策略: 前 1 秒用快速间隔, 之后降速。
         这样在流动性好的快速成交场景下能更快确认成交。
-        竞价时段(9:15~9:30)提交的委托要排队到开盘才可能成交, deadline 顺延。
         """
-        if opening_sell_first_attempt:
-            timeout = (
-                _seconds_until_market_open() + _OPENING_SELL_RECONCILE_GRACE_SEC
+        if timeout is None:
+            timeout = self.config.order_timeout_sec + _seconds_until_market_open(
+                self.machine_schedule
             )
-        else:
-            timeout = self.config.order_timeout_sec + _seconds_until_market_open()
         deadline = time.monotonic() + timeout
         fast_deadline = time.monotonic() + 1.0  # 前 1 秒快速轮询
         last_snapshot = self.broker.get_order_snapshot(order_id)
+        if last_snapshot.status == BrokerOrderStatus.NOT_VISIBLE:
+            # 超时=0 的极端配置下 while 不执行, 首取也必须能上报幽灵单。
+            raise _GhostOrderSuspected(order_id, last_snapshot)
 
         while time.monotonic() < deadline:
+            if last_snapshot.status == BrokerOrderStatus.NOT_VISIBLE:
+                # 疑似幽灵单: 报单受理后宽限期内从未出现在 QMT 委托清单。
+                # 交给上层三重校验(直查/冻结资金/持仓), 不在这里当超时处理。
+                raise _GhostOrderSuspected(order_id, last_snapshot)
             if last_snapshot.status in {
                 BrokerOrderStatus.FILLED,
                 BrokerOrderStatus.CANCELED,
@@ -1139,6 +1625,149 @@ class OrderExecutionEngine:
         )
         return last_snapshot
 
+    def _maybe_wait_on_opening_gap(
+        self,
+        signal: TradeSignal,
+        order_id: str,
+        order_price: float,
+        snapshot: OrderSnapshot,
+        first_timeout: float | None,
+        budget_room: float,
+        attempt_qty: int,
+    ) -> OrderSnapshot:
+        """开盘窗口内 BUY 首笔委托超时未成交时, 按最新价与挂单价的偏离决定
+        是否再等一等; 不满足条件时原样返回, 行为与旧版完全一致。
+
+        触发条件: 首笔(first_timeout 非 None)、BUY、订单非终态且零成交、
+        两个配置项均 > 0、总预算仍有剩余。
+        """
+        if not (
+            first_timeout is not None
+            and signal.action == Action.BUY
+            and snapshot.status not in _TERMINAL_ORDER_STATUSES
+            and snapshot.filled_qty <= 0
+            and self.config.opening_price_gap_wait_pct > 0
+            and self.config.opening_price_gap_wait_max_sec > 0
+            and budget_room > 0
+        ):
+            return snapshot
+        return self._opening_price_gap_wait(
+            signal, order_id, order_price, snapshot, budget_room, attempt_qty,
+        )
+
+    def _opening_price_gap_wait(
+        self,
+        signal: TradeSignal,
+        order_id: str,
+        order_price: float,
+        snapshot: OrderSnapshot,
+        budget_room: float,
+        attempt_qty: int,
+    ) -> OrderSnapshot:
+        """开盘首挂未成交时的价格感知等待。
+
+        首笔委托超时、零成交有两种可能: (a) 价格已经甩开挂单价, 单子等不回来;
+        (b) 价格仍贴近挂单价, 只是回报迟到或被更高价买盘短暂插队(价格随时
+        回来)。旧行为不区分一律撤单追价, (b) 场景会亲手撤掉一张健康的排队单。
+        这里以 opening_price_gap_wait_poll_sec 为节奏(默认 0.2s, 开盘分秒必争;
+        1.0 = 旧行为)用新鲜行情重判:
+        - 最新价甩开挂单价超过阈值 → 立即结束等待, 交给上层走撤单追价;
+        - 最新价偏离 ≤ opening_price_gap_wait_pct → 继续等, 等满
+          opening_price_gap_wait_max_sec(再受总预算 budget_room 约束)为止;
+        - 行情仍停在竞价旧快照(开盘宽限内的冻结时间戳) → 不下价格结论
+          (旧价盲判曾让死单白等 6 秒), 并触发一次幽灵单三重校验;
+        - 买单价格在挂单价下方却零成交 → 同样是"单子可能不在队列"的强信号
+          (挂单高于市价而没成交, 只可能是回报丢失或死单), 每个等待窗口
+          至多直查诊断一次: 健康单会被直查识别(可见)继续等, 死单立即交由
+          主循环重挂, 不用等满窗口;
+        - 行情取不到 → 宁等不撤: 撤掉健康排队单的代价 > 多等一秒, 同样有上限。
+        等待期间订单进入终态(成交/撤单/拒单)或出现成交即返回;
+        查单异常向上抛出, 沿既有"订单终态不明 → 交易熔断"路径处置。
+        """
+        code_label = signal.display_code
+        event_label = signal.console_event("开盘耐心")
+        wait_budget = min(
+            self.config.opening_price_gap_wait_max_sec, budget_room,
+        )
+        poll_sec = self.config.opening_price_gap_wait_poll_sec or 1.0
+        waited = 0.0
+        ghost_checked = False
+        logger.info(
+            "%s | %s | 首挂未成交, 进入价格感知等待 | 挂单价=%.3f 阈值=%.1f%% 上限=%.1fs 重判=%.2fs",
+            event_label, code_label, order_price,
+            self.config.opening_price_gap_wait_pct * 100, wait_budget, poll_sec,
+        )
+        while waited < wait_budget:
+            round_start = time.monotonic()
+            try:
+                quote = self._latest_quote_with_retry(signal)
+            except Exception as exc:
+                quote = None
+                logger.warning(
+                    "%s | %s | 行情取不到, 本轮继续等 | 已等 %.1fs | %s",
+                    event_label, code_label, waited, exc,
+                )
+            stale_auction = (
+                quote is not None
+                and quote.quote_time is not None
+                and self._auction_quote_within_opening_grace(
+                    quote, _current_datetime(),
+                )
+            )
+            gap: float | None = None
+            if quote is not None:
+                gap = (quote.last_price - order_price) / order_price
+                if not stale_auction:
+                    if gap > self.config.opening_price_gap_wait_pct:
+                        logger.info(
+                            "%s | %s | 价格已甩开挂单价 %.2f%% > %.2f%%, 停止等待, 撤单追价",
+                            event_label, code_label, gap * 100,
+                            self.config.opening_price_gap_wait_pct * 100,
+                        )
+                        break
+                    logger.debug(
+                        "%s | %s | 价格仍贴近挂单价(偏离 %.2f%% ≤ %.2f%%) | 剩余 %.1fs",
+                        event_label, code_label, gap * 100,
+                        self.config.opening_price_gap_wait_pct * 100,
+                        wait_budget - waited,
+                    )
+                else:
+                    logger.debug(
+                        "%s | %s | 行情仍停在竞价旧快照, 本轮不下价格结论 | 剩余 %.1fs",
+                        event_label, code_label, wait_budget - waited,
+                    )
+            # 死单/旧价即时诊断(每窗口至多一次): 价格站在成交侧却零成交,
+            # 或判断数据仍是竞价旧快照时, 用三重校验确认订单是否真的在册。
+            # 健康单被直查识别后继续等(毫秒级成本), 死单立即交给主循环重挂。
+            if (
+                not ghost_checked
+                and snapshot.filled_qty <= 0
+                and gap is not None
+                and (stale_auction or gap < 0)
+            ):
+                ghost_checked = True
+                verdict, detail, _visible = self._diagnose_ghost_order(
+                    signal, order_id, attempt_qty,
+                )
+                if verdict in {"ghost", "doubt"}:
+                    # 统一由主循环的幽灵单处置(重挂或熔断)收口, 这里只上报。
+                    raise _GhostOrderSuspected(order_id, snapshot)
+                logger.debug(
+                    "%s | %s | 零成交原因排查: %s | 继续等完窗口",
+                    event_label, code_label, detail,
+                )
+            step = min(poll_sec, wait_budget - waited)
+            snapshot = self._wait_for_terminal_or_timeout(order_id, timeout=step)
+            waited += time.monotonic() - round_start
+            if snapshot.status in _TERMINAL_ORDER_STATUSES:
+                return snapshot
+            if snapshot.filled_qty > 0:
+                logger.info(
+                    "%s | %s | 等待期间已成交 %s股, 价格确在挂单价附近, 继续等完窗口",
+                    event_label, code_label, snapshot.filled_qty,
+                )
+        return snapshot
+
     def _cancel_and_wait_for_terminal(self, order_id: str, deadline: float) -> OrderSnapshot:
         """提交撤单请求并等待 MiniQMT 返回真实终态。"""
         self.broker.cancel_order(order_id)
@@ -1156,6 +1785,70 @@ class OrderExecutionEngine:
             order_id, _broker_label(last_snapshot.status), last_snapshot.filled_qty,
         )
         return last_snapshot
+
+    def _diagnose_ghost_order(
+        self,
+        signal: TradeSignal,
+        order_id: str,
+        attempt_qty: int,
+    ) -> tuple[str, str, OrderSnapshot | None]:
+        """疑似幽灵单的三重校验: 直查委托 → 冻结资金 → 成交痕迹。
+
+        verdict:
+        - "visible": 绕过缓存直查 QMT 委托清单, 订单其实在册 —— 只是回报/
+          扫描滞后, 恢复轮询原单, 不重挂也不熔断;
+        - "doubt":   存在订单在途或已成交的证据(冻结资金未清零/持仓痕迹),
+          不能排除重挂双成交风险 —— 交给上层熔断 + 人工对账;
+        - "ghost":   直查无单、无冻结资金、无成交痕迹 —— 确认报单未达柜台,
+          可安全重挂剩余数量(无单可撤)。
+
+        残留风险(诚实声明): 冻结资金回传本身可能延迟, 理论存在"真单在途但
+        三查全空"的极小窗口; 因此重挂有连续上限, 超限即熔断。
+        """
+        code_label = signal.display_code
+        try:
+            visible_orders = self.broker.query_orders_by_signal_id(signal.signal_id)
+        except Exception as exc:
+            return "doubt", f"直查委托失败({exc})", None
+        for order in visible_orders:
+            if order.order_id == order_id:
+                return "visible", "直查委托可见, 回报滞后", order
+        try:
+            account = self.broker.query_account_snapshot()
+        except Exception as exc:
+            return "doubt", f"账户快照失败({exc})", None
+        if account.frozen_cash > 0:
+            return "doubt", f"冻结资金 {account.frozen_cash:.2f} 未清零", None
+        position = account.position_of(signal.code)
+        if signal.action == Action.BUY:
+            # 买单成交必然留下持仓: 有持仓 = 疑似已成交但回报丢失。
+            # 账户本就持有该代码的边缘场景会误判为 doubt(fail-closed, 可接受;
+            # 正常流程里已有持仓不补仓, 不会走到这里)。
+            if position is not None and position.total_qty > 0:
+                return (
+                    "doubt",
+                    f"持仓 {position.total_qty}股(疑似已成交回报丢失)",
+                    None,
+                )
+        else:
+            # 卖单成交必然消耗可用持仓: 可用持仓少于本次委托量 = 有成交痕迹。
+            # 未减少 = 无成交发生, 重挂安全; 且重挂数量仍受可用持仓封顶,
+            # 双卖不可能超出账户持仓。
+            try:
+                available = self.broker.query_available_position(signal.code)
+            except Exception as exc:
+                return "doubt", f"持仓查询失败({exc})", None
+            if available < attempt_qty:
+                return (
+                    "doubt",
+                    f"可用持仓 {available}股 < 委托 {attempt_qty}股(疑似已成交)",
+                    None,
+                )
+        logger.warning(
+            "%s | %s | 幽灵单三重校验通过 | 直查无单、无冻结资金、无成交痕迹",
+            signal.console_event("重试"), code_label,
+        )
+        return "ghost", "直查无单、无冻结、无成交痕迹", None
 
     def _locked_book_label(self, signal: TradeSignal, quote: Quote) -> str | None:
         """无对手盘(涨跌停封死)时返回日志标签, 正常返回 None。
@@ -1196,7 +1889,7 @@ class OrderExecutionEngine:
         与买入侧 _is_confirmed_limit_up 对称。此前这里只判断 "bid1 is None",
         于是任何买一档缺失的行情 —— 停牌、盘口不连续发布的 9:25~9:30 时段、
         行情源丢档 —— 都会被当成跌停封死, 把一笔普通清仓单挂成跌停价、
-        并锁死一个排队 worker 到 14:56:30 且全天不重新定价。
+        并锁死一个排队 worker 到配置的排队撤单时刻，且全天不重新定价。
         """
         if (
             signal.action != Action.SELL
@@ -1219,8 +1912,17 @@ class OrderExecutionEngine:
         total_filled: int,
         attempts: int,
         target_qty: int | None,
+        *,
+        force_sync: bool = False,
     ) -> ExecutionResult | _QueueBuyRetry:
-        """涨停买单只挂一笔涨停价委托，成交或截止前不撤不重挂。"""
+        """涨停买单入场: 挂一笔涨停价委托并保留队列位置。
+
+        - 全额接纳且配置了队列池时, 挂单落库后把慢轮询移交给 qmt-queue,
+          返回 QUEUED_LIMIT_UP 占位结果 —— 买入 worker 立即空出;
+        - 资金截断(非全额)保持同步路径, 由本函数内联慢轮询;
+        - 提交期非硬拒单仍返回 _QueueBuyRetry, 由主循环刷新行情重试入场,
+          保持既有语义。
+        """
         code_label = signal.display_code
 
         def _fallback_skip(message: str) -> ExecutionResult:
@@ -1239,11 +1941,14 @@ class OrderExecutionEngine:
             )
             return _fallback_skip("limit-up queue fallback: high_limit unavailable")
 
-        wait_sec = _seconds_until_queue_buy_deadline(self.config.queue_buy_deadline)
+        queue_cancel_at = (
+            self.machine_schedule.order_guard.limit_up_queue_cancel_at
+        )
+        wait_sec = _seconds_until_queue_buy_cancel(queue_cancel_at)
         if wait_sec <= 0:
             logger.warning(
                 "%s | %s | 涨停排队降级跳过 | 已过排队截止 %s",
-                signal.console_event("跳过"), code_label, self.config.queue_buy_deadline,
+                signal.console_event("跳过"), code_label, queue_cancel_at,
             )
             return _fallback_skip("limit-up queue fallback: past queue deadline")
 
@@ -1261,6 +1966,8 @@ class OrderExecutionEngine:
             )
             return _fallback_skip("limit-up queue fallback: queue capacity reached")
 
+        # 名额要么随本函数早退归还, 要么移交 _park_queued_buy 在终态后归还。
+        slot_transferred = False
         try:
             attempt_no = attempts + 1
             effective_target = (
@@ -1345,124 +2052,338 @@ class OrderExecutionEngine:
             logger.info(
                 "%s | %s | 涨停排队已挂 | %.3f×%s | 截止 %s | 保留队列位置",
                 signal.console_event("竞价"), code_label, high_limit, attempt_qty,
-                self.config.queue_buy_deadline,
+                queue_cancel_at,
             )
 
-            mono_deadline = time.monotonic() + wait_sec
-            snapshot: OrderSnapshot | None = None
-            try:
-                snapshot = self.broker.get_order_snapshot(order_id)
-                while (
-                    snapshot.status not in _TERMINAL_ORDER_STATUSES
-                    and time.monotonic() < mono_deadline
-                ):
-                    interval = _QUEUE_BUY_POLL_INTERVAL_SEC
-                    if interval > 0:
-                        time.sleep(min(interval, max(0.0, mono_deadline - time.monotonic())))
-                    snapshot = self.broker.get_order_snapshot(order_id)
-            except Exception as exc:
-                known_filled = (
-                    max(0, min(snapshot.filled_qty, attempt_qty))
-                    if snapshot is not None
-                    else 0
+            if (
+                self._queue_executor is not None
+                and not force_sync
+                and attempt_qty >= remaining_qty
+            ):
+                # 全额接纳: 挂单落库后移交专用线程慢轮询, 买入 worker 立即空出。
+                slot_transferred = True
+                future = self._queue_executor.submit(
+                    self._park_queued_buy,
+                    signal, order_id, attempt_qty,
+                    effective_target, total_filled, attempts, queue_cancel_at,
                 )
-                reconciled_total = total_filled + known_filled
-                if snapshot is not None:
-                    self.store.update_attempt(
-                        order_id, snapshot.status.value, snapshot.filled_qty,
-                    )
-                halt_reason = self._set_trading_halt(
-                    f"order {order_id} state is uncertain: {exc}; "
-                    "restart only after manual MiniQMT reconciliation"
+                with self._queued_futures_lock:
+                    self._queued_futures[signal.signal_id] = future
+                future.add_done_callback(
+                    lambda f: self._forget_queued_future(signal.signal_id, f)
                 )
-                logger.critical(
-                    "%s | %s | 涨停排队查单失败，订单终态不明，停止后续交易 | "
-                    "QMT单号=%s | %s",
-                    signal.console_event("停止"), code_label, order_id, exc,
+                logger.info(
+                    "%s | %s | 涨停排队已转交专用线程 | 截止 %s",
+                    signal.console_event("竞价"), code_label, queue_cancel_at,
                 )
-                return self._defer_for_recovery(
-                    signal, reconciled_total, attempts, halt_reason,
+                return ExecutionResult(
+                    signal_id=signal.signal_id,
+                    status=ExecutionStatus.QUEUED_LIMIT_UP,
+                    requested_qty=signal.amount,
+                    filled_qty=total_filled,
+                    attempts=attempts,
+                    message="limit-up queue handed to dedicated worker",
                 )
+            # 资金截断或未配置专用池: 同步慢轮询, 名额由 _park_queued_buy 归还。
+            slot_transferred = True
+            return self._park_queued_buy(
+                signal, order_id, attempt_qty,
+                effective_target, total_filled, attempts, queue_cancel_at,
+            )
+        finally:
+            if not slot_transferred:
+                with self._queue_buy_lock:
+                    self._active_queue_buys -= 1
 
-            assert snapshot is not None
+    def _park_queued_buy(
+        self,
+        signal: TradeSignal,
+        order_id: str,
+        attempt_qty: int,
+        effective_target: int,
+        total_filled: int,
+        attempts: int,
+        queue_cancel_at: dt.time,
+    ) -> ExecutionResult:
+        """涨停排队买单的专用线程执行体: 慢轮询到终态或截止, 续跑在队列线程内闭环。
 
-            if snapshot.status not in _TERMINAL_ORDER_STATUSES:
+        与 _run_queued_sell 同构, 但买入侧有续跑语义: 非硬拒单与部分成交剩余
+        需要重新入场排队(仍封板)或转常规定价主循环(开板)。所有续跑都在本线程
+        内迭代完成 —— 不递归、不跨池, _queued_futures 的 future 只在真正终态
+        完成, 上层补 ACK 语义不变。
+        """
+        code_label = signal.display_code
+        try:
+            current_order_id = order_id
+            current_qty = attempt_qty
+            target_qty = effective_target
+            filled_total = total_filled
+            tries = attempts
+            while True:
+                # ---- 慢轮询当前挂单到终态 / 截止 / 停机 ----
+                deadline = time.monotonic() + max(
+                    0.0, _seconds_until_queue_buy_cancel(queue_cancel_at),
+                )
+                snapshot: OrderSnapshot | None = None
                 try:
-                    snapshot = self._cancel_and_wait_for_terminal(
-                        order_id, time.monotonic() + self.config.cancel_confirm_timeout_sec,
-                    )
+                    snapshot = self.broker.get_order_snapshot(current_order_id)
+                    while (
+                        snapshot.status not in _TERMINAL_ORDER_STATUSES
+                        and time.monotonic() < deadline
+                        and not self._stop_requested()
+                    ):
+                        interval = _QUEUE_BUY_POLL_INTERVAL_SEC
+                        if interval > 0:
+                            time.sleep(
+                                min(interval, max(0.0, deadline - time.monotonic()))
+                            )
+                        snapshot = self.broker.get_order_snapshot(current_order_id)
                 except Exception as exc:
-                    known_filled = max(0, min(snapshot.filled_qty, attempt_qty))
-                    reconciled_total = total_filled + known_filled
-                    self.store.update_attempt(order_id, snapshot.status.value, snapshot.filled_qty)
+                    known_filled = (
+                        max(0, min(snapshot.filled_qty, current_qty))
+                        if snapshot is not None
+                        else 0
+                    )
+                    reconciled_total = filled_total + known_filled
+                    if snapshot is not None:
+                        self.store.update_attempt(
+                            current_order_id, snapshot.status.value,
+                            snapshot.filled_qty,
+                        )
                     halt_reason = self._set_trading_halt(
-                        f"order {order_id} cancel state is uncertain: {exc}; "
+                        f"order {current_order_id} state is uncertain: {exc}; "
                         "restart only after manual MiniQMT reconciliation"
                     )
                     logger.critical(
-                        "%s | %s | 涨停排队撤单终态未确认，停止后续交易 | QMT单号=%s | %s",
-                        signal.console_event("停止"), code_label, order_id, exc,
+                        "%s | %s | 涨停排队查单失败，订单终态不明，停止后续交易 | "
+                        "QMT单号=%s | %s",
+                        signal.console_event("停止"), code_label,
+                        current_order_id, exc,
                     )
                     return self._defer_for_recovery(
-                        signal, reconciled_total, attempts, halt_reason,
+                        signal, reconciled_total, tries, halt_reason,
                     )
 
-            self.store.update_attempt(order_id, snapshot.status.value, snapshot.filled_qty)
-            filled_this_attempt = max(0, min(snapshot.filled_qty, attempt_qty))
-            reconciled_total = total_filled + filled_this_attempt
+                assert snapshot is not None
 
-            if snapshot.status == BrokerOrderStatus.FILLED or filled_this_attempt >= attempt_qty:
-                if reconciled_total >= effective_target:
-                    logger.info(
-                        "%s | %s | 涨停排队成交 | %.3f×%s | 全成 %s/%s",
-                        signal.console_event("成交"), code_label, high_limit,
-                        attempt_qty, reconciled_total, effective_target,
-                    )
-                    return self._finish(
-                        signal, ExecutionStatus.FILLED, reconciled_total, attempts,
-                        "filled from limit-up queue",
-                    )
-                return _QueueBuyRetry(effective_target, reconciled_total, attempts)
+                if snapshot.status not in _TERMINAL_ORDER_STATUSES:
+                    try:
+                        snapshot = self._cancel_and_wait_for_terminal(
+                            current_order_id,
+                            time.monotonic() + self.config.cancel_confirm_timeout_sec,
+                        )
+                    except Exception as exc:
+                        known_filled = max(0, min(snapshot.filled_qty, current_qty))
+                        reconciled_total = filled_total + known_filled
+                        self.store.update_attempt(
+                            current_order_id, snapshot.status.value,
+                            snapshot.filled_qty,
+                        )
+                        halt_reason = self._set_trading_halt(
+                            f"order {current_order_id} cancel state is uncertain: "
+                            f"{exc}; restart only after manual MiniQMT reconciliation"
+                        )
+                        logger.critical(
+                            "%s | %s | 涨停排队撤单终态未确认，停止后续交易 | "
+                            "QMT单号=%s | %s",
+                            signal.console_event("停止"), code_label,
+                            current_order_id, exc,
+                        )
+                        return self._defer_for_recovery(
+                            signal, reconciled_total, tries, halt_reason,
+                        )
 
-            if snapshot.status == BrokerOrderStatus.REJECTED:
-                rejection_kind = snapshot.rejection_kind or BrokerRejectionKind.UNKNOWN
-                rejection_reason = snapshot.rejection_reason or "券商未返回拒单原因"
-                if rejection_kind == BrokerRejectionKind.HARD_STOP:
-                    logger.error(
-                        "%s | %s | 涨停排队硬拒单终止 | 分类=%s | 原因=%s | 累计 %s/%s",
-                        signal.console_event("失败"), code_label,
+                self.store.update_attempt(
+                    current_order_id, snapshot.status.value, snapshot.filled_qty,
+                )
+                filled_this_attempt = max(0, min(snapshot.filled_qty, current_qty))
+                filled_total += filled_this_attempt
+
+                # ---- 终态分派 ----
+                if (
+                    snapshot.status == BrokerOrderStatus.FILLED
+                    or filled_this_attempt >= current_qty
+                ):
+                    if filled_total >= target_qty:
+                        logger.info(
+                            "%s | %s | 涨停排队成交 | %s×%s | 全成 %s/%s",
+                            signal.console_event("成交"), code_label,
+                            snapshot.price, current_qty, filled_total, target_qty,
+                        )
+                        return self._finish(
+                            signal, ExecutionStatus.FILLED, filled_total, tries,
+                            "filled from limit-up queue",
+                        )
+                    # 部分成交剩余: 落入续跑
+                elif snapshot.status == BrokerOrderStatus.REJECTED:
+                    rejection_kind = (
+                        snapshot.rejection_kind or BrokerRejectionKind.UNKNOWN
+                    )
+                    rejection_reason = (
+                        snapshot.rejection_reason or "券商未返回拒单原因"
+                    )
+                    if rejection_kind == BrokerRejectionKind.HARD_STOP:
+                        logger.error(
+                            "%s | %s | 涨停排队硬拒单终止 | 分类=%s | 原因=%s | "
+                            "累计 %s/%s",
+                            signal.console_event("失败"), code_label,
+                            rejection_kind.value, rejection_reason,
+                            filled_total, target_qty,
+                        )
+                        status = (
+                            ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
+                            if filled_total
+                            else ExecutionStatus.FAILED_BROKER
+                        )
+                        return self._finish(
+                            signal, status, filled_total, tries, rejection_reason,
+                        )
+                    logger.warning(
+                        "%s | %s | 涨停排队被拒 | 分类=%s | 原因=%s | 刷新重试",
+                        signal.console_event("重试"), code_label,
                         rejection_kind.value, rejection_reason,
-                        reconciled_total, effective_target,
+                    )
+                    # 落入续跑
+                else:
+                    # CANCELED: 截止/停机收尾撤单, 或人工在 QMT 客户端撤单
+                    logger.warning(
+                        "%s | %s | 涨停排队到期 | 成交 %s/%s | 截止 %s",
+                        signal.console_event("超时"), code_label,
+                        filled_total, target_qty, queue_cancel_at,
                     )
                     status = (
                         ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                        if reconciled_total
+                        if filled_total
+                        else ExecutionStatus.LIMIT_UP_QUEUE_EXPIRED
+                    )
+                    return self._finish(
+                        signal, status, filled_total, tries,
+                        "limit-up queue expired without full fill",
+                    )
+
+                # ---- 续跑: 刷新行情决定重新排队还是转常规定价 ----
+                remaining_qty = target_qty - filled_total
+                if remaining_qty <= 0:
+                    return self._finish(
+                        signal, ExecutionStatus.FILLED, filled_total, tries,
+                        "filled from limit-up queue",
+                    )
+                quote = self._latest_quote_with_retry(signal)
+                if not self._is_confirmed_limit_up(signal, quote):
+                    logger.info(
+                        "%s | %s | 涨停已打开 | 余量 %s 转常规定价",
+                        signal.console_event("重试"), code_label, remaining_qty,
+                    )
+                    return self._execute_main_loop(
+                        signal,
+                        exec_started=time.monotonic(),
+                        remaining_qty=remaining_qty,
+                        total_filled=filled_total,
+                        attempts=tries,
+                        target_qty=target_qty,
+                        initial_quote=quote,
+                    )
+                if _seconds_until_queue_buy_cancel(queue_cancel_at) <= 0:
+                    status = (
+                        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
+                        if filled_total
+                        else ExecutionStatus.SKIPPED_LIMIT_UP
+                    )
+                    return self._finish(
+                        signal, status, filled_total, tries,
+                        "limit-up queue fallback: past queue deadline",
+                    )
+                # 仍封板: 本线程直接重新入场, 名额已由本任务持有, 不再占买卖 worker。
+                attempt_no = tries + 1
+                try:
+                    current_order_id, current_qty = self._submit_buy_with_cash_lock(
+                        signal, remaining_qty, quote.high_limit,
+                    )
+                except BrokerOrderRejected as exc:
+                    if exc.kind == BrokerRejectionKind.HARD_STOP:
+                        logger.error(
+                            "%s | %s | 第%02d次 | 涨停排队硬拒单终止 | "
+                            "分类=%s | 原因=%s",
+                            signal.console_event("失败"), code_label, attempt_no,
+                            exc.kind.value, exc.reason,
+                        )
+                        status = (
+                            ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
+                            if filled_total
+                            else ExecutionStatus.FAILED_BROKER
+                        )
+                        return self._finish(
+                            signal, status, filled_total, attempt_no, exc.reason,
+                        )
+                    logger.warning(
+                        "%s | %s | 第%02d次 | 涨停排队重挂未受理 | "
+                        "分类=%s | 原因=%s | 刷新重试",
+                        signal.console_event("重试"), code_label, attempt_no,
+                        exc.kind.value, exc.reason,
+                    )
+                    tries = attempt_no
+                    retry_delay = min(self.config.poll_interval_sec, 0.05)
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
+                    continue
+                except BrokerSubmissionUncertain as exc:
+                    halt_reason = self._set_trading_halt(
+                        f"limit-up queue submission state is uncertain: {exc}; "
+                        "restart only after manual MiniQMT reconciliation"
+                    )
+                    logger.critical(
+                        "%s | %s | 涨停排队重挂受理状态不明，停止后续交易 | %s",
+                        signal.console_event("停止"), code_label, exc,
+                    )
+                    return self._defer_for_recovery(
+                        signal, filled_total, attempt_no, halt_reason,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "%s | %s | 涨停排队重挂失败 | %s",
+                        signal.console_event("失败"), code_label, exc,
+                    )
+                    status = (
+                        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
+                        if filled_total
                         else ExecutionStatus.FAILED_BROKER
                     )
                     return self._finish(
-                        signal, status, reconciled_total, attempts, rejection_reason,
+                        signal, status, filled_total, tries, str(exc),
                     )
-                logger.warning(
-                    "%s | %s | 涨停排队被拒 | 分类=%s | 原因=%s | 刷新重试",
-                    signal.console_event("重试"), code_label,
-                    rejection_kind.value, rejection_reason,
+                if current_qty <= 0:
+                    logger.warning(
+                        "%s | %s | 可用资金不足",
+                        signal.console_event("风控"), code_label,
+                    )
+                    status = (
+                        ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
+                        if filled_total
+                        else ExecutionStatus.FAILED_RISK
+                    )
+                    return self._finish(
+                        signal, status, filled_total, tries,
+                        "insufficient funds for limit-up queue relist",
+                    )
+                tries = attempt_no
+                self.store.record_attempt(
+                    signal.signal_id,
+                    tries,
+                    current_order_id,
+                    current_qty,
+                    quote.high_limit,
+                    ExecutionStatus.QUEUED_LIMIT_UP.value,
                 )
-                return _QueueBuyRetry(effective_target, reconciled_total, attempts)
-
-            logger.warning(
-                "%s | %s | 涨停排队到期 | 成交 %s/%s | 截止 %s",
-                signal.console_event("超时"), code_label,
-                reconciled_total, effective_target, self.config.queue_buy_deadline,
-            )
-            status = (
-                ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
-                if reconciled_total
-                else ExecutionStatus.LIMIT_UP_QUEUE_EXPIRED
-            )
-            return self._finish(
-                signal, status, reconciled_total, attempts,
-                "limit-up queue expired without full fill",
-            )
+                self.store.update_signal_status(
+                    signal.signal_id, ExecutionStatus.QUEUED_LIMIT_UP,
+                    filled_qty=filled_total,
+                )
+                logger.info(
+                    "%s | %s | 涨停排队重新挂 | %s×%s | 保留队列位置",
+                    signal.console_event("竞价"), code_label, quote.high_limit,
+                    current_qty,
+                )
+                continue
         finally:
             with self._queue_buy_lock:
                 self._active_queue_buys -= 1
@@ -1483,6 +2404,9 @@ class OrderExecutionEngine:
         - 豁免 order_timeout_sec / max_attempts / max_total_duration_sec 与偏离度守卫
           (止损单被"偏离参考价太远"拦下是本末倒置; 竞价保护已有同类豁免先例);
         - 慢轮询 queue_sell_poll_interval_sec, 降低全天占用的开销。
+
+        配置专用线程池时, 挂单落库后把慢轮询移交过去并立即返回占位结果 ——
+        排队单不再全天占用卖出 worker。未配置时走原同步路径, 行为与旧版一致。
 
         回退为 skip 的情形: 取不到跌停价 / 已过排队截止 / 排队并发已满。
         """
@@ -1505,11 +2429,14 @@ class OrderExecutionEngine:
             )
             return _fallback_skip("limit-down queue fallback: low_limit unavailable")
 
-        wait_sec = _seconds_until_queue_sell_deadline(self.config.queue_sell_deadline)
+        queue_cancel_at = (
+            self.machine_schedule.order_guard.limit_down_queue_cancel_at
+        )
+        wait_sec = _seconds_until_queue_sell_cancel(queue_cancel_at)
         if wait_sec <= 0:
             logger.warning(
                 "%s | %s | 跌停排队降级跳过 | 已过排队截止 %s",
-                signal.console_event("跳过"), code_label, self.config.queue_sell_deadline,
+                signal.console_event("跳过"), code_label, queue_cancel_at,
             )
             return _fallback_skip("limit-down queue fallback: past queue deadline")
 
@@ -1527,6 +2454,53 @@ class OrderExecutionEngine:
             )
             return _fallback_skip("limit-down queue fallback: queue capacity reached")
 
+        if self._queue_executor is None:
+            # 未配置专用池: 完全保持旧行为(同步挂单+慢轮询)。
+            return self._run_queued_sell(
+                signal, remaining_qty, total_filled, attempts,
+                low_limit, queue_cancel_at, wait_sec,
+            )
+
+        future = self._queue_executor.submit(
+            self._run_queued_sell,
+            signal, remaining_qty, total_filled, attempts,
+            low_limit, queue_cancel_at, wait_sec,
+        )
+        with self._queued_futures_lock:
+            self._queued_futures[signal.signal_id] = future
+        future.add_done_callback(
+            lambda f: self._forget_queued_future(signal.signal_id, f)
+        )
+        logger.info(
+            "%s | %s | 跌停排队已转交专用线程 | 截止 %s",
+            signal.console_event("竞价"), code_label, queue_cancel_at,
+        )
+        # 占位结果: 主 worker 立即返回, 队列慢轮询在专用线程继续。
+        return ExecutionResult(
+            signal_id=signal.signal_id,
+            status=ExecutionStatus.QUEUED_LIMIT_DOWN,
+            requested_qty=signal.amount,
+            filled_qty=total_filled,
+            attempts=attempts,
+            message="limit-down queue handed to dedicated worker",
+        )
+
+    def _run_queued_sell(
+        self,
+        signal: TradeSignal,
+        remaining_qty: int,
+        total_filled: int,
+        attempts: int,
+        low_limit: float,
+        queue_cancel_at: dt.time,
+        wait_sec: float,
+    ) -> ExecutionResult:
+        """跌停排队卖出的完整执行体: 挂单 → 落库 → 慢轮询 → 截止撤单收尾。
+
+        在主线程(未配置专用池)或 qmt-queue 专用线程里执行。无论走哪条路径
+        都会在 finally 释放并发名额与开盘屏障(排队单挂上即不再阻塞买入)。
+        """
+        code_label = signal.display_code
         try:
             attempt_qty = self._cap_attempt_to_available_resources(
                 signal, remaining_qty, low_limit,
@@ -1597,11 +2571,13 @@ class OrderExecutionEngine:
             self.store.update_signal_status(
                 signal.signal_id, ExecutionStatus.QUEUED_LIMIT_DOWN, filled_qty=total_filled,
             )
+            # 挂单落库即释放开盘屏障(文档化不变量: 排队单不阻塞买入);
+            # 移交专用线程后, 这里保持"挂上即释放"的原时序。
             self._on_limit_down_queued(signal.signal_id)
             logger.info(
                 "%s | %s | 跌停排队已挂 | %.3f×%s | 截止 %s | 排队等待开板",
                 signal.console_event("竞价"), code_label, low_limit, attempt_qty,
-                self.config.queue_sell_deadline,
+                queue_cancel_at,
             )
 
             # ---- 慢轮询直到终态或截止 ----
@@ -1612,6 +2588,7 @@ class OrderExecutionEngine:
                 while (
                     snapshot.status not in _TERMINAL_ORDER_STATUSES
                     and time.monotonic() < mono_deadline
+                    and not self._stop_requested()
                 ):
                     interval = self.config.queue_sell_poll_interval_sec
                     if interval > 0:
@@ -1697,7 +2674,7 @@ class OrderExecutionEngine:
             logger.warning(
                 "%s | %s | 跌停排队到期 | 成交 %s/%s | 截止 %s",
                 signal.console_event("超时"), code_label, total_filled, attempt_qty,
-                self.config.queue_sell_deadline,
+                queue_cancel_at,
             )
             status = (
                 ExecutionStatus.PARTIALLY_FILLED_TIMEOUT
@@ -1711,6 +2688,10 @@ class OrderExecutionEngine:
         finally:
             with self._queue_sell_lock:
                 self._active_queue_sells -= 1
+            # 未挂单就终止的降级路径(无持仓/拒单等)也必须释放开盘屏障,
+            # 否则移交专用线程后买单会被一只已跳过的排队单永远挡住。
+            # 成功挂单路径在上面已释放过一次, 此处重复调用是无害空操作。
+            self._on_limit_down_queued(signal.signal_id)
 
     def _submit_buy_with_cash_lock(
         self,
@@ -1733,7 +2714,12 @@ class OrderExecutionEngine:
         with self._broker_submission_lock:
             return self._trading_halt_reason
 
+    def _stop_requested(self) -> bool:
+        """优雅退出时返回 True: 排队慢轮询据此提前收口, 而非等到排队截止。"""
+        return self._stop_event is not None and self._stop_event.is_set()
+
     def _set_trading_halt(self, reason: str) -> str:
+        """熔断原因首次落定后不再被后续原因覆盖, 保证停机根因可追溯。"""
         with self._broker_submission_lock:
             if self._trading_halt_reason is None:
                 self._trading_halt_reason = reason

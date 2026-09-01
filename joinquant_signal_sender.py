@@ -21,6 +21,10 @@
 
     publish_watchlist_to_redis(context, selected_codes)
 
+QMT 本地策略引擎模式只推送当日有序候选结果：
+
+    publish_candidate_plan_to_redis(context, selected_codes, "local-engine-v1")
+
 需要清仓时，对清单逐只发 sell_all 意图信号：
 
     def auction_stop_loss(context):
@@ -54,14 +58,20 @@
   直接终态并 ACK，不下单。发送端只附带发送时刻，不写死过期时间。
 - execute_at 已废弃：执行端收到未过期信号后立即执行，不再等待预约时间。
 - reference_price 只作审计/日志参考，执行端始终按实时行情重新定价。
+- QMT 本地策略引擎的专用账户只接受 candidate_plan；同策略旧的普通交易和
+  plan 消息会被交易端 ACK 拒绝。不要在同一策略里同时发送两套协议。
 """
 
 import datetime as dt
 import json
 import re
+import time
 import uuid
 
 
+# ---------------------------------------------------------------------------
+# 配置常量
+# ---------------------------------------------------------------------------
 SIGNAL_REDIS_CONFIG = {
     "host": "YOUR_REDIS_HOST",   # 部署前替换；生产地址不要提交到仓库
     "port": 6379,
@@ -69,11 +79,18 @@ SIGNAL_REDIS_CONFIG = {
     "stream": "jq_qmt_signals",  # 必须与 Windows 端 config.yaml 一致
     "maxlen": 10000,
     "socket_connect_timeout": 1,
+    "socket_timeout": 2,         # 读写超时: 半死连接最多挂 2 秒, 不会卡死整个策略
 }
 SIGNAL_STRATEGY_ID = "YOUR_STRATEGY_ID"  # 与 Windows 端白名单 allowed_strategy_ids 对应
 SIGNAL_MAX_LIVE_LAG_SECONDS = 600    # context 时间与系统时间差超过它视为回测
+# 发送失败重试: signal_id 不变, 重复消息由执行端幂等去重, 重试不会重复下单。
+SIGNAL_XADD_MAX_RETRIES = 3
+SIGNAL_XADD_RETRY_DELAY_SEC = 0.5
 
 
+# ---------------------------------------------------------------------------
+# 内部工具函数
+# ---------------------------------------------------------------------------
 def _log(message):
     """聚宽平台提供全局 log 对象；本机直接运行/测试时回退到 print。"""
     try:
@@ -112,34 +129,41 @@ def _cached_redis_client():
             password=SIGNAL_REDIS_CONFIG["password"],
             decode_responses=True,
             socket_connect_timeout=SIGNAL_REDIS_CONFIG["socket_connect_timeout"],
+            socket_timeout=SIGNAL_REDIS_CONFIG["socket_timeout"],
         )
         holder._redis_config_key = config_key
     return holder._redis_client
 
 
 def _xadd(payload):
-    """写入 Stream 并返回 Redis 消息 id。"""
+    """写入 Stream; 失败自动重试, 全部失败才抛给上层记日志。"""
     client = _cached_redis_client()
-    return client.xadd(
-        SIGNAL_REDIS_CONFIG["stream"],
-        {"payload": json.dumps(payload, ensure_ascii=False)},
-        maxlen=SIGNAL_REDIS_CONFIG["maxlen"],
-        approximate=True,
-    )
+    last_error = None
+    for attempt in range(1, SIGNAL_XADD_MAX_RETRIES + 1):
+        try:
+            return client.xadd(
+                SIGNAL_REDIS_CONFIG["stream"],
+                {"payload": json.dumps(payload, ensure_ascii=False)},
+                maxlen=SIGNAL_REDIS_CONFIG["maxlen"],
+                approximate=True,
+            )
+        except Exception as exc:
+            last_error = exc
+            _log("[信号] Redis写入失败 第{}次重试: {}".format(attempt, exc))
+            if attempt < SIGNAL_XADD_MAX_RETRIES:
+                time.sleep(SIGNAL_XADD_RETRY_DELAY_SEC)
+    raise last_error
 
 
+# ---------------------------------------------------------------------------
+# 公开发送函数
+# ---------------------------------------------------------------------------
 def publish_trade_signal_to_redis(context, action, code, amount, price):
     """精确买卖信号：五参数签名固定，旧策略调用点无需改动。
 
-    参数:
-      context: 聚宽策略的 context（用 context.current_dt 判断回测/实盘）
-      action:  "buy" 或 "sell"
-      code:    聚宽代码，如 "510300.XSHG" / "000001.XSHE"
-      amount:  目标股数（正数）；执行端仍会按最新资金/持仓缩量
-      price:   策略参考价，仅审计用；执行端按实时行情重新定价
-
-    返回: {"sent": bool, "mode": "live"/"backtest", "signal": dict,
-          "redis_message_id": str/None}
+    action 为 "buy"/"sell"，amount 为目标股数（正数，执行端仍会按最新资金/持仓
+    缩量），price 仅作审计参考、执行端按实时行情重新定价；非实时信号只返回
+    sent=False 不写 Redis。返回 dict 含 sent/mode/signal/redis_message_id。
     """
     try:
         action = str(action).lower()
@@ -241,6 +265,63 @@ def publish_watchlist_to_redis(context, codes):
         }
 
 
+def publish_candidate_plan_to_redis(context, candidates, strategy_version=""):
+    """推送 QMT 本地策略引擎所需的唯一日输入：有序候选股票列表。
+
+    空列表也会发送，明确表示当天不买。资金、止损、卖出时点与订单数量均由
+    Windows 交易机的私有 config.strategy.yaml 决定，不进入 Redis 消息。
+    """
+    try:
+        candidates = [str(code) for code in (candidates or []) if code]
+        if len(set(candidates)) != len(candidates):
+            raise ValueError("candidates 包含重复代码")
+        code_pattern = re.compile(r"^\d{6}\.(XSHG|XSHE)$")
+        for code in candidates:
+            if not code_pattern.match(code):
+                raise ValueError("非法聚宽证券代码: {}".format(code))
+
+        mode, context_time = _signal_mode(context)
+        if mode != "live":
+            return {"sent": False, "mode": mode, "redis_message_id": None}
+
+        now = dt.datetime.now()
+        payload = {
+            "action": "candidate_plan",
+            "schema_version": 1,
+            "plan_id": "{}-{}-candidates".format(
+                SIGNAL_STRATEGY_ID, context_time.strftime("%Y%m%d")
+            ),
+            "strategy_id": SIGNAL_STRATEGY_ID,
+            "mode": mode,
+            "trading_date": context_time.strftime("%Y-%m-%d"),
+            "candidates": candidates,
+            "strategy_version": str(strategy_version or ""),
+            "created_at": context_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "sent_at_ms": int(now.timestamp() * 1000),
+        }
+        redis_message_id = _xadd(payload)
+        _log(
+            "[信号] 候选计划已推送: {}只 {}".format(
+                len(candidates), ",".join(candidates)
+            )
+        )
+        return {
+            "sent": True,
+            "mode": mode,
+            "candidate_plan": payload,
+            "redis_message_id": redis_message_id,
+        }
+    except Exception as exc:
+        _log("[信号] 候选计划推送失败: {}".format(exc))
+        return {
+            "sent": False,
+            "mode": None,
+            "candidate_plan": None,
+            "redis_message_id": None,
+            "error": str(exc),
+        }
+
+
 def publish_daily_plan_to_redis(context, codes_to_sell, codes_to_buy):
     """日计划意图信号：开盘清仓清单 + 今日待买清单。
 
@@ -300,6 +381,7 @@ def publish_sell_all_to_redis(context, code, price):
 
 
 def _publish_intent(context, action, code, price):
+    """sell_half/sell_all 共用的意图信号构造：signal_id 不含数量，数量由执行端按真实持仓解析。"""
     try:
         mode, context_time = _signal_mode(context)
         safe_code = re.sub(r"[^0-9A-Za-z]", "", str(code))

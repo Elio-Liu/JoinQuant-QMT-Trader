@@ -1,0 +1,179 @@
+# 公开示例: 本地策略引擎配置模板。
+# 复制为 config.strategy.yaml 并按你的策略修改; 真实参数不要提交到公开仓库。
+#
+# 重要: 本文件全部数值都是【虚构示例值】, 仅演示结构与取值范围,
+# 不代表任何真实部署口径。复制后请逐项核对后再启动。
+#
+# 加载方式: main.py 固定读取自身同级目录的 config.strategy.yaml
+# (没有命令行替代参数), 与主配置 config.yaml 的联动关系见 README。
+
+strategy_engine:
+  # 本地策略引擎总开关。校验要求必须为 true: 关闭会直接拒绝启动,
+  # 防止静默退回普通跟单模式。
+  enabled: true
+  # 专用账户唯一策略标识, 必须与主配置 redis.allowed_strategy_ids 完全一致。
+  strategy_id: "YOUR_STRATEGY_ID"
+  # 聚宽侧卖出信号的放行白名单: 只有 quantity_mode=sell_all 且 purpose 在
+  # 名单内的消息会被执行, 其余同策略旧交易消息一律 ACK 拒绝 (防止聚宽与
+  # 交易端双重管理真实仓位)。名单内容属于策略契约, 代码不内置默认值;
+  # 空列表表示拒绝一切外部卖出信号。
+  external_signals:
+    allowed_sell_purposes: ["固定止损", "见顶卖出"] # 示例值, 按你的策略定义
+
+  # 策略决策日程; 只决定当前策略何时产生决策, 交易机安全边界在 config.yaml。
+  # 全部为示例值, 必须满足: 开盘退出触发早于其补执行截止; 补执行截止不晚于
+  # 开盘买入接纳截止; 候选计划截止不晚于买入接纳截止; 买入起点不早于连续
+  # 竞价开始; 各退出补执行截止不晚于最后报卖时刻。
+  schedule:
+    candidate_plan:
+      # 候选计划接收截止 (不包含); 该秒起不再接纳, 重启后也不补收。
+      accept_until: "09:35:00"
+    opening_exit:
+      # 开盘退出首次触发 (包含); 示例定在竞价定盘之后、连续竞价之前。
+      trigger_at: "09:27:00"
+      # 开盘退出重启补执行截止 (不包含)。
+      retry_until: "09:35:00"
+    opening_buy:
+      # 第一波盘前挂单窗口起点 (包含)。候选计划送达即用盘前资金整批接纳,
+      # 不等此点; 此点只约束重启/补挂路径。
+      preopen_start_at: "09:25:30"
+      # 开盘买入开始时刻 (包含); 第一波未发生时到点才允许退回整批接纳。
+      start_at: "09:30:00"
+      # 开盘买入接纳与回款补仓窗口截止 (不包含)。
+      admit_until: "09:35:00"
+    hard_stop:
+      # 盘中硬止损开始检查 (包含)。
+      start_at: "09:31:00"
+      # 盘中硬止损最后检查 (包含); 重启补检查最晚到此时刻。
+      last_check_at: "14:56:00"
+      # 检查间隔, 单位秒。
+      interval_sec: 1.0
+    morning_exit:
+      # 上午退出首次触发 (包含)。
+      trigger_at: "10:00:00"
+      # 上午退出重启补执行截止 (不包含)。
+      retry_until: "10:05:00"
+    afternoon_exit:
+      # 下午退出首次触发 (包含)。
+      trigger_at: "14:00:00"
+      # 下午退出重启补执行截止 (不包含)。
+      retry_until: "14:56:00"
+
+  candidate_plan:
+    # 是否接收聚宽候选计划。
+    enabled: true
+    # 单份计划最多允许的候选数量。
+    max_candidates: 3
+    # 候选计划允许的最大消息年龄, 单位秒。
+    max_age_sec: 600
+    # 收到计划后是否立即订阅候选行情。
+    subscribe_on_receive: true
+
+  opening_buy:
+    # 是否执行开盘买入规则。开启时 candidate_plan 与 capital_allocation
+    # 也必须开启, 否则拒绝启动。
+    enabled: true
+    # 回款补仓与回退批次是否等待盘前卖出屏障释放 (第一波盘前挂单天然不等)。
+    wait_for_opening_sells: true
+    # 是否启用回款补仓: 窗口内每 tick 检查回款池, 够一手就补一波, 直到
+    # admit_until 收口。
+    topup_enabled: true
+    capital_allocation:
+      # 是否启用本地资金分配; 开盘买入开启时必须开启。
+      enabled: true
+      # 分配方法; 当前仅支持 equal=候选间等额分配。
+      method: "equal"
+      # 账户总仓位上限 (占总资产比例); 0=不限制。
+      total_position_limit_pct: 0.3
+      # 现金预留比例 (占总资产比例); 0=不留。上限 5%(不含)。
+      cash_reserve_pct: 0.02
+      # 已持仓标的不重复买入。
+      skip_existing_positions: true
+      # 失败候选的预算是否重分配给其余候选; 当前仅支持 false。
+      redistribute_failed_budget: false
+
+  opening_exit:
+    # 是否执行开盘退出规则。
+    enabled: true
+    low_open_exit:
+      # 是否启用低开退出。
+      enabled: true
+      # 相对昨收的低开阈值, 取值 (-1, 0]; 开盘收益率低于该值即触发。
+      # 示例 -0.01 = 低开超过 1% 触发; 0.0 = 低于昨收即触发。
+      threshold_pct: -0.01
+    limit_down_exit:
+      # 是否启用跌停退出。
+      enabled: true
+      # 跌停退出必须使用 execution.limit_down_sell_mode=queue。
+      require_queue_mode: true
+
+  intraday_hard_stop:
+    # 交易端本地硬止损。一般把它作为聚宽侧止损信号的"灾难兜底":
+    # 平时由聚宽按模拟盘决策下发止损信号, 本地这条只在信号链丢失时接管,
+    # 阈值可比主止损线放宽; 两套并存无害 (先到先卖, 后到者跳过)。
+    enabled: true
+    # 相对持仓成本的亏损触发比例 (示例 5%)。
+    loss_pct: 0.05
+    # 涨停标的不执行硬止损卖出。
+    skip_if_limit_up: true
+
+  trailing_take_profit:
+    # 回落止盈: 现价相对买入以来最高价回落达到阈值即全清。
+    # 示例默认关闭, 按策略回测结论决定是否启用。
+    enabled: false
+    # 回落触发比例 (仅在 enabled=true 时生效)。
+    pullback_pct: 0.08
+
+  morning_exit:
+    # 是否执行上午退出规则。
+    enabled: true
+    # 仅在标的未涨停时执行上午退出。
+    require_not_limit_up: true
+    # 上午仍亏损时是否全部退出。
+    loss_exit: true
+    profit_reduce:
+      # 上午盈利时是否减仓。
+      enabled: true
+      # 盈利减仓比例; 当前固定支持卖出一半 (0.5)。
+      sell_ratio: 0.5
+      # 一半不足一手时的处理: sell_all=卖出全部可卖 / skip=不卖。
+      insufficient_lot_mode: "sell_all"
+
+  afternoon_exit:
+    # 是否执行下午退出规则。
+    enabled: true
+    # 下午未涨停时是否全部退出。
+    sell_if_not_limit_up: true
+    # 下午仍涨停时是否继续持有过夜。
+    hold_if_limit_up: true
+
+  limit_detection:
+    # 涨跌停价格判断容差比例。
+    tolerance_pct: 0.002
+    # 缺少涨跌停价时阻断相关规则。
+    require_limit_prices: true
+
+  data_safety:
+    # 行情快照最大允许年龄, 单位秒。
+    max_tick_age_sec: 3
+    # 快照必须属于当前交易日。
+    require_current_trade_date: true
+    # 开盘价和昨收价必须同时可用。
+    require_open_and_previous_close: true
+    # 数据不合法时阻断当前规则, 不降级执行。
+    invalid_data_action: "block_rule"
+
+# 策略层执行开关: 四个键严格必填, 取值校验与主配置同源; 主配置禁止重复
+# 携带这些键。
+execution:
+  # 跌停锁盘卖单的处理模式: queue=挂跌停价排队 / skip=跳过 / none=普通定价。
+  limit_down_sell_mode: "queue"
+  # 涨停锁盘买单的处理模式, 取值同上。
+  limit_up_buy_mode: "queue"
+  # sell_half 半仓不足一手时的处理: sell_all=全卖 / skip=不卖。
+  sell_half_insufficient_lot_mode: "sell_all"
+  # 单票集中度上限 = 账户总资产 × 该比例 (取值 (0, 1]):
+  #   策略层把它当"持仓上限"(扣除该标的现有持仓市值);
+  #   执行层把 plan 派生 auto_buy 的预算按它封顶。
+  # 示例 0.2; 必须不高于上面 capital_allocation.total_position_limit_pct。
+  max_single_position_pct: 0.2

@@ -1,6 +1,9 @@
 """意图型信号的数量计算（纯函数，无 I/O，便于单测）。
 
-规则（与策略端语义保持一致）:
+将 sell_all / sell_half / auto_buy 三种意图从真实账户数据换算成委托股数，
+规则与策略端语义保持一致。
+
+本模块约定:
 - sell_all: 真实可卖持仓全清。
 - sell_half: 持仓的一半向下取整到 100 股；不足一手时按
   sell_half_insufficient_lot_mode 处理（sell_all=全卖 / skip=不卖）。

@@ -1,4 +1,8 @@
-"""人工核对 QMT 后，安全收口 recovery_required 信号。"""
+"""人工核对 QMT 后，安全收口 recovery_required 信号。
+
+停止交易服务后，把状态不确定的恢复待办按人工对账结果写回终态并 ACK。
+运行前需加 --confirm-qmt-reconciled 确认已在 QMT 委托/成交列表核对过。
+"""
 
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ _STATUS_CHOICES = (
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """解析命令行参数，并强制要求 --confirm-qmt-reconciled 已核对开关。"""
     parser = argparse.ArgumentParser(
         description="停止交易程序并在 QMT 委托列表对账后，收口一条恢复待办。"
     )
@@ -40,6 +45,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """解析参数、加单实例锁后，把该 signal_id 的恢复状态写回终态。"""
     args = _parse_args(argv)
     lock = SingleInstanceLock(str(args.state_db) + ".lock")
     lock.acquire()
