@@ -1,6 +1,6 @@
 # JoinQuant QMT 跟单助手
 
-把聚宽策略里的买卖想法，自动变成 QMT 里的真实委托。你只管在聚宽写策略，下单、撤单、排队这些脏活交给这个程序。
+把聚宽策略里的买卖想法，自动变成 QMT 里的真实委托。你只管在聚宽写策略，下单、撤单、排队这些脏活交给这个程序。开箱即用的**纯跟单模式**适合绝大多数策略；想把风控也搬到交易端的，还有**本地策略引擎**这个进阶玩法。
 
 > [!WARNING]
 > 本项目连接真实交易链路。仓库默认关闭交易开关，macOS/Linux 上的测试也不能替代目标券商 Windows 客户端的仿真验证。第一次启用请用仿真账户、小额订单，并人工盯盘。
@@ -26,11 +26,11 @@
 ## 两条执行路径
 
 > [!IMPORTANT]
-> 独立 miniQMT 服务有两种运行模式，由 `config.strategy.yaml` 是否存在决定：**本地策略引擎模式**（文件存在，默认）把选股之外的风控全部搬进交易端；**纯跟单模式**（文件不存在）退化为泛用跟单程序，只执行白名单策略下发的普通信号。本仓库按本地策略引擎模式开发，见下文「两种运行模式」。
+> 独立 miniQMT 服务有两种运行模式，由 `main.py` 同级有没有 `config.strategy.yaml` 决定：**纯跟单模式**（没有该文件，默认）就是泛用跟单程序，白名单策略发什么信号就执行什么；**本地策略引擎模式**（有该文件，进阶）把选股之外的风控全部搬进交易端。大多数用户只需要纯跟单模式，见下文「两种运行模式」。
 
 | 执行方式 | 适合谁 | 可靠性 | 入口 |
 | --- | --- | --- | --- |
-| 独立 miniQMT 服务（推荐） | Windows 上能单独跑 Python 服务 | 本地策略引擎、SQLite 持久账本、signal_id 幂等、买卖并发池、开盘卖单屏障、涨跌停排队专用池、完整委托记录 | `python main.py` |
+| 独立 miniQMT 服务（推荐） | Windows 上能单独跑 Python 服务 | 纯跟单/本地策略引擎双模式、SQLite 持久账本、signal_id 幂等、买卖并发池、开盘卖单屏障、涨跌停排队专用池、完整委托记录 | `python main.py` |
 | 大 QMT 单文件执行器（备用） | 券商大 QMT 只允许策略是单个 Python 文件 | 买卖双通道 FIFO，去重和订单状态只存在本次运行内存里，重启不恢复 | `bigqmt_follower/bigqmt_redis_follower.py` |
 
 同一个资金账户严禁同时跑两个执行端。两边消费组不同，会各收到一份完整消息，等于把单子下两遍。反过来，多台机器管不同账户时，每台必须用不同的消费组，这样每台都能拿到完整消息、各自执行。
@@ -39,19 +39,21 @@
 
 独立 miniQMT 服务可以按你的需要切换成两种角色，开关很简单：**`main.py` 同级有没有 `config.strategy.yaml`**。
 
-| | 本地策略引擎模式（默认） | 纯跟单模式（泛用） |
+**先看结论：绝大多数人用纯跟单模式就够了。** 每个人的策略千差万别，`config.strategy.yaml` 那套规则配置只适合一种特定的玩法（把风控搬进交易端）；如果你的策略自己在聚宽里决定买卖时机，交易端只负责把信号变成真实委托，那就是纯跟单模式——一份 `config.yaml` 搞定，没有额外的策略文件要学。
+
+| | 纯跟单模式（推荐，默认） | 本地策略引擎模式（进阶） |
 | --- | --- | --- |
-| 触发条件 | 存在 `config.strategy.yaml` | 不存在该文件 |
-| 谁做买卖决策 | 交易端本地引擎（候选计划驱动） | 聚宽策略（发什么跟什么） |
-| 接受的信号 | `candidate_plan` + 白名单内的 `sell_all` 卖出信号 | `plan` / `buy` / `sell` / `sell_half` / `sell_all` / `watchlist`，全部照常执行 |
-| 策略白名单 | 严格单策略（`allowed_strategy_ids` 只能有 `strategy_engine.strategy_id` 一项） | 可以列多个策略 id（空=不过滤，遗留行为） |
-| 策略层执行开关 | 必须放在 `config.strategy.yaml` 的 `execution` 节点 | 可放回主配置 `execution`（机器默认值兜底） |
-| 适合谁 | 想把风控/资金分配下放到交易端的自营策略 | 已有聚宽策略、只想自动跟单的通用场景 |
+| 触发条件 | 不存在 `config.strategy.yaml` | 存在该文件 |
+| 谁做买卖决策 | 聚宽策略（发什么跟什么） | 交易端本地引擎（候选计划驱动） |
+| 接受的信号 | `plan` / `buy` / `sell` / `sell_half` / `sell_all` / `watchlist`，全部照常执行 | `candidate_plan` + 白名单内的 `sell_all` 卖出信号 |
+| 策略白名单 | 可以列多个策略 id（空=不过滤，遗留行为） | 严格单策略（`allowed_strategy_ids` 只能有 `strategy_engine.strategy_id` 一项） |
+| 策略层执行开关 | 可放在主配置 `execution`（机器默认值兜底） | 必须放在 `config.strategy.yaml` 的 `execution` 节点 |
+| 适合谁 | 已有聚宽策略、只想自动跟单的通用场景 | 想把风控/资金分配下放到交易端的自营策略 |
 
-- **本地策略引擎模式**：聚宽只发选股结果和止损等退出信号，交易端按 `config.strategy.yaml` 的时间表自己决策。详细机制见下一章「本地策略引擎」。这个模式是整个仓库的开发主线。
-- **纯跟单模式**：不建本地策略引擎、不拒绝任何普通信号，回到"策略说什么、交易端做什么"的经典跟单形态。`candidate_plan` 没有消费方，会被记日志后直接 ACK。部署时只需 `config.yaml` 一份配置。
+- **纯跟单模式**：不建本地策略引擎、不拒绝任何普通信号，回到"策略说什么、交易端做什么"的经典跟单形态。`candidate_plan` 没有消费方，会被记日志后直接 ACK。部署时只需 `config.yaml` 一份配置，快速开始一节默认按这个模式走。
+- **本地策略引擎模式**：聚宽只发选股结果和止损等退出信号，交易端按 `config.strategy.yaml` 的时间表自己决策。详细机制见「进阶：本地策略引擎」一章——这是本仓库的实现重点，但不是大多数人的刚需。
 
-**为什么把风控放在交易端更快**：聚宽模拟盘有约 10 秒的行情与执行延迟，止损/退出信号从触发到送达交易端还要再过一个网络往返；而交易端本地引擎直接读 QMT 实时行情、按亚秒级节奏逐 tick 判断，触发即下单。开盘竞价定盘、盘中急跌这些场景下，本地风控通常能比"等聚宽喊话"早一个数量级反应。代价是策略逻辑要写成 `config.strategy.yaml` 的规则配置——这也是下一章的主角。
+**为什么把风控放在交易端更快**：聚宽模拟盘有约 10 秒的行情与执行延迟，止损/退出信号从触发到送达交易端还要再过一个网络往返；而交易端本地引擎直接读 QMT 实时行情、按亚秒级节奏逐 tick 判断，触发即下单。开盘竞价定盘、盘中急跌这些场景下，本地风控通常能比"等聚宽喊话"早一个数量级反应。代价是策略逻辑要写成 `config.strategy.yaml` 的规则配置——如果你不需要这个收益，留在纯跟单模式就好。
 
 ### 一份策略，多台机器
 
@@ -68,7 +70,137 @@
 
 两点要注意。新消费组从 Stream 最新位置开始消费，盘中新加的机器不会重放早上的消息（早上的 plan 没有过期时间，重放会误建仓）；错过 plan 的机器当天不买，宁可少买不盲买。已经存在的组在交易机重启后会找回本组未确认消息，先按 `signal_id` 去 QMT 订单备注核对，再决定继续、确认或停机待人工处理。每台机器有独立的 SQLite 账本和日志，盘后按机器对账，单台宕机不影响其他机器。
 
-## 本地策略引擎：交易机自己的"脑子"
+## 快速开始（部署）
+
+### 1. 准备环境
+
+需要三样东西：
+
+- Windows 10/11，装好并登录了 miniQMT，账号能手工下单、撤单、查委托
+- 一个 Windows 和聚宽都能访问的 Redis
+- 一个能 `import xtquant` 的 **Python 3.11 或更高版本**环境（xtquant 通常随 miniQMT 提供，别从别的环境乱拷）
+
+3.11 是硬下限：`miniqmt_follower/models.py` 用了 `enum.StrEnum`，3.10 上整个包都 import 不进去。`python main.py` 启动时会先校验这一条，不达标会直接给一句人话而不是从包深处冒出来的 ImportError。
+
+装公共依赖：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+只装两个包：`redis` 和 `PyYAML`。**xtquant 不在里面**，它必须用交易机上 miniQMT 自带的那一份——PyPI 上那个同名包是第三方上传的，真正下单要的 `xtquant.xttrader` 依赖随终端分发的本地二进制，pip 装它只会掩盖问题。理由和其他运行环境（大 QMT、测试脚本、聚宽云端）各自的依赖，都写在 `requirements.txt` 的注释里。
+
+先确认当前解释器能用 xtquant：
+
+```powershell
+python -c "import xtquant; print('xtquant ok')"
+python -c "from xtquant import xtdata; print('xtdata ok')"
+python -c "from xtquant.xttrader import XtQuantTrader; print('xttrader ok')"
+```
+
+### 2. 建配置
+
+```powershell
+Copy-Item config.example.yaml config.yaml
+$env:REDIS_PASSWORD="你的 Redis 密码"
+```
+
+打开 `config.yaml`，下面这几项是必改的：
+
+| 配置 | 改什么 |
+| --- | --- |
+| `redis.host` / `port` / `password` | Redis 地址和密码，密码可写 `${REDIS_PASSWORD}` 从环境变量读 |
+| `redis.stream` | Stream 名字，必须和聚宽发送函数里的一致 |
+| `redis.group` / `consumer` | 消费组和执行器名字，多台机器各用各的 |
+| `trading.account_id` / `miniqmt_path` | 资金账号和 miniQMT 的 `userdata_mini` 目录 |
+| `trading.enabled` | 交易安全门，先保持 `false` |
+
+先保持 `trading.enabled: false` 启动一次，看到安全门拒绝是正常的。只读检查都过了、仿真账户验证没问题，再改成 `true`。
+
+**到这里，纯跟单模式（大多数人）就配完了**——不需要任何额外文件。白名单里的策略发什么信号，交易端就执行什么（`plan`/`buy`/`sell`/`sell_half`/`sell_all`/`watchlist`）。
+
+<details>
+<summary>进阶：切换到本地策略引擎模式（把风控搬进交易端）</summary>
+
+在 `config.yaml` 同目录创建固定文件 `config.strategy.yaml`（从公开模板 `config.strategy.example.yaml` 复制改名，模板全是虚构示例值）。该文件没有命令行替代参数，并由 `.gitignore` 排除；真实策略开关、阈值和部署参数只保留在交易机本地，不得提交。缺失、关闭、字段拼错或与主配置冲突都会直接阻止启动。本机 `deploy/<机器名>/` 目录（不入库）还留有各交易机的部署配置对，复制到交易机即可。
+
+本地策略引擎模式的联动条件（纯跟单模式不需要满足）：
+
+- `redis.allowed_strategy_ids` 只能包含 `strategy_engine.strategy_id` 这一项；这是专用账户，不允许第二个策略进入同一真实账户。
+- `config.strategy.yaml` 的 `execution.limit_down_sell_mode` 必须为 `queue`，因为 `strategy_engine.schedule.opening_exit.trigger_at`（示例 `09:27:00`）开始的跌停退出依赖跌停排队。
+- 涨跌停排队单（买卖两侧）在 `qmt-queue` 专用线程池慢轮询，不再占用买卖 worker；`--workers`（默认 8）只需覆盖策略单日目标股数。优雅退出时排队单会主动撤单收口（上界 ≈ `cancel_confirm_timeout_sec` + 轮询间隔），硬杀语义不变：重启后按 QMT 订单备注恢复跟踪。
+- `config.strategy.yaml` 内每条规则、总仓位上限和现金预留都有独立 `enabled` 开关；单票上限由 `execution.max_single_position_pct` 单一键约束（策略层开盘买入/回款补仓按持仓上限使用，执行层 auto_buy 按单笔买入上限使用）；比例与时间严格校验。
+
+</details>
+
+### 3. 启动服务
+
+把 `config.yaml` 放在 `main.py` 同级目录（默认配置路径已锚定在同级，任意工作目录启动都能找到；本地策略引擎模式还需要同级的 `config.strategy.yaml`）：
+
+```powershell
+python .\main.py
+```
+
+需要覆盖默认配置路径或调整并发数时：
+
+```powershell
+python .\main.py --config path\to\config.yaml --workers 8
+```
+
+`--workers` 是买卖方向各自的并发线程数，默认 8。启动正常会看到：
+
+```text
+【系统】🚀 QMT跟单助手启动中 | 买卖各 8 线程并发
+【系统】🧭 运行模式: 纯跟单 | 无本地策略引擎, 只执行白名单策略下发的普通信号
+【QMT】🔌 交易端已连接
+【系统】🟢 Redis监听已启动
+```
+
+本地策略引擎模式下第二行会显示 `运行模式: 本地策略引擎 | strategy_id=...`，其余相同。
+
+### 4. 接入聚宽策略
+
+发送函数集中在 `joinquant_signal_sender.py`，文件里写明了用法。把文件内容（或只用到的函数）粘进聚宽策略，然后改文件顶部的 `SIGNAL_REDIS_CONFIG`：`host`、`password`、`stream` 要和 Windows 端 `config.yaml` 一致，`SIGNAL_STRATEGY_ID` 要和 `redis.allowed_strategy_ids` 白名单对应。填真实配置之前，先确认不会把带密码的副本提交到仓库。
+
+策略里最常用的几个调用：
+
+```python
+# 精确买卖（数量由策略定）
+publish_trade_signal_to_redis(context, "buy", "510300.XSHG", 1000, 3.850)
+publish_trade_signal_to_redis(context, "sell", "159915.XSHE", 500, 1.235)
+
+# 盘前预订阅股票池，只订阅行情、不下单
+publish_watchlist_to_redis(context, ["510300.XSHG", "159915.XSHE"])
+
+# 意图型信号：数量由执行端按真实持仓/资金算
+publish_sell_half_to_redis(context, "000001.XSHE", 10.5)   # 卖半仓
+publish_sell_all_to_redis(context, "000002.XSHE", 9.8)     # 清仓
+
+# 日计划：清仓清单 + 待买清单
+publish_daily_plan_to_redis(context, ["000001.XSHE"], ["600000.XSHG", "000002.XSHE"])
+```
+
+上面这些函数就是**纯跟单模式**要用的全部：策略照常买卖，执行端负责落地。**本地策略引擎模式**则反过来——实际只调用下面这个函数，上面的交易函数在引擎模式下发出来也不会执行。止损等退出信号由策略部署副本内带 `purpose` 标签的 `sell_all` 发送函数发出（purpose 必须出现在 `config.strategy.yaml` 的 `external_signals.allowed_sell_purposes` 白名单里，发送函数带每分钟补发队列直到 XADD 成功），本仓库的 `joinquant_signal_sender.py` 是这些函数的基础版本，`strategies/` 下的部署副本保留完整逻辑。
+
+```python
+# 选股完成后发送有序候选列表；空列表也要发送，明确表示“今天不买”。
+publish_candidate_plan_to_redis(
+    context,
+    selected_codes,
+    strategy_version="local-engine-v1",
+)
+```
+
+候选计划必须在 `strategy_engine.schedule.candidate_plan.accept_until`（示例值 `09:35:00`）之前收到并通过日期、超龄、行情、账户和开盘卖单检查。服务在 `strategy_engine.schedule.opening_exit.trigger_at`（示例值 `09:27:00`）后重启时，会先补做开盘退出；只要整批买入前置条件在 `strategy_engine.schedule.opening_buy.admit_until`（示例值 `09:35:00`）之前全部通过，兄弟买单即使随后在线程队列里跨过截止边界也继续执行；截止时刻所在整秒起不再接纳新批次，回款补仓窗口同步收口。
+
+对于开盘调仓策略，可以先推送预订阅和待卖清单，再发日计划。执行端会先处理盘前卖单，买单等到开盘屏障放行后，按各账户真实可用资金计算数量。具体选股、发送和卖出时间由使用者自己的策略决定，不在公开仓库中记录。
+
+发送函数会按 `context.current_dt` 和系统时间判断回测还是实盘。回测、研究、历史补跑不会写 Redis；实盘 XADD 成功也只代表 Redis 收到了，不代表已经下单成交。
+
+## 进阶：本地策略引擎（交易端自己做风控）
+
+> [!NOTE]
+> 本章是进阶内容：**大多数跟单场景用不到它**。如果你的策略自己决定买卖时机（绝大多数情况），直接用上面的纯跟单模式即可，跳过本章。只有想把风控和资金分配从聚宽搬到交易端、规避约 10 秒模拟盘延迟时，才需要本章。
 
 专用账户模式下，交易机上跑着一个完整的本地策略引擎，不靠聚宽逐笔指挥，而是每天按一张时间表自己决策。聚宽只做两件事：**盘前把选股结果发过来**（`candidate_plan`），**盘中发现止损等退出信号就喊一声**（`sell_all`，purpose 白名单可配置）。买多少、什么时候卖、卖多少，全部由交易机按自己的真实账户决定。这份"时间表"就是 `config.strategy.yaml`（公开模板见 `config.strategy.example.yaml`），改任何一个时间都会改变当天行为。
 
@@ -140,129 +272,6 @@
 
 由于交易端直接读 QMT 实时行情，这份配置里的每一条风控规则都以亚秒级节奏在真实账户上运行——比"聚宽模拟盘判断、再发信号过来"（约 10 秒延迟）快一个数量级。这是把风控从云端搬到交易端的核心收益，也是这份模板存在的意义。
 
-## 快速开始（部署）
-
-### 1. 准备环境
-
-需要三样东西：
-
-- Windows 10/11，装好并登录了 miniQMT，账号能手工下单、撤单、查委托
-- 一个 Windows 和聚宽都能访问的 Redis
-- 一个能 `import xtquant` 的 **Python 3.11 或更高版本**环境（xtquant 通常随 miniQMT 提供，别从别的环境乱拷）
-
-3.11 是硬下限：`miniqmt_follower/models.py` 用了 `enum.StrEnum`，3.10 上整个包都 import 不进去。`python main.py` 启动时会先校验这一条，不达标会直接给一句人话而不是从包深处冒出来的 ImportError。
-
-装公共依赖：
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-只装两个包：`redis` 和 `PyYAML`。**xtquant 不在里面**，它必须用交易机上 miniQMT 自带的那一份——PyPI 上那个同名包是第三方上传的，真正下单要的 `xtquant.xttrader` 依赖随终端分发的本地二进制，pip 装它只会掩盖问题。理由和其他运行环境（大 QMT、测试脚本、聚宽云端）各自的依赖，都写在 `requirements.txt` 的注释里。
-
-先确认当前解释器能用 xtquant：
-
-```powershell
-python -c "import xtquant; print('xtquant ok')"
-python -c "from xtquant import xtdata; print('xtdata ok')"
-python -c "from xtquant.xttrader import XtQuantTrader; print('xttrader ok')"
-```
-
-### 2. 建配置
-
-```powershell
-Copy-Item config.example.yaml config.yaml
-$env:REDIS_PASSWORD="你的 Redis 密码"
-```
-
-打开 `config.yaml`，下面这几项是必改的：
-
-| 配置 | 改什么 |
-| --- | --- |
-| `redis.host` / `port` / `password` | Redis 地址和密码，密码可写 `${REDIS_PASSWORD}` 从环境变量读 |
-| `redis.stream` | Stream 名字，必须和聚宽发送函数里的一致 |
-| `redis.group` / `consumer` | 消费组和执行器名字，多台机器各用各的 |
-| `trading.account_id` / `miniqmt_path` | 资金账号和 miniQMT 的 `userdata_mini` 目录 |
-| `trading.enabled` | 交易安全门，先保持 `false` |
-
-先保持 `trading.enabled: false` 启动一次，看到安全门拒绝是正常的。只读检查都过了、仿真账户验证没问题，再改成 `true`。
-
-接下来按运行模式二选一：
-
-- **纯跟单模式（泛用）**：到此为止，不用建任何额外文件。白名单里的策略发什么信号，交易端就执行什么（`plan`/`buy`/`sell`/`sell_half`/`sell_all`/`watchlist`）。
-- **本地策略引擎模式**：在 `config.yaml` 同目录创建固定文件 `config.strategy.yaml`（从公开模板 `config.strategy.example.yaml` 复制改名）。该文件没有命令行替代参数，并由 `.gitignore` 排除；真实策略开关、阈值和部署参数只保留在交易机本地，不得提交。缺失、关闭、字段拼错或与主配置冲突都会直接阻止启动。本机 `deploy/<机器名>/` 目录（不入库）还留有各交易机的部署配置对，复制到交易机即可。
-
-本地策略引擎模式的联动条件（纯跟单模式不需要满足）：
-
-- `redis.allowed_strategy_ids` 只能包含 `strategy_engine.strategy_id` 这一项；这是专用账户，不允许第二个策略进入同一真实账户。
-- `config.strategy.yaml` 的 `execution.limit_down_sell_mode` 必须为 `queue`，因为 `strategy_engine.schedule.opening_exit.trigger_at`（示例 `09:27:00`）开始的跌停退出依赖跌停排队。
-- 涨跌停排队单（买卖两侧）在 `qmt-queue` 专用线程池慢轮询，不再占用买卖 worker；`--workers`（默认 8）只需覆盖策略单日目标股数。优雅退出时排队单会主动撤单收口（上界 ≈ `cancel_confirm_timeout_sec` + 轮询间隔），硬杀语义不变：重启后按 QMT 订单备注恢复跟踪。
-- `config.strategy.yaml` 内每条规则、总仓位上限和现金预留都有独立 `enabled` 开关；单票上限由 `execution.max_single_position_pct` 单一键约束（策略层开盘买入/回款补仓按持仓上限使用，执行层 auto_buy 按单笔买入上限使用）；比例与时间严格校验。
-
-### 3. 启动服务
-
-把 `config.yaml` 与 `config.strategy.yaml` 放在 `main.py` 同级目录（默认配置路径已锚定在同级，任意工作目录启动都能找到）：
-
-```powershell
-python .\main.py
-```
-
-需要覆盖默认配置路径或调整并发数时：
-
-```powershell
-python .\main.py --config path\to\config.yaml --workers 8
-```
-
-`--workers` 是买卖方向各自的并发线程数，默认 8。启动正常会看到：
-
-```text
-【系统】🚀 QMT跟单助手启动中 | 买卖各 8 线程并发
-【系统】🧭 运行模式: 本地策略引擎 | strategy_id=YOUR_STRATEGY_ID
-【QMT】🔌 交易端已连接
-【系统】🟢 Redis监听已启动
-```
-
-纯跟单模式下第二行会显示 `运行模式: 纯跟单`，其余相同。
-
-### 4. 接入聚宽策略
-
-发送函数集中在 `joinquant_signal_sender.py`，文件里写明了用法。把文件内容（或只用到的函数）粘进聚宽策略，然后改文件顶部的 `SIGNAL_REDIS_CONFIG`：`host`、`password`、`stream` 要和 Windows 端 `config.yaml` 一致，`SIGNAL_STRATEGY_ID` 要和 `redis.allowed_strategy_ids` 白名单对应。填真实配置之前，先确认不会把带密码的副本提交到仓库。
-
-策略里最常用的几个调用：
-
-```python
-# 精确买卖（数量由策略定）
-publish_trade_signal_to_redis(context, "buy", "510300.XSHG", 1000, 3.850)
-publish_trade_signal_to_redis(context, "sell", "159915.XSHE", 500, 1.235)
-
-# 盘前预订阅股票池，只订阅行情、不下单
-publish_watchlist_to_redis(context, ["510300.XSHG", "159915.XSHE"])
-
-# 意图型信号：数量由执行端按真实持仓/资金算
-publish_sell_half_to_redis(context, "000001.XSHE", 10.5)   # 卖半仓
-publish_sell_all_to_redis(context, "000002.XSHE", 9.8)     # 清仓
-
-# 日计划：清仓清单 + 待买清单
-publish_daily_plan_to_redis(context, ["000001.XSHE"], ["600000.XSHG", "000002.XSHE"])
-```
-
-本地策略引擎模式下，实际只调用下面这个函数；上面的旧交易函数是纯跟单模式的用法，引擎模式下发出来也不会执行。止损等退出信号由策略部署副本内带 `purpose` 标签的 `sell_all` 发送函数发出（purpose 必须出现在 `config.strategy.yaml` 的 `external_signals.allowed_sell_purposes` 白名单里，发送函数带每分钟补发队列直到 XADD 成功），本仓库的 `joinquant_signal_sender.py` 是这些函数的基础版本，`strategies/` 下的部署副本保留完整逻辑。
-
-```python
-# 选股完成后发送有序候选列表；空列表也要发送，明确表示“今天不买”。
-publish_candidate_plan_to_redis(
-    context,
-    selected_codes,
-    strategy_version="local-engine-v1",
-)
-```
-
-候选计划必须在 `strategy_engine.schedule.candidate_plan.accept_until`（示例值 `09:35:00`）之前收到并通过日期、超龄、行情、账户和开盘卖单检查。服务在 `strategy_engine.schedule.opening_exit.trigger_at`（示例值 `09:27:00`）后重启时，会先补做开盘退出；只要整批买入前置条件在 `strategy_engine.schedule.opening_buy.admit_until`（示例值 `09:35:00`）之前全部通过，兄弟买单即使随后在线程队列里跨过截止边界也继续执行；截止时刻所在整秒起不再接纳新批次，回款补仓窗口同步收口。
-
-对于开盘调仓策略，可以先推送预订阅和待卖清单，再发日计划。执行端会先处理盘前卖单，买单等到开盘屏障放行后，按各账户真实可用资金计算数量。具体选股、发送和卖出时间由使用者自己的策略决定，不在公开仓库中记录。
-
-发送函数会按 `context.current_dt` 和系统时间判断回测还是实盘。回测、研究、历史补跑不会写 Redis；实盘 XADD 成功也只代表 Redis 收到了，不代表已经下单成交。
-
 ## 配置说明
 
 主配置 `config.yaml` 分五个主要区域：`redis`、`machine_schedule`、`execution`、`market_data`、`trading`。除了上面必改项，下面这些按你的习惯调：
@@ -308,9 +317,9 @@ publish_candidate_plan_to_redis(
 | `machine_schedule.order_guard.limit_up_queue_cancel_at` | 涨停排队买单撤单收尾时刻 | 到点触发撤单 | `14:56:30` |
 | `machine_schedule.lifecycle.daily_summary_at` | 基于 QMT 真实账户输出日结并关闭策略日 | 到点触发；必须晚于收盘和全部排队撤单 | `15:02:00` |
 
-### 策略日程：`strategy_engine.schedule`
+### 策略日程：`strategy_engine.schedule`（仅本地策略引擎模式）
 
-下表的 13 个字段位于本地私有 `config.strategy.yaml`，全部必填且没有代码默认值。表中示例值为**虚构示例值**（与公开模板 `config.strategy.example.yaml` 一致，不代表任何真实部署口径）；改动后必须同时满足策略内部关系和与 `machine_schedule` 的跨层关系。
+下表 13 个字段位于本地私有 `config.strategy.yaml`，全部必填且没有代码默认值。表中示例值为**虚构示例值**（与公开模板 `config.strategy.example.yaml` 一致，不代表任何真实部署口径）；改动后必须同时满足策略内部关系和与 `machine_schedule` 的跨层关系。纯跟单模式没有这份配置。
 
 | 完整路径 | 中文含义 | 边界 | 示例值 |
 | --- | --- | --- | --- |
@@ -372,8 +381,8 @@ RedisStreamClient.read_forever()
   → 遗留消息先按 signal_id 查询 QMT 订单备注，确认无旧单才允许继续
   → 预订阅指令：立即订阅行情并 ACK
   → 消息日期早于本地今天的旧消息：记日志直接 ACK，不落库不执行
-  → 候选计划：写入 candidate_plans 审计后 ACK，交给本地策略引擎
-  → 本地策略引擎按日程 tick：从 QMT 批量读取真实资产/持仓/行情，
+  → [仅本地策略引擎模式] 候选计划：写入 candidate_plans 审计后 ACK，交给本地策略引擎
+  → [仅本地策略引擎模式] 引擎按日程 tick：从 QMT 批量读取真实资产/持仓/行情，
     纯规则生成内部 fixed_budget / sell_all / sell_half 信号
   → 交易信号：按方向进买入/卖出并发线程池
   → `machine_schedule.market_session.preopen_sell_start_at`（示例 `09:25:00`）至 `machine_schedule.market_session.continuous_trading_start_at`（示例 `09:30:00`）的盘前卖单先登记预挂，买单等开盘屏障
@@ -387,7 +396,9 @@ RedisStreamClient.read_forever()
   → 写终态，XACK
 ```
 
-本地策略协调层位于 Redis 与既有订单执行状态机之间：候选计划先写入 `candidate_plans` 后 ACK；调度器从 QMT 批量读取真实资产、持仓与行情，纯规则生成确定性的内部 `fixed_budget/sell_all/sell_half` 信号；`strategy_days` 记录当日是否可买和熔断原因，`strategy_events` 保证每条规则每只股票只触发一次。内部订单仍进入原有 SQLite `signals/order_attempts`、撤单确认、重挂与 QMT 备注恢复链路。决策细节见上文「本地策略引擎」一章。
+纯跟单模式就是上面这条链路去掉标注的两行"本地策略引擎"——聚宽信号直接进线程池执行，没有任何本地决策层。
+
+本地策略协调层（引擎模式）位于 Redis 与既有订单执行状态机之间：候选计划先写入 `candidate_plans` 后 ACK；调度器从 QMT 批量读取真实资产、持仓与行情，纯规则生成确定性的内部 `fixed_budget/sell_all/sell_half` 信号；`strategy_days` 记录当日是否可买和熔断原因，`strategy_events` 保证每条规则每只股票只触发一次。内部订单仍进入原有 SQLite `signals/order_attempts`、撤单确认、重挂与 QMT 备注恢复链路。决策细节见「进阶：本地策略引擎」一章。
 
 执行端有几点设计是故意的，值得知道：
 
@@ -427,7 +438,7 @@ Redis Stream 每条消息用字段 `payload` 装 JSON。精确买卖信号：
 }
 ```
 
-本地策略引擎使用的候选计划不携带任何交易参数：
+本地策略引擎模式（进阶）使用的候选计划不携带任何交易参数：
 
 ```json
 {
@@ -480,7 +491,7 @@ Redis Stream 每条消息用字段 `payload` 装 JSON。精确买卖信号：
 
 盘中 `sell_half` / `sell_all` 不带 `amount`，数量按真实可卖持仓算；`buy` 不带 `amount` 时按 `min(可用资金÷待买只数, 总资产×max_single_position_pct)` 计算整手。旧的 `buy`/`sell` + `amount` 协议完全兼容。
 
-### 本地策略引擎的内部信号
+### 本地策略引擎的内部信号（仅引擎模式）
 
 这些信号不经过 Redis，由交易机自己生成、自己执行，走同一条执行链路（幂等、撤单确认、重挂）。`signal_id` 稳定可预测，重启恢复靠它和 QMT 订单备注对上账：
 
@@ -656,7 +667,7 @@ python -m miniqmt_follower.recovery_cli `
 
 跌停卖出 / 涨停买入挂的是涨跌停价排队，重挂会丢队列位置，所以排队期间不撤不重挂，到 `14:56:30` 统一收口。期间它占用的是 `qmt-queue` 专用线程池（慢轮询，默认 3s 一次），不挡其他买卖。
 
-### 日志里出现 BLOCK / BLOCKED_DATA
+### 日志里出现 BLOCK / BLOCKED_DATA（仅本地策略引擎模式）
 
 策略引擎发现行情太旧、缺涨跌停价、快照日期不对等数据问题时，会阻塞对应规则而不是带病决策。等下一 tick 数据恢复会自动继续；若持续 BLOCK，检查行情源连接和 `data_safety` 配置。
 
