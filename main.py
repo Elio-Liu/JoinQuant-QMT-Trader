@@ -1,5 +1,5 @@
-"""Windows 侧执行服务的根目录启动入口。
-
+"""
+Windows 侧执行服务的根目录启动入口。
 在导入 miniqmt_follower 之前先做 Python 版本闸门，把低版本环境的报错前移，
 再委托给 app.main() 拉起跟单主循环。
 """
