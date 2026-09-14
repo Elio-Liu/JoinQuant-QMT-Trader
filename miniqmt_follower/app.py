@@ -21,6 +21,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Sequence
 
 from miniqmt_follower.adapters.qmt import QmtBrokerAdapter, QmtMarketDataAdapter
@@ -119,6 +120,14 @@ def _on_shutdown(signum, _frame):
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="QMT跟单助手 —— Redis Stream → miniQMT 实盘跟单")
     parser.add_argument(
+        "machine",
+        nargs="?",
+        default=None,
+        help="deploy 下的机器目录名 (如 elio_gj): 自动使用 "
+        "deploy/<机器名>/config.yaml 及同目录的 config.strategy.yaml; "
+        "与 --config 互斥",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help="YAML 配置文件路径 (缺省: main.py 同级目录下的 config.yaml)",
@@ -134,9 +143,44 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "买卖 worker",
     )
     args = parser.parse_args(argv)
+    if args.machine and args.config:
+        parser.error("机器名与 --config 不能同时指定")
     if args.workers < 1:
         parser.error("--workers 必须 ≥ 1")
     return args
+
+
+def _resolve_config_path(
+    machine: str | None, config: str | None, default_config: str
+) -> str:
+    """把启动参数解析成 config.yaml 路径。
+
+    - 机器名模式 (``python main.py elio_gj``): 解析为
+      ``<default_config 所在目录>/deploy/<机器名>/config.yaml``, 与同目录的
+      config.strategy.yaml 成对加载; 机器名不存在时列出 deploy 下的可选目录。
+    - --config / 缺省路径: 原样透传。
+    """
+    if not machine:
+        return config or default_config
+    deploy_root = Path(default_config).resolve().parent / "deploy"
+    candidate = (deploy_root / machine / "config.yaml").resolve()
+    if candidate.is_file():
+        return str(candidate)
+    try:
+        available = sorted(
+            p.name
+            for p in deploy_root.iterdir()
+            if p.is_dir() and (p / "config.yaml").is_file()
+        )
+    except OSError:
+        available = []
+    listing = "、".join(available) if available else "无 —— 请先把 deploy/ 目录复制到交易机"
+    raise SystemExit(
+        f"❌ 找不到机器配置: {candidate}\n"
+        f"   deploy 下可选机器: {listing}\n"
+        f"   用法: python main.py <机器名> (如 python main.py elio_gj), "
+        f"或 python main.py --config <config.yaml 路径>"
+    )
 
 
 def _build_execution_components(
@@ -170,10 +214,12 @@ def main(default_config: str = "config.yaml") -> None:
     然后用买入、卖出两个独立线程池 (各 --workers 线程) 并发处理交易信号。
     default_config 由 main.py 传入 (锚定在 main.py 同级目录), 使
     ``python main.py`` 从任意工作目录启动都能找到同级的 config.yaml;
-    --config 显式指定时优先。
+    --config 显式指定时优先; 位置参数机器名 (``python main.py elio_gj``)
+    解析为 ``deploy/<机器名>/config.yaml`` (与其同目录的 config.strategy.yaml
+    自动成对加载), 便于把整个 deploy/ 目录复制到交易机后按机器名启动。
     """
     args = _parse_args()
-    config_path = args.config or default_config
+    config_path = _resolve_config_path(args.machine, args.config, default_config)
 
     config, strategy_config = load_runtime_with_strategy(
         config_path, workers=args.workers

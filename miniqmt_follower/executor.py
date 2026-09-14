@@ -38,7 +38,11 @@ from miniqmt_follower.models import (
     is_terminal_execution_status,
 )
 from miniqmt_follower.opening import is_preopen_sell
-from miniqmt_follower.pricing import calculate_order_price, tick_size_for
+from miniqmt_follower.pricing import (
+    _fresh_continuous_ask,
+    calculate_order_price,
+    tick_size_for,
+)
 from miniqmt_follower.sizing import resolve_sell_all, resolve_sell_half, shares_for_budget
 from miniqmt_follower.store import SQLiteExecutionStore
 from miniqmt_follower.strategy_models import AccountSnapshot
@@ -972,22 +976,26 @@ class OrderExecutionEngine:
                     # 首次实时查询决定该信号的实际执行目标，兼容原有资源上限语义。
                     target_qty = attempt_qty
                     remaining_qty = target_qty
-                logger.debug(
-                    "💰 第%d次定价 | %s 最新价=%.3f 卖一=%s 买一=%s 委托价=%.3f 数量=%s",
-                    attempt_no, signal.label, quote.last_price, quote.ask1, quote.bid1,
-                    order_price, attempt_qty,
-                )
                 if signal.action == Action.SELL:
                     order_id = self._submit_order_with_halt_check(
                         signal, attempt_qty, order_price,
                     )
                 assert order_id is not None
+                submitted_at = time.monotonic()
+                logger.debug(
+                    "💰 第%d次定价 | %s 最新价=%.3f 卖一=%s 买一=%s 委托价=%.3f 数量=%s | "
+                    "QMT单号=%s signal_id=%s attempt_no=%d quote_time=%s",
+                    attempt_no, signal.label, quote.last_price, quote.ask1, quote.bid1,
+                    order_price, attempt_qty, order_id, signal.signal_id, attempt_no,
+                    quote.quote_time,
+                )
                 attempts = attempt_no
                 if attempts == 1:
-                    # 延迟打点: 开始处理 → 首笔委托到达柜台。抢单优化就看这个数。
+                    # 本机执行开始到取得适配器委托号, 排除后续定价日志耗时。
                     logger.debug(
-                        "⏱️ 首笔委托耗时 | %s 处理→委托=%.0fms",
-                        signal.label, (time.monotonic() - exec_started) * 1000,
+                        "⏱️ 首笔委托耗时 | %s 处理→取得委托号=%.0fms | signal_id=%s QMT单号=%s",
+                        signal.label, (submitted_at - exec_started) * 1000,
+                        signal.signal_id, order_id,
                     )
             except BrokerOrderRejected as exc:
                 # 同步 order_stock 明确返回失败，没有有效订单号，不写伪造 attempt。
@@ -1354,7 +1362,10 @@ class OrderExecutionEngine:
         ):
             return quote
         now = _current_datetime()
-        if self._auction_quote_within_opening_grace(quote, now):
+        if (
+            self._auction_quote_within_opening_grace(quote, now)
+            and not (signal.action == Action.BUY and self.config.pricing_mode == "book")
+        ):
             return quote
         retry_max = (
             _QUOTE_STALE_RETRY_OPENING_MAX
@@ -1364,6 +1375,12 @@ class OrderExecutionEngine:
             else _QUOTE_STALE_RETRY_MAX
         )
         for attempt in range(1, retry_max + 1):
+            if quote.quote_time is None:
+                logger.warning(
+                    "%s | %s | 重取行情缺少源时间 | 不判定为新鲜盘口",
+                    signal.console_event("重试"), signal.display_code,
+                )
+                return quote
             age = (_current_datetime() - quote.quote_time).total_seconds()
             if age <= max_age:
                 if attempt > 1:
@@ -1483,7 +1500,7 @@ class OrderExecutionEngine:
             quote = self._latest_quote_with_retry(signal)
             return shares_for_budget(
                 budget=self._per_stock_budget(signal),
-                price=quote.last_price,
+                price=self._budget_unit_price(quote.last_price),
                 fee_buffer_pct=self.config.cash_fee_buffer_pct,
             )
         if signal.quantity_mode == "fixed_budget":
@@ -1493,10 +1510,28 @@ class OrderExecutionEngine:
             # 协调器分配预算时已扣除策略 YAML 的现金预留；此处不重复扣费。
             return shares_for_budget(
                 budget=signal.budget_amount,
-                price=quote.last_price,
+                price=self._budget_unit_price(quote.last_price),
                 fee_buffer_pct=0.0,
             )
         raise ValueError(f"invalid quantity_mode: {signal.quantity_mode}")
+
+    def _budget_unit_price(self, quote_price: float) -> float:
+        """预算折算股数的单价口径, 与定价模块的报价包络保持一致。
+
+        买单实际按 最新价×(1+quote_band_pct) 挂出(竞价排队报价与 slippage
+        模式皆然), 若仍按最新价折算股数, 报单前资金复核会削掉一手并打
+        "资金不足"告警(2026-09-08 金健米业复盘); 这里按同一报价口径折算,
+        让预算一步到位。book 模式(盘口锚定)不适用包络, 维持最新价口径。
+        """
+        if (
+            self.config.quote_band_pct > 0
+            and (
+                self.config.pricing_mode == "slippage"
+                or _seconds_until_market_open(self.machine_schedule) > 0
+            )
+        ):
+            return quote_price * (1 + self.config.quote_band_pct)
+        return quote_price
 
     def _signal_expiry_status(
         self, signal: TradeSignal
@@ -1671,8 +1706,9 @@ class OrderExecutionEngine:
         回来)。旧行为不区分一律撤单追价, (b) 场景会亲手撤掉一张健康的排队单。
         这里以 opening_price_gap_wait_poll_sec 为节奏(默认 0.2s, 开盘分秒必争;
         1.0 = 旧行为)用新鲜行情重判:
-        - 最新价甩开挂单价超过阈值 → 立即结束等待, 交给上层走撤单追价;
-        - 最新价偏离 ≤ opening_price_gap_wait_pct → 继续等, 等满
+        - book 使用本帧新鲜卖一, 其他模式使用非竞价旧帧的最新价;
+        - 参考价甩开挂单价超过阈值 → 立即结束等待, 交给上层走撤单确认;
+        - 参考价偏离 ≤ opening_price_gap_wait_pct → 继续等, 等满
           opening_price_gap_wait_max_sec(再受总预算 budget_room 约束)为止;
         - 行情仍停在竞价旧快照(开盘宽限内的冻结时间戳) → 不下价格结论
           (旧价盲判曾让死单白等 6 秒), 并触发一次幽灵单三重校验;
@@ -1716,24 +1752,31 @@ class OrderExecutionEngine:
             )
             gap: float | None = None
             if quote is not None:
-                gap = (quote.last_price - order_price) / order_price
-                if not stale_auction:
+                if self.config.pricing_mode == "book":
+                    ask = _fresh_continuous_ask(
+                        quote, self.config, self.machine_schedule, _current_datetime(),
+                    )
+                    if ask is not None:
+                        gap = (ask - order_price) / order_price
+                elif not stale_auction:
+                    gap = (quote.last_price - order_price) / order_price
+                if gap is not None:
                     if gap > self.config.opening_price_gap_wait_pct:
                         logger.info(
-                            "%s | %s | 价格已甩开挂单价 %.2f%% > %.2f%%, 停止等待, 撤单追价",
+                            "%s | %s | 买入参考价已甩开挂单价 %.2f%% > %.2f%%, 停止等待, 交撤单确认",
                             event_label, code_label, gap * 100,
                             self.config.opening_price_gap_wait_pct * 100,
                         )
                         break
                     logger.debug(
-                        "%s | %s | 价格仍贴近挂单价(偏离 %.2f%% ≤ %.2f%%) | 剩余 %.1fs",
+                        "%s | %s | 买入参考价仍贴近挂单价(偏离 %.2f%% ≤ %.2f%%) | 剩余 %.1fs",
                         event_label, code_label, gap * 100,
                         self.config.opening_price_gap_wait_pct * 100,
                         wait_budget - waited,
                     )
                 else:
                     logger.debug(
-                        "%s | %s | 行情仍停在竞价旧快照, 本轮不下价格结论 | 剩余 %.1fs",
+                        "%s | %s | 盘口或同帧时效不可靠, 本轮不下价格结论 | 剩余 %.1fs",
                         event_label, code_label, wait_budget - waited,
                     )
             # 死单/旧价即时诊断(每窗口至多一次): 价格站在成交侧却零成交,
@@ -1742,8 +1785,7 @@ class OrderExecutionEngine:
             if (
                 not ghost_checked
                 and snapshot.filled_qty <= 0
-                and gap is not None
-                and (stale_auction or gap < 0)
+                and (stale_auction or (gap is not None and gap < 0))
             ):
                 ghost_checked = True
                 verdict, detail, _visible = self._diagnose_ghost_order(
@@ -2125,6 +2167,7 @@ class OrderExecutionEngine:
                     0.0, _seconds_until_queue_buy_cancel(queue_cancel_at),
                 )
                 snapshot: OrderSnapshot | None = None
+                recorded_filled = 0
                 try:
                     snapshot = self.broker.get_order_snapshot(current_order_id)
                     while (
@@ -2132,6 +2175,17 @@ class OrderExecutionEngine:
                         and time.monotonic() < deadline
                         and not self._stop_requested()
                     ):
+                        # 部分成交会减少冻结资金；及时保存进度供补仓核对，仍保留排队状态。
+                        # 只采信有效且递增的累计量，重复/回退回报不触发写库。
+                        if (
+                            snapshot.status in (BrokerOrderStatus.OPEN, BrokerOrderStatus.PARTIALLY_FILLED)
+                            and recorded_filled < snapshot.filled_qty <= current_qty
+                        ):
+                            self.store.update_attempt(
+                                current_order_id, ExecutionStatus.QUEUED_LIMIT_UP.value,
+                                snapshot.filled_qty,
+                            )
+                            recorded_filled = snapshot.filled_qty
                         interval = _QUEUE_BUY_POLL_INTERVAL_SEC
                         if interval > 0:
                             time.sleep(

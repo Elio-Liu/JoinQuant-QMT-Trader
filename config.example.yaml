@@ -126,7 +126,7 @@ execution:
   # 高开奔涨停的票要把阈值设小（1.5% 报价包络下挂单价离涨停仅 ~2%，0.01 合适）；
   # 等待上限 + 开盘超时 + 一次追单预算需 < max_total_duration_sec。任一值为 0 = 关闭。
   opening_price_gap_wait_pct: 0.01
-  opening_price_gap_wait_max_sec: 6
+  opening_price_gap_wait_max_sec: 8
   # 价格感知等待的行情重判节奏（秒）：等待循环每轮取行情下判断的间隔。
   # 默认 0.2（每秒 5 判，价格甩开最多 0.2s 反应）；1.0 = 旧行为每秒一轮。
   opening_price_gap_wait_poll_sec: 0.2

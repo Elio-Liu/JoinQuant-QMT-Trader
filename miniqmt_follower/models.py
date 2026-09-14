@@ -306,8 +306,8 @@ class Quote:
     bid1: float | None = None
     high_limit: float | None = None
     low_limit: float | None = None
-    # 行情快照时间(本地时间): 最后一笔成交时间与最近一帧行情推送到达时间的
-    # 较新者; None 表示行情源未提供, 时效门控自动跳过。
+    # 本次 tick 的源时间(本地时间), 不使用另一帧推送的到达时间替换。
+    # None 表示该帧没有可识别时间, 不具备新鲜盘口定价资格。
     quote_time: dt.datetime | None = None
 
 

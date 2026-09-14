@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from decimal import ROUND_HALF_UP, Decimal
 
 from miniqmt_follower.config import MachineScheduleConfig
@@ -93,6 +94,46 @@ def _round_to_tick_half_up(value: float, tick: float) -> float:
     return float(tick_units * tick_decimal)
 
 
+def _fresh_continuous_ask(
+    quote: Quote,
+    config: ExecutionConfig,
+    machine_schedule: MachineScheduleConfig,
+    now: dt.datetime,
+) -> float | None:
+    """返回源时间属于当日开盘后、未超龄且有效的卖一。"""
+    stamp = quote.quote_time
+    if stamp is None or config.quote_max_age_sec <= 0:
+        return None
+    session = machine_schedule.market_session
+    opening = now.replace(
+        hour=session.continuous_trading_start_at.hour,
+        minute=session.continuous_trading_start_at.minute,
+        second=session.continuous_trading_start_at.second,
+        microsecond=0,
+    )
+    if now < opening or stamp < opening:
+        return None
+    if not 0 <= (now - stamp).total_seconds() <= config.quote_max_age_sec:
+        return None
+    ask = quote.ask1
+    if ask is None or not math.isfinite(ask) or ask <= 0:
+        return None
+    bid = quote.bid1
+    if bid is not None and (not math.isfinite(bid) or bid <= 0 or bid > ask):
+        return None
+    if quote.low_limit is not None and (
+        not math.isfinite(quote.low_limit) or quote.low_limit <= 0
+        or ask < quote.low_limit
+    ):
+        return None
+    if quote.high_limit is not None and (
+        not math.isfinite(quote.high_limit) or quote.high_limit <= 0
+        or ask > quote.high_limit
+    ):
+        return None
+    return ask
+
+
 def calculate_order_price(
     signal: TradeSignal,
     quote: Quote,
@@ -122,6 +163,16 @@ def calculate_order_price(
     if prefer_book:
         # 价格拒单后的重挂: 盘口锚定报价, 不再走竞价/开盘的百分比激进报价。
         order_price, mode_label = _book_anchor_price(signal.action, quote, tick)
+    elif (
+        signal.action == Action.BUY
+        and config.pricing_mode == "book"
+        and not _in_call_auction(machine_schedule)
+        and _fresh_continuous_ask(
+            quote, config, machine_schedule, dt.datetime.now(),
+        ) is not None
+    ):
+        # 开盘后已有可靠盘口时, 不再让最新成交价的百分比覆盖卖一定价。
+        order_price, mode_label = _price_by_mode(signal.action, quote, config, tick)
     else:
         auction_price = _auction_queue_price(
             signal.action, quote, config, tick, machine_schedule

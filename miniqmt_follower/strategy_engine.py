@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import threading
 import time
 from concurrent.futures import Future
@@ -48,6 +49,7 @@ from miniqmt_follower.strategy_rules import (
     decide_opening_exit,
     decide_trailing_exit,
     filter_deployable_topup_budgets,
+    yesterday_sealed_limit_up,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,23 @@ _OPENING_SNAPSHOT_GRACE_SEC = 60
 # 收盘休眠后的盘前唤醒时刻: 引擎睡到次日该时刻醒来, 随后直接睡到当日第一个
 # 调度边界(盘前挂单窗口起点), 不空转。候选计划的即时挂单走消费线程, 与此无关。
 _PREOPEN_WAKEUP_TIME = dt.time(9, 0)
+# 涨停豁免盘前预热时刻 (2026-09-08 复盘): 提前把隔夜可卖仓的前两日收盘取回
+# 并预判昨日封板, 把本地日线补下载这类阻塞操作挪出 09:25 决策热路径
+# (决策锁内); 数据落在行情适配器当日缓存, 09:25:05 判定直接命中。
+# 预热失败/错过(重启晚于该时刻)不改变 fail-closed 惰性兜底, 只影响时序。
+_OPENING_EXEMPT_WARM_AT = dt.time(9, 20)
+# 2026-09-09 双机复盘:
+# ① 预热由"一天一次"改为逐票持续预热(09:20 至 opening_exit.retry_until 内
+#    每个 tick 对未覆盖的隔夜可卖仓重试), 账户快照迟到/漏票不再让某只票
+#    永久失去豁免数据 —— 当日楚天龙的止损被 296s 的日线补下载卡在决策锁里。
+# ② 日线惰性取数只给 2s 预算: 拿不到立即 fail-closed 卖出, 后台线程继续补,
+#    阻塞不再回到 09:25 热路径。预热循环用 0.5s 小预算, 不拖 tick。
+_DAILY_CLOSE_LAZY_WAIT_SEC = 2.0
+_DAILY_CLOSE_WARM_WAIT_SEC = 0.5
+# 数据类日志限流: 同一 (code, 原因) 的"行情超龄"等 BLOCK 日志 30s 内只报一次。
+_DATA_BLOCK_LOG_INTERVAL_SEC = 30.0
+# 调度周期异常日志限流: 同一异常 30s 内只打一次完整堆栈, 其余降为 debug。
+_CYCLE_ERROR_LOG_INTERVAL_SEC = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -227,11 +246,22 @@ class LocalStrategyEngine:
         self._startup_recovery_complete = False
         self._last_hard_stop_check: dt.datetime | None = None
         self._last_trailing_check: dt.datetime | None = None
-        # 两波开盘买入状态: 第一波(盘前挂单)的可用资金基线, 第二波起连续补仓
-        # 用"当前可用资金 − 基线"识别卖款回笼; 基线随第一波接纳落库
-        # (strategy_state), 重启后可重建并续跑补仓波次。
-        self._wave1_cash_baseline: float | None = None
-        self._baseline_state_loaded = False
+        # 涨停豁免盘前预热状态(2026-09-09 复盘): 按自然日 + 逐票去重。预热
+        # 改为持续重试, 直到所有隔夜可卖仓都拿到前两日收盘为止 —— 账户快照
+        # 迟到/漏票不再让某只票永久失去豁免数据(当日楚天龙 296s 阻塞复盘)。
+        self._opening_exempt_warmed_day: str = ""
+        self._opening_exempt_warmed_codes: set[str] = set()
+        self._opening_exempt_warm_done_logged = False
+        self._opening_exempt_missing_warned = False
+        # 补仓波间最小间隔的逐票最近提交时刻(按引擎时钟, 自然日翻转清空)。
+        self._topup_last_submit: dict[str, dt.datetime] = {}
+        self._topup_last_submit_day: str = ""
+        # 候选数量闸门: 当日已打过闸门拦截日志的自然日(按日只打一次)。
+        self._min_candidates_gate_logged_day: str = ""
+        # 数据 BLOCK 日志限流账本 (key=(code, issue) → 上次打日志的 monotonic 时刻)。
+        self._data_block_last_log: dict[tuple[str, str], float] = {}
+        # 调度周期异常日志限流账本 (key=异常指纹 → 上次打堆栈的 monotonic 时刻)。
+        self._cycle_error_last_log: dict[str, float] = {}
         self._account_snapshot_ttl_sec = account_snapshot_ttl_sec
         self._account_cache: tuple[float, object] | None = None
 
@@ -257,17 +287,35 @@ class LocalStrategyEngine:
         self._thread = None
 
     def _run(self) -> None:
-        """调度主循环：逐周期 tick，任一周期的未捕获异常重置恢复标记以便下周期重扫。"""
+        """调度主循环：逐周期 tick，任一周期的未捕获异常重置恢复标记以便下周期重扫。
+
+        2026-09-09 复盘: QMT 断连时(当日 13:39)每个周期抛同一异常, 旧行为每秒
+        刷一条完整堆栈; 现在同一异常 30s 内只打一次堆栈, 其余降为 debug,
+        不再刷屏淹没真正的新异常。
+        """
         while not self._stop.is_set() and not (
             self._external_stop is not None and self._external_stop.is_set()
         ):
             try:
                 self.tick(self._clock())
-            except Exception:
+            except Exception as exc:
                 self._startup_recovery_complete = False
-                logger.exception("【策略】❌ 调度周期异常")
+                self._log_cycle_error(exc)
             now = self._clock()
             self._stop.wait(self._scheduler_delay(now))
+
+    def _log_cycle_error(self, exc: Exception) -> None:
+        """限流记录调度周期异常: 同指纹 30s 内一次堆栈, 其余 debug。"""
+        fingerprint = f"{type(exc).__name__}:{exc}"
+        now_mono = time.monotonic()
+        last = self._cycle_error_last_log.get(fingerprint, 0.0)
+        if now_mono - last >= _CYCLE_ERROR_LOG_INTERVAL_SEC:
+            if len(self._cycle_error_last_log) > 100:
+                self._cycle_error_last_log.clear()
+            self._cycle_error_last_log[fingerprint] = now_mono
+            logger.exception("【策略】❌ 调度周期异常", exc_info=exc)
+        else:
+            logger.debug("【策略】⚠️ 调度周期持续异常(限流) | %s", fingerprint)
 
     def _scheduler_delay(self, now: dt.datetime) -> float:
         """计算到下一调度边界的最小睡眠时长；活跃窗口内用短周期避免错过规则触发点。"""
@@ -305,6 +353,7 @@ class LocalStrategyEngine:
         )
         boundaries = {
             _PREOPEN_WAKEUP_TIME,
+            _OPENING_EXEMPT_WARM_AT,
             schedule.candidate_plan.accept_until,
             schedule.opening_exit.trigger_at,
             schedule.opening_exit.retry_until,
@@ -401,10 +450,12 @@ class LocalStrategyEngine:
         # 收到候选计划立即盘前挂单(不等 tick 调度): 竞价价已定, 早挂只赚
         # 队列位置, 开盘价撮合不受挂单时刻影响。数据未就绪(如竞价价尚未
         # 形成)由行情门控 BLOCK, tick 路径在盘前窗口内按既有重试语义补挂。
+        # 候选数量闸门优先: 当日候选不足阈值时不开仓, 盘前挂单一并跳过。
         if (
             persisted == CandidatePlanStatus.READY
             and self.config.opening_buy.enabled
             and now.time() < self.config.schedule.opening_buy.start_at
+            and not self._min_candidates_blocked(plan, now)
         ):
             with self._decision_lock:
                 self._run_opening_buy_wave1(
@@ -445,7 +496,18 @@ class LocalStrategyEngine:
             if day.status in {StrategyDayStatus.HALTED, StrategyDayStatus.CLOSED}:
                 return
             self._finalize_missed_deadlines(now)
+            # 盘前豁免预热: 09:20 起对隔夜可卖仓取前两日收盘并预判昨日封板。
+            # 放在活跃窗口门控之前 —— 09:20 时开盘退出窗口(09:25:05)尚未开始,
+            # 预热必须在门控 return 之前跑, 否则永远等不到执行时机。
+            # 2026-09-09 复盘: 由"一天一次"改为逐票持续重试(直到 retry_until),
+            # 账户快照迟到/漏票的隔夜仓也能在后续 tick 补上预热。
             schedule = self.config.schedule
+            if (
+                self.config.opening_exit.low_open_exit.sealed_exempt.enabled
+                and _OPENING_EXEMPT_WARM_AT <= now.time()
+                and now.time() < schedule.opening_exit.retry_until
+            ):
+                self._warm_opening_exempt_data(now)
             active_start = min(
                 schedule.opening_exit.trigger_at,
                 schedule.opening_buy.preopen_start_at,
@@ -619,9 +681,148 @@ class LocalStrategyEngine:
             return None
         return stored.plan
 
+    def _min_candidates_blocked(self, plan, now: dt.datetime) -> bool:
+        """候选数量闸门: 当日候选数 < 阈值 → 当日不开仓, 返回 True。
+
+        只拦开盘买入(wave-1/整批/回款补仓全部买入路径), 硬止损/开盘退出/
+        早盘/尾盘等卖出规则照常; 命中按日只打一次日志。与聚宽侧
+        g.min_target_count 同规则, 交易机侧作为独立保险层(阈值可各机不同)。
+        """
+        cfg = self.config.min_candidates_gate
+        if not cfg.enabled or not plan or len(plan.candidates) >= cfg.min_candidates:
+            return False
+        today = now.date().isoformat()
+        if self._min_candidates_gate_logged_day != today:
+            self._min_candidates_gate_logged_day = today
+            logger.warning(
+                "【策略】🛑 候选数量闸门 | 当日候选 %d 只 < 阈值 %d | "
+                "当日不开仓(仅拦买入, 卖出规则照常) | %s",
+                len(plan.candidates),
+                cfg.min_candidates,
+                ", ".join(plan.candidates) or "<空>",
+            )
+        return True
+
     # ---------------------------------------------------------------------------
     # 规则执行
     # ---------------------------------------------------------------------------
+
+    def _warm_opening_exempt_data(self, now: dt.datetime) -> None:
+        """盘前预热涨停豁免数据: 逐票持续重试, 直到所有隔夜可卖仓覆盖。
+
+        2026-09-09 复盘前的旧行为一天只跑一次: 09:20 账户快照漏掉的隔夜仓
+        (当日楚天龙)永远不会被预热, 09:25:05 决策时惰性补下载把决策锁卡了
+        296 秒。现在:
+        - 按 (自然日, 代码) 去重, 每个 tick 只处理尚未覆盖的隔夜可卖仓;
+        - 每票只给 0.5s 取数预算(行情适配器后台线程继续补, 下 tick 再查),
+          预热循环不阻塞决策;
+        - 全部覆盖打"预热完成"; 到开盘退出触发点仍未覆盖的票打一次告警,
+          由 09:25 惰性 fail-closed 兜底接管。
+        """
+        fetcher = getattr(self.market_data, "previous_two_daily_closes", None)
+        if fetcher is None:
+            return
+        today = now.date().isoformat()
+        if self._opening_exempt_warmed_day != today:
+            self._opening_exempt_warmed_day = today
+            self._opening_exempt_warmed_codes.clear()
+            self._opening_exempt_warm_done_logged = False
+            self._opening_exempt_missing_warned = False
+        try:
+            account = self._account_snapshot_cached()
+        except Exception as exc:
+            logger.warning("【策略】⚠️ 盘前豁免预热 | 账户快照查询失败 | %s", exc)
+            return
+        tolerance = self.config.limit_detection.tolerance_pct
+        overnight = [
+            position.code
+            for position in account.positions
+            if position.available_qty > 0
+        ]
+        for code in overnight:
+            if code in self._opening_exempt_warmed_codes:
+                continue
+            try:
+                closes = fetcher(code, wait_sec=_DAILY_CLOSE_WARM_WAIT_SEC)
+            except Exception as exc:
+                self._throttled_warning(
+                    ("warm", code),
+                    "【策略】⚠️ 盘前豁免预热失败 | %s | %s | 下 tick 重试",
+                    code, exc,
+                )
+                continue
+            t1, t2 = closes[0], closes[1]
+            if t1 is None or t2 is None:
+                # 取数未在预算内完成(后台继续): 下 tick 再查。
+                continue
+            self._opening_exempt_warmed_codes.add(code)
+            sealed = yesterday_sealed_limit_up(t1, t2, tolerance)
+            logger.info(
+                "【策略】📅 盘前豁免预热 | %s | T-1=%s T-2=%s | 昨日封板=%s",
+                code,
+                f"{t1:.2f}" if t1 else "缺",
+                f"{t2:.2f}" if t2 else "缺",
+                "是" if sealed else ("否" if sealed is False else "数据缺失"),
+            )
+        missing = [
+            code for code in overnight if code not in self._opening_exempt_warmed_codes
+        ]
+        if not missing:
+            if not self._opening_exempt_warm_done_logged:
+                self._opening_exempt_warm_done_logged = True
+                logger.info(
+                    "【策略】📅 盘前豁免预热完成 | 隔夜可卖 %s 只",
+                    len(self._opening_exempt_warmed_codes),
+                )
+        elif (
+            now.time() >= self.config.schedule.opening_exit.trigger_at
+            and not self._opening_exempt_missing_warned
+        ):
+            self._opening_exempt_missing_warned = True
+            logger.warning(
+                "【策略】⚠️ 盘前豁免预热未覆盖 %d 只 | %s | "
+                "由 09:25 惰性 fail-closed 兜底接管",
+                len(missing), ", ".join(sorted(missing)),
+            )
+
+    def _throttled_warning(self, key, message: str, *args) -> None:
+        """按 key 限流的告警: 同 key 30s 内只打一条(2026-09-09 复盘, 防刷屏)。"""
+        now_mono = time.monotonic()
+        last = self._data_block_last_log.get(key, 0.0)
+        if now_mono - last < _DATA_BLOCK_LOG_INTERVAL_SEC:
+            return
+        if len(self._data_block_last_log) > 200:
+            self._data_block_last_log.clear()
+        self._data_block_last_log[key] = now_mono
+        logger.warning(message, *args)
+
+    def _throttled_error(self, key, message: str, *args) -> None:
+        """同 _throttled_warning, 但按 ERROR 级别输出首条。"""
+        now_mono = time.monotonic()
+        last = self._data_block_last_log.get(key, 0.0)
+        if now_mono - last < _DATA_BLOCK_LOG_INTERVAL_SEC:
+            return
+        if len(self._data_block_last_log) > 200:
+            self._data_block_last_log.clear()
+        self._data_block_last_log[key] = now_mono
+        logger.error(message, *args)
+
+    def _strategy_snapshot_safe(self, code: str):
+        """取策略快照, 行情源异常(QMT 断连/无 tick)时不抛, 返回 None。
+
+        2026-09-09 复盘: QMT 断连时旧行为从 _run_hard_stops 直接抛异常,
+        整个调度周期报废且每秒刷一条堆栈; 现在单票取数失败只限流告警并
+        跳过该票, 不影响同周期其他票的决策。
+        """
+        try:
+            return self.market_data.latest_strategy_snapshot(code)
+        except Exception as exc:
+            self._throttled_warning(
+                ("snapshot", code),
+                "【策略】⚠️ %s | 行情取数失败, 本轮跳过该票 | %s",
+                code, exc,
+            )
+            return None
 
     def _run_opening_exits(self, now: dt.datetime, positions) -> None:
         cfg = self.config.opening_exit
@@ -633,12 +834,41 @@ class LocalStrategyEngine:
         for position in positions:
             if self._event_exists(now.date(), "opening_exit", position.code):
                 continue
-            market = self.market_data.latest_strategy_snapshot(position.code)
+            market = self._strategy_snapshot_safe(position.code)
+            if market is None:
+                continue
             market = self._snapshot_for_decision(market, now)
+            # 涨停豁免数据源: 前日收盘 (T-2) 判定"昨日是否封板"。行情源不提供
+            # 日线查询或查询失败时传 None, 规则退化为普通低开卖出 (fail-closed)。
+            # T+1 新仓(可卖=0)规则必然返回 None, 不查日线 —— 隔夜可卖仓的
+            # 数据通常已被 09:20 盘前预热缓存, 这里只是惰性兜底。
+            prev_prev_close = None
+            if (
+                cfg.low_open_exit.sealed_exempt.enabled
+                and position.available_qty > 0
+            ):
+                fetcher = getattr(
+                    self.market_data, "previous_two_daily_closes", None
+                )
+                if fetcher is not None:
+                    try:
+                        prev_prev_close = fetcher(
+                            position.code, wait_sec=_DAILY_CLOSE_LAZY_WAIT_SEC
+                        )[1]
+                    except Exception:
+                        prev_prev_close = None
+                if prev_prev_close is None:
+                    # 降级必须显式可见: 旧版此路径完全静默, 豁免失效无从排查。
+                    logger.warning(
+                        "【策略】⚠️ %s | 涨停豁免数据缺失, 退化为普通低开卖出 "
+                        "(fail-closed)",
+                        position.code,
+                    )
             decision = decide_opening_exit(
                 position, market, cfg.low_open_exit, self.config.limit_detection,
                 self.config.data_safety, now=now,
                 limit_down_enabled=cfg.limit_down_exit.enabled,
+                prev_prev_close=prev_prev_close,
             )
             if decision is None and now.time() < (
                 self.machine_schedule.market_session.continuous_trading_start_at
@@ -676,8 +906,8 @@ class LocalStrategyEngine:
         """两波开盘买入调度:
         - 盘前窗口 [preopen_start_at, start_at): 第一波整批接纳, 盘前挂单排队,
           9:30:00 开盘价撮合(不等卖单屏障, 资金=盘前可用资金);
-        - 开盘后 [start_at, admit_until): 卖单终态且卖款回笼后一次性补仓;
-          第一波未发生(重启/旧配置)时退回原整批接纳路径。
+        - 开盘后 [start_at, admit_until): 核对在途与资金后分波补仓；
+          当日无首波事件时走原整批接纳路径。
         """
         cfg = self.config.opening_buy
         schedule = self.config.schedule.opening_buy
@@ -686,12 +916,17 @@ class LocalStrategyEngine:
         plan = self._candidate_for_day(now.date())
         if plan is None or not plan.candidates:
             return
+        # 候选数量闸门: 当日候选不足阈值时不开仓, 全部买入路径
+        # (wave-1 重试/整批接纳/回款补仓) 一并跳过; 卖出规则不受影响。
+        if self._min_candidates_blocked(plan, now):
+            return
         if schedule.preopen_start_at <= now.time() < schedule.start_at:
             self._run_opening_buy_wave1(now, plan, account, cfg, schedule)
         elif schedule.start_at <= now.time() < schedule.admit_until:
-            if self._topup_cash_baseline(now.date()) is None:
-                # 第一波未发生且无落库基线(重启/旧行为): 退回原整批接纳,
-                # 语义与旧版一致; 该路径会把接纳时资金落为基线继续补仓。
+            if not any(
+                self._event_exists(now.date(), "opening_buy", code)
+                for code in plan.candidates
+            ):
                 self._run_opening_buy_batch(
                     now, plan, account, cfg, schedule, preopen=False,
                 )
@@ -700,22 +935,27 @@ class LocalStrategyEngine:
 
     def _run_opening_buy_wave1(self, now, plan, account, cfg, schedule) -> None:
         """盘前第一波: 用盘前资金整批接纳并挂单排队, 不等卖单屏障。"""
-        if all(
+        if any(
             self._event_exists(now.date(), "opening_buy", code)
             for code in plan.candidates
         ):
             return
-        admitted, _baseline = self._admit_opening_buy_batch(
+        # 底线先于事件落库；孤立底线说明上次接纳未完成，必须重新查询现金。
+        if self.store.get_strategy_state(
+            self.config.strategy_id, now.date(), "opening_buy_cash_floor_v2",
+        ) is not None:
+            account = self.broker.query_account_snapshot()
+        admitted, _ = self._admit_opening_buy_batch(
             now, plan, account, cfg, cutoff_until=schedule.start_at,
         )
         if not admitted:
             return
-        self._wave1_cash_baseline = account.available_cash
+        cash_floor = account.available_cash - sum(budget for _, budget, _ in admitted)
+        if not math.isfinite(cash_floor) or cash_floor < -0.000001:
+            raise ValueError("opening buy cash floor is invalid")
         self.store.set_strategy_state(
-            self.config.strategy_id,
-            now.date(),
-            "wave1_cash_baseline",
-            f"{account.available_cash:.6f}",
+            self.config.strategy_id, now.date(), "opening_buy_cash_floor_v2",
+            f"{max(0.0, cash_floor):.6f}",
         )
         self._submit_opening_buy_batch(
             now, admitted, rule_name="opening_buy", preopen=True,
@@ -725,25 +965,29 @@ class LocalStrategyEngine:
         self, now, plan, account, cfg, schedule, *, preopen: bool
     ) -> None:
         """原整批接纳路径(等卖单屏障, 开盘后快照资金), 供第一波未发生时的回退。"""
-        if all(
+        if any(
             self._event_exists(now.date(), "opening_buy", code)
             for code in plan.candidates
         ):
             return
         if cfg.wait_for_opening_sells and self.opening_barrier.pending_count():
             return
-        admitted, _baseline = self._admit_opening_buy_batch(
+        # 底线先于事件落库；孤立底线说明上次接纳未完成，必须重新查询现金。
+        if self.store.get_strategy_state(
+            self.config.strategy_id, now.date(), "opening_buy_cash_floor_v2",
+        ) is not None:
+            account = self.broker.query_account_snapshot()
+        admitted, _ = self._admit_opening_buy_batch(
             now, plan, account, cfg, cutoff_until=schedule.admit_until,
         )
         if not admitted:
             return
-        # 回退整批接纳同样落基线: 后续窗口内的卖款回笼按此基线识别并续补。
-        self._wave1_cash_baseline = account.available_cash
+        cash_floor = account.available_cash - sum(budget for _, budget, _ in admitted)
+        if not math.isfinite(cash_floor) or cash_floor < -0.000001:
+            raise ValueError("opening buy cash floor is invalid")
         self.store.set_strategy_state(
-            self.config.strategy_id,
-            now.date(),
-            "wave1_cash_baseline",
-            f"{account.available_cash:.6f}",
+            self.config.strategy_id, now.date(), "opening_buy_cash_floor_v2",
+            f"{max(0.0, cash_floor):.6f}",
         )
         self._submit_opening_buy_batch(
             now, admitted, rule_name="opening_buy", preopen=preopen,
@@ -761,7 +1005,9 @@ class LocalStrategyEngine:
         for code, budget in budgets.items():
             if self._event_exists(now.date(), "opening_buy", code):
                 continue
-            market = self.market_data.latest_strategy_snapshot(code)
+            market = self._strategy_snapshot_safe(code)
+            if market is None:
+                return [], False
             issue = self._buy_market_issue(market, now)
             if issue is not None:
                 logger.error("【策略】⛔ 买入批次未接纳 | %s | %s", code, issue)
@@ -822,49 +1068,70 @@ class LocalStrategyEngine:
         for signal, event in submissions:
             self._submit(signal, event)
 
-    def _wave1_terminal_or_absent(self, now: dt.datetime, code: str) -> bool:
-        """第一波信号不存在或已终态 → 允许补仓; 在途时跳过防双计数。"""
-        wave1_id = make_local_buy_signal(
-            strategy_id=self.config.strategy_id,
-            trading_date=now.date(),
-            code=code,
-            budget=0.0,
-            reference_price=0.0,
-            created_at=now,
-        ).signal_id
-        stored = self.store.get_signal_optional(wave1_id)
-        if stored is None:
-            return True
-        return is_terminal_execution_status(stored.status)
-
     def _topup_cash_baseline(self, trading_date: dt.date) -> float | None:
-        """补仓基线: 内存优先, 缺失时从落库的 strategy_state 重建(重启续跑)。"""
-        if self._wave1_cash_baseline is not None:
-            return self._wave1_cash_baseline
-        if not self._baseline_state_loaded:
-            self._baseline_state_loaded = True
-            raw = self.store.get_strategy_state(
-                self.config.strategy_id, trading_date, "wave1_cash_baseline"
-            )
-            if raw is not None:
-                try:
-                    self._wave1_cash_baseline = float(raw)
-                except ValueError:
-                    logger.warning(
-                        "【策略】⛔ 补仓基线落库值非法, 当日跳过补仓 | %s", raw
+        """仅读取当日 v2 保留底线；旧基线不能转换为可复用预算。"""
+        raw = self.store.get_strategy_state(
+            self.config.strategy_id, trading_date, "opening_buy_cash_floor_v2",
+        )
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError("opening buy cash floor is invalid") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("opening buy cash floor is invalid")
+        return value
+
+    def _topup_buy_occupancy(self, trading_date):
+        """核对所有已接纳买单，返回排队占用和用于新快照后复核的账本。"""
+        excluded = set()
+        principal = 0.0
+        ledger = []
+        for event in self.store.list_strategy_events(self.config.strategy_id, trading_date):
+            if event.decision != "fixed_budget":
+                continue
+            stored = self.store.get_signal_optional(event.signal_id) if event.signal_id else None
+            if stored is None:
+                if event.status == StrategyEventStatus.MISSED_DEADLINE:
+                    continue
+                if event.status not in (StrategyEventStatus.TRIGGERED, StrategyEventStatus.SUBMITTED):
+                    self._throttled_error(
+                        ("topup_ledger", event.code),
+                        "【策略】⛔ 补仓暂停 | %s | 已终结买入事件缺少信号账本", event.code,
                     )
-        return self._wave1_cash_baseline
+                return None
+            if is_terminal_execution_status(stored.status):
+                ledger.append((stored, ()))
+                continue
+            if stored.status != ExecutionStatus.QUEUED_LIMIT_UP:
+                return None
+            attempts = self.store.list_attempts(event.signal_id)
+            attempt = attempts[-1] if attempts else None
+            if (
+                attempt is None or not str(attempt.broker_order_id).isdigit()
+                or int(attempt.broker_order_id) <= 0 or attempt.attempt_no <= 0
+                or attempt.quantity <= 0 or not 0 <= attempt.filled_qty <= attempt.quantity
+                or not math.isfinite(attempt.price) or attempt.price <= 0
+                or attempt.status != ExecutionStatus.QUEUED_LIMIT_UP.value
+                or any(previous.status not in {"filled", "canceled", "rejected"}
+                       for previous in attempts[:-1])
+            ):
+                self._throttled_error(
+                    ("topup_attempt", event.code),
+                    "【策略】⛔ 补仓暂停 | %s | 排队买单委托账本不完整", event.code,
+                )
+                return None
+            excluded.add(event.code)
+            principal += max(attempt.quantity - attempt.filled_qty, 0) * attempt.price
+            ledger.append((stored, attempts))
+        return excluded, principal, ledger
 
     def _run_opening_buy_topup(self, now, plan, account, cfg, schedule) -> None:
-        """第二波起连续补仓: 窗口内每 tick 检查卖款回笼池, 池子够一手就发一波。
+        """核对全部在途买单，再用新现金快照将首波余款、退款和卖款分波补仓。
 
-        与旧版一次性补仓的区别(2026-08-31 复盘):
-        - 补仓池 = 当前可用资金 − 第一波基线, 每 tick 重算 —— 卖出回款到账
-          即补, 不再只认"卖单屏障清空"那一刻(失败的卖单终态也会清空屏障,
-          其回款可能迟到数十秒, 旧版会永久漏掉);
-        - 多波次: 买单提交即冻结资金、池自然归零, 下一笔回款再起下一波,
-          直到 admit_until 收口; 波次编号从落库信号数重建, 幂等且重启可续跑;
-        - 单波内预算低于一手的候选留池累积, 下一 tick 与新增回款合并再分配。
+        保留现金底线、总仓位和单票上限、波间隔、最小手数与接纳截止时间。
+        普通买单在途时等待；已验证的涨停排队单排除该代码并计入总仓位。
         """
         if not cfg.topup_enabled:
             return
@@ -872,24 +1139,47 @@ class LocalStrategyEngine:
             return
         baseline = self._topup_cash_baseline(now.date())
         if baseline is None:
+            self._throttled_error(
+                ("topup_floor", str(now.date())),
+                "【策略】⛔ 当日停止新增补仓 | 首波已接纳但缺少 v2 资金底线",
+            )
+            return
+        occupancy = self._topup_buy_occupancy(now.date())
+        if occupancy is None:
+            return
+        excluded, queued_principal, _ = occupancy
+        account = self.broker.query_account_snapshot()
+        if any(not math.isfinite(value) or value < 0 for value in (
+            account.available_cash, account.frozen_cash,
+        )):
+            raise ValueError("topup account cash is invalid")
+        # 查资金期间排队单可能转普通追单或终态；任何已观察到的变化都下轮重核。
+        if self._topup_buy_occupancy(now.date()) != occupancy:
+            return
+        if queued_principal > account.frozen_cash + 0.01:
+            self._throttled_error(
+                ("topup_frozen", str(now.date())),
+                "【策略】⏳ 补仓等待 | 排队本金与新快照冻结现金不一致",
+            )
             return
         pool = max(0.0, account.available_cash - baseline)
         if pool <= 0:
             return
-        candidates = tuple(
-            code
-            for code in plan.candidates
-            if self._wave1_terminal_or_absent(now, code)
-        )
+        account = replace(account, market_value=account.market_value + queued_principal)
+        candidates = tuple(code for code in plan.candidates if code not in excluded)
         if not candidates:
             return
         # 逐候选行情门控: 不过者仅跳过该候选(记 BLOCKED_DATA), 不再整批返回。
+        # 行情源异常(QMT 断连)同样只跳过该票, 不炸调度周期。
         markets: dict[str, MarketSnapshot] = {}
         for code in candidates:
-            market = self.market_data.latest_strategy_snapshot(code)
+            market = self._strategy_snapshot_safe(code)
+            if market is None:
+                continue
             issue = self._buy_market_issue(market, now)
             if issue is not None:
-                logger.error(
+                self._throttled_error(
+                    ("topup_data", code),
                     "【策略】⛔ 补仓候选本轮跳过 | %s | %s | 下 tick 重试",
                     code, issue,
                 )
@@ -903,8 +1193,18 @@ class LocalStrategyEngine:
             single_position_limit_pct=self._single_position_limit_pct,
         )
         wave_budgets = filter_deployable_topup_budgets(
-            budgets, {code: m.last_price for code, m in markets.items()}
+            budgets,
+            {code: m.last_price for code, m in markets.items()},
+            min_lots=cfg.topup_min_wave_lots,
         )
+        if not wave_budgets:
+            return
+        # 波间冷却: 同一候选距上一波提交不足最小间隔则本轮不发, 下 tick 再评估。
+        wave_budgets = {
+            code: budget
+            for code, budget in wave_budgets.items()
+            if self._topup_interval_elapsed(code, now, cfg)
+        }
         if not wave_budgets:
             return
         cutoff_check = self._clock()
@@ -912,6 +1212,8 @@ class LocalStrategyEngine:
             cutoff_check.date() != now.date()
             or cutoff_check.time() >= schedule.admit_until
         ):
+            return
+        if self._topup_buy_occupancy(now.date()) != occupancy:
             return
         wave_no = self.store.count_signals_like(
             f"{self.config.strategy_id}-{now.date():%Y%m%d}-topup"
@@ -941,6 +1243,7 @@ class LocalStrategyEngine:
         )
         for signal, event in submissions:
             self._submit(signal, event)
+            self._topup_last_submit[signal.code] = now
         # 买单提交即冻结资金: 使账户快照缓存失效, 下一 tick 必须拿到含冻结的
         # 真实可用资金, 防止旧快照把同一笔回款再算一遍(双花)。
         self._account_cache = None
@@ -949,6 +1252,20 @@ class LocalStrategyEngine:
             wave_no, len(submissions), pool,
             ", ".join(f"{b:.2f}" for b in wave_budgets.values()),
         )
+
+    def _topup_interval_elapsed(self, code: str, now: dt.datetime, cfg) -> bool:
+        """补仓波间最小间隔: 自然日翻转清空账本; 间隔<=0 恒放行(旧行为)。"""
+        interval = cfg.topup_min_wave_interval_sec
+        if interval <= 0:
+            return True
+        today = now.date().isoformat()
+        if self._topup_last_submit_day != today:
+            self._topup_last_submit.clear()
+            self._topup_last_submit_day = today
+        last = self._topup_last_submit.get(code)
+        if last is None:
+            return True
+        return (now - last).total_seconds() >= interval
 
     def _record_opening_buy_data_block(
         self,
@@ -1027,7 +1344,11 @@ class LocalStrategyEngine:
         for position in positions:
             if self._event_exists(now.date(), "hard_stop", position.code):
                 continue
-            market = self.market_data.latest_strategy_snapshot(position.code)
+            market = self._strategy_snapshot_safe(position.code)
+            if market is None:
+                # 行情取数异常(QMT 断连): 本 tick 跳过该票, 不炸调度周期,
+                # 下 tick 重试; 硬止损时效门控已放宽(见 decide_hard_stop)。
+                continue
             market = self._snapshot_for_decision(market, now)
             decision = decide_hard_stop(
                 position, market, cfg, self.config.limit_detection,
@@ -1104,7 +1425,9 @@ class LocalStrategyEngine:
                 continue
             if self._event_exists(now.date(), "trailing_exit", position.code):
                 continue
-            market = self.market_data.latest_strategy_snapshot(position.code)
+            market = self._strategy_snapshot_safe(position.code)
+            if market is None:
+                continue
             market = self._snapshot_for_decision(market, now)
             high = self._position_high_for(position, market)
             decision = decide_trailing_exit(
@@ -1123,7 +1446,9 @@ class LocalStrategyEngine:
         for position in positions:
             if self._event_exists(now.date(), rule_name, position.code):
                 continue
-            market = self.market_data.latest_strategy_snapshot(position.code)
+            market = self._strategy_snapshot_safe(position.code)
+            if market is None:
+                continue
             market = self._snapshot_for_decision(market, now)
             if rule_name == "morning_exit":
                 decision = decide_morning_exit(

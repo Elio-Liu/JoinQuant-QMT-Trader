@@ -78,6 +78,18 @@ class CandidatePlanConfig:
 
 
 @dataclass(frozen=True)
+class MinCandidatesGateConfig:
+    """候选数量闸门：当日选股结果(待买入股票数)少于 min_candidates 时不开仓。
+
+    与聚宽侧 g.min_target_count_gate_enabled / g.min_target_count 同规则,
+    作为交易机侧独立保险层存在(两端阈值可不同); 只拦开盘买入, 硬止损/
+    开盘退出/早盘/尾盘等卖出规则照常执行。
+    """
+    enabled: bool
+    min_candidates: int
+
+
+@dataclass(frozen=True)
 class CandidatePlanScheduleConfig:
     """候选计划接收截止时间。"""
     accept_until: dt.time
@@ -136,18 +148,38 @@ class CapitalAllocationConfig:
 
 @dataclass(frozen=True)
 class OpeningBuyConfig:
-    """开盘买入开关、是否等待开盘卖出、回款补仓与资金分配。"""
+    """开盘买入开关、是否等待开盘卖出、回款补仓与资金分配。
+
+    2026-09-09 复盘新增两项(可选键, 代码默认值):
+    - topup_min_wave_interval_sec: 同一候选两波补仓之间的最小间隔(秒),
+      0=每 tick 都允许(旧行为)。回款分批到账时, 旧行为会在 1 秒内连发多波
+      全买在同一个尖峰价位; 间隔让回款分批进场, 当天买入(T+1 不可卖)的
+      票买贵了没有止损可救, 这是第一天唯一的价格保护。
+    - topup_min_wave_lots: 单波补仓的最小手数, 低于该手数的预算留池累积。
+      1=旧行为(够一手即发)。>1 时单票上限接近饱和的小账户不再 100 股碎单
+      见缝插针。
+    """
     enabled: bool
     wait_for_opening_sells: bool
     topup_enabled: bool
     capital_allocation: CapitalAllocationConfig
+    topup_min_wave_interval_sec: float = 5.0
+    topup_min_wave_lots: int = 3
+
+
+@dataclass(frozen=True)
+class SealedExemptConfig:
+    """低开卖出的涨停豁免: 昨日收盘涨停且今日低开幅度≤容忍度时不做低开卖出。"""
+    enabled: bool
+    gap_tolerance_pct: float
 
 
 @dataclass(frozen=True)
 class LowOpenExitConfig:
-    """低开卖出阈值。"""
+    """低开卖出阈值与涨停豁免。"""
     enabled: bool
     threshold_pct: float
+    sealed_exempt: SealedExemptConfig
 
 
 @dataclass(frozen=True)
@@ -241,6 +273,7 @@ class StrategyEngineConfig:
     external_signals: ExternalSignalsConfig
     schedule: StrategyScheduleConfig
     candidate_plan: CandidatePlanConfig
+    min_candidates_gate: MinCandidatesGateConfig
     opening_buy: OpeningBuyConfig
     opening_exit: OpeningExitConfig
     intraday_hard_stop: IntradayHardStopConfig
@@ -309,6 +342,16 @@ def _positive_float(raw: object, field: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{field} 必须是有限且大于0的数字: {raw!r}")
+    return value
+
+
+def _nonnegative_float(raw: object, field: str) -> float:
+    """>=0 的数字(0 合法, 表示关闭对应机制)。"""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{field} 必须是大于等于0的数字: {raw!r}")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{field} 必须是有限且大于等于0的数字: {raw!r}")
     return value
 
 
@@ -508,6 +551,16 @@ def _load_candidate(raw: object) -> CandidatePlanConfig:
     )
 
 
+def _load_min_candidates_gate(raw: object) -> MinCandidatesGateConfig:
+    """strategy_engine.min_candidates_gate: 候选数量闸门 (当日候选不足阈值不开仓)。"""
+    field = "strategy_engine.min_candidates_gate"
+    data = _mapping(raw, field, {"enabled", "min_candidates"})
+    return MinCandidatesGateConfig(
+        enabled=_bool(data["enabled"], f"{field}.enabled"),
+        min_candidates=_positive_int(data["min_candidates"], f"{field}.min_candidates"),
+    )
+
+
 def _load_capital_allocation(raw: object) -> CapitalAllocationConfig:
     field = "strategy_engine.opening_buy.capital_allocation"
     data = _mapping(
@@ -565,7 +618,21 @@ def _load_opening_buy(raw: object) -> OpeningBuyConfig:
     data = _mapping(
         raw,
         field,
-        {"enabled", "wait_for_opening_sells", "topup_enabled", "capital_allocation"},
+        {
+            "enabled",
+            "wait_for_opening_sells",
+            "topup_enabled",
+            "capital_allocation",
+            "topup_min_wave_interval_sec",
+            "topup_min_wave_lots",
+        },
+    )
+    interval = _nonnegative_float(
+        data.get("topup_min_wave_interval_sec", 5.0),
+        f"{field}.topup_min_wave_interval_sec",
+    )
+    lots = _positive_int(
+        data.get("topup_min_wave_lots", 3), f"{field}.topup_min_wave_lots"
     )
     return OpeningBuyConfig(
         enabled=_bool(data["enabled"], f"{field}.enabled"),
@@ -574,6 +641,8 @@ def _load_opening_buy(raw: object) -> OpeningBuyConfig:
         ),
         topup_enabled=_bool(data["topup_enabled"], f"{field}.topup_enabled"),
         capital_allocation=_load_capital_allocation(data["capital_allocation"]),
+        topup_min_wave_interval_sec=interval,
+        topup_min_wave_lots=lots,
     )
 
 
@@ -585,7 +654,14 @@ def _load_opening_exit(raw: object) -> OpeningExitConfig:
         {"enabled", "low_open_exit", "limit_down_exit"},
     )
     low_field = f"{field}.low_open_exit"
-    low = _mapping(data["low_open_exit"], low_field, {"enabled", "threshold_pct"})
+    low = _mapping(
+        data["low_open_exit"], low_field,
+        {"enabled", "threshold_pct", "sealed_exempt"},
+    )
+    exempt_field = f"{low_field}.sealed_exempt"
+    exempt = _mapping(
+        low["sealed_exempt"], exempt_field, {"enabled", "gap_tolerance_pct"}
+    )
     limit_field = f"{field}.limit_down_exit"
     limit_down = _mapping(
         data["limit_down_exit"], limit_field, {"enabled", "require_queue_mode"}
@@ -602,6 +678,16 @@ def _load_opening_exit(raw: object) -> OpeningExitConfig:
         low_open_exit=LowOpenExitConfig(
             enabled=_bool(low["enabled"], f"{low_field}.enabled"),
             threshold_pct=threshold,
+            sealed_exempt=SealedExemptConfig(
+                enabled=_bool(exempt["enabled"], f"{exempt_field}.enabled"),
+                gap_tolerance_pct=_pct(
+                    exempt["gap_tolerance_pct"],
+                    f"{exempt_field}.gap_tolerance_pct",
+                    minimum=0,
+                    maximum=0.05,
+                    include_minimum=False,
+                ),
+            ),
         ),
         limit_down_exit=LimitDownExitConfig(
             enabled=_bool(limit_down["enabled"], f"{limit_field}.enabled"),
@@ -938,6 +1024,7 @@ def load_strategy_config(
             "external_signals",
             "schedule",
             "candidate_plan",
+            "min_candidates_gate",
             "opening_buy",
             "opening_exit",
             "intraday_hard_stop",
@@ -954,6 +1041,7 @@ def load_strategy_config(
         external_signals=_load_external_signals(data["external_signals"]),
         schedule=_load_schedule(data["schedule"]),
         candidate_plan=_load_candidate(data["candidate_plan"]),
+        min_candidates_gate=_load_min_candidates_gate(data["min_candidates_gate"]),
         opening_buy=_load_opening_buy(data["opening_buy"]),
         opening_exit=_load_opening_exit(data["opening_exit"]),
         intraday_hard_stop=_load_hard_stop(data["intraday_hard_stop"]),

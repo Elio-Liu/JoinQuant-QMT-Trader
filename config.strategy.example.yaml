@@ -69,6 +69,14 @@ strategy_engine:
     # 收到计划后是否立即订阅候选行情。
     subscribe_on_receive: true
 
+  # 候选数量闸门 (2026-09 需求): 当日选股结果(待买入股票数) < min_candidates
+  # 时当日不开仓 —— 只拦开盘买入(wave-1/整批/回款补仓), 硬止损/开盘退出/
+  # 早盘/尾盘等卖出规则照常; 与聚宽侧 g.min_target_count_gate_enabled /
+  # g.min_target_count 同规则, 交易机侧作为独立保险层(两端阈值可不同)。
+  min_candidates_gate:
+    enabled: false
+    min_candidates: 3
+
   opening_buy:
     # 是否执行开盘买入规则。开启时 candidate_plan 与 capital_allocation
     # 也必须开启, 否则拒绝启动。
@@ -78,6 +86,14 @@ strategy_engine:
     # 是否启用回款补仓: 窗口内每 tick 检查回款池, 够一手就补一波, 直到
     # admit_until 收口。
     topup_enabled: true
+    # 补仓波次最小间隔(秒): 同一候选两波补仓之间至少间隔该时长, 避免回款
+    # 集中到账时 1 秒内连发多波、全部买在同一个尖峰价位(2026-09-09 复盘:
+    # 当天买入 T+1 不可卖, 买贵了没有止损可救, 这是第一天唯一的价格保护)。
+    # 0=每 tick 都允许补仓(旧行为)。
+    topup_min_wave_interval_sec: 5
+    # 补仓最小波次量(手): 单波预算不足该手数时留池累积, 不发碎单;
+    # 单票上限接近饱和的小账户不再 100 股见缝插针。1=旧行为(够一手即发)。
+    topup_min_wave_lots: 3
     capital_allocation:
       # 是否启用本地资金分配; 开盘买入开启时必须开启。
       enabled: true
@@ -99,8 +115,21 @@ strategy_engine:
       # 是否启用低开退出。
       enabled: true
       # 相对昨收的低开阈值, 取值 (-1, 0]; 开盘收益率低于该值即触发。
-      # 示例 -0.01 = 低开超过 1% 触发; 0.0 = 低于昨收即触发。
-      threshold_pct: -0.01
+      # 0.0 = 低于昨收即触发 (与聚宽侧 check_auction_stop_loss
+      # "低开(非跌停)即清仓" 同规则)。
+      threshold_pct: 0.0
+      # 涨停豁免 (2026-09 复盘): 昨日收盘涨停 且 今日低开幅度≤容忍度 的票
+      # 不做低开卖出, 交10:00早盘规则与盘中硬止损处理 —— 历史55笔竞价砍仓
+      # 全部卖飞(48赚/7亏/0大面); 1% 版回测效果优于 2% 版。与聚宽侧
+      # check_auction_stop_loss 同规则, 两边参数保持同步。
+      sealed_exempt:
+        # 是否启用涨停豁免; false=任何低开触发都直接卖出 (旧行为)。
+        # ✅ 2026-09-07 复盘后重新启用: 与聚宽侧 check_auction_stop_loss
+        # 同规则, 两边参数保持同步; 取数链路已加固(排除当日未收盘K线 +
+        # 本地缺失补下载 + 降级告警)。
+        enabled: true
+        # 豁免的低开幅度上限, 取值 (0, 0.05]; 低开超过该值仍卖出。
+        gap_tolerance_pct: 0.01
     limit_down_exit:
       # 是否启用跌停退出。
       enabled: true

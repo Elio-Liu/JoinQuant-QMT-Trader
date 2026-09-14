@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 from miniqmt_follower.strategy_config import (
     CapitalAllocationConfig,
@@ -29,6 +30,12 @@ from miniqmt_follower.strategy_models import (
     StrategyAction,
     StrategyDecision,
 )
+
+logger = logging.getLogger(__name__)
+
+# 主板 10% 涨停价基准 (涨停豁免的"昨日封板"判定)。本策略候选只在沪深主板
+# (聚宽侧已过滤创业板/科创板/ST), 与聚宽侧 check_auction_stop_loss 同口径。
+_MAIN_BOARD_LIMIT_UP_RATIO = 1.1
 
 
 # ---------------------------------------------------------------------------
@@ -48,14 +55,21 @@ def _market_data_issue(
     require_open_previous: bool = False,
     require_high_limit: bool = False,
     require_low_limit: bool = False,
+    max_age_override: float | None = None,
 ) -> str | None:
-    """校验行情数据有效性，返回问题描述字符串；无问题返回 None。"""
+    """校验行情数据有效性，返回问题描述字符串；无问题返回 None。
+
+    max_age_override: 覆盖 safety.max_tick_age_sec 的时效门控(秒)。
+    保护类规则(硬止损)用它放宽容忍度 —— 行情源系统性滞后几秒时,
+    保命决策宁可用稍旧的价格判断, 也不能被"行情超龄"整体 BLOCK。
+    """
     if market.last_price <= 0:
         return "行情最新价无效"
     if market.quote_time is None:
         return "行情时间缺失"
     age = (now - market.quote_time).total_seconds()
-    if age < -1 or age > safety.max_tick_age_sec:
+    max_age = safety.max_tick_age_sec if max_age_override is None else max_age_override
+    if age < -1 or age > max_age:
         return f"行情已过期或时钟异常: age={age:.3f}s"
     if safety.require_current_trade_date and market.trading_date != now.date():
         return "行情交易日期不是当前日期"
@@ -87,6 +101,24 @@ def _is_limit_down(
     return market.last_price <= market.low_limit * (1 + config.tolerance_pct)
 
 
+def yesterday_sealed_limit_up(
+    previous_close: float | None,
+    prev_prev_close: float | None,
+    tolerance_pct: float,
+) -> bool | None:
+    """昨日收盘是否封板: 昨收 ≥ round(T-2收盘×1.1, 2)×(1-容差)。
+
+    prev_prev_close / previous_close 缺失返回 None(数据不足, 调用方 fail-closed)。
+    封板判定用 T-2 收盘 ×1.1 —— 不能用当日 high_limit(它是今昨收×1.1, 恒 False,
+    2026-09 已踩坑)。涨停豁免决策与盘前预热日志共用本函数, 保持单一公式。
+    """
+    if not prev_prev_close or not previous_close:
+        return None
+    return previous_close >= round(
+        prev_prev_close * _MAIN_BOARD_LIMIT_UP_RATIO, 2
+    ) * (1 - tolerance_pct)
+
+
 # ---------------------------------------------------------------------------
 # 规则判定
 # ---------------------------------------------------------------------------
@@ -101,8 +133,13 @@ def decide_opening_exit(
     *,
     now: dt.datetime,
     limit_down_enabled: bool = True,
+    prev_prev_close: float | None = None,
 ) -> StrategyDecision | None:
-    """开盘卖出判定：跌停排队全清或低开阈值全清，数据问题返回 BLOCK，无动作返回 None。"""
+    """开盘卖出判定：跌停排队全清或低开阈值全清，数据问题返回 BLOCK，无动作返回 None。
+
+    prev_prev_close = 前日收盘 (T-2): 涨停豁免用它判定"昨日(T-1)是否封板"
+    (昨收 ≥ 前日收盘×10%涨停价)。缺失时豁免不生效, 退化为普通低开卖出 (fail-closed)。
+    """
     issue = _market_data_issue(market, safety, now)
     if issue:
         return _blocked(issue)
@@ -124,11 +161,37 @@ def decide_opening_exit(
         return _blocked(issue)
     open_return = market.open_price / market.previous_close - 1
     if open_return < low_open.threshold_pct:
+        if low_open.sealed_exempt.enabled and prev_prev_close:
+            # 涨停豁免 (与聚宽侧同规则, 2026-09 复盘: 昨日涨停+次日微低开
+            # 竞价砍仓55笔全部卖飞, 豁免后净值+3.7%): 昨日收盘封板且低开
+            # 幅度≤容忍度 → 不做低开卖出, 交10:00早盘规则与盘中硬止损。
+            sealed_yesterday = yesterday_sealed_limit_up(
+                market.previous_close, prev_prev_close, limits.tolerance_pct
+            )
+            if (
+                sealed_yesterday
+                and open_return >= -low_open.sealed_exempt.gap_tolerance_pct
+            ):
+                logger.info(
+                    "【策略】🕊️ 竞价豁免｜%s | 昨日涨停且低开%.2f%%≤容忍度%.1f%%"
+                    "｜不竞价止损, 交10:00规则",
+                    market.code,
+                    open_return * 100,
+                    low_open.sealed_exempt.gap_tolerance_pct * 100,
+                )
+                return None
         return StrategyDecision(
             StrategyAction.SELL_ALL,
             f"低开收益率 {open_return:.4%} 低于阈值 {low_open.threshold_pct:.4%}",
         )
     return None
+
+
+# 硬止损对行情超龄的放宽倍数(2026-09-09 复盘): 集泰股份的行情在双机上
+# 稳定滞后 ~3.0s, 恰好卡在 max_tick_age_sec=3 的刀口上, 决策变成掷硬币;
+# 硬止损是保命规则, 时效门控放宽到 5 倍(3s→15s), 宁可按稍旧价格判断,
+# 也不能被系统性滞后 BLOCK 成裸奔。超过放宽线仍照旧 BLOCK。
+_HARD_STOP_STALE_AGE_SLACK = 5.0
 
 
 def decide_hard_stop(
@@ -148,6 +211,7 @@ def decide_hard_stop(
         safety,
         now,
         require_high_limit=limits.require_limit_prices and config.skip_if_limit_up,
+        max_age_override=safety.max_tick_age_sec * _HARD_STOP_STALE_AGE_SLACK,
     )
     if issue:
         return _blocked(issue)
@@ -336,17 +400,16 @@ def calculate_topup_budgets(
     *,
     single_position_limit_pct: float,
 ) -> dict[str, float]:
-    """把回笼卖款在候选间等分补仓：受单票仓位上限与现金预留约束。
+    """补仓池等分，受实时现金、总仓位、单票仓位和现金预留约束。
 
-    与第一波等额预算的区别: 不按可用资金全额分配、不应用总仓位上限 ——
-    补仓池就是卖款回笼的增量, 总市值因卖单已下降, 总上限自然满足;
-    skip_existing_positions 不适用(补仓对象本来就是第一波已买入的持仓)。
-    single_position_limit_pct 语义同 calculate_equal_budgets, 扣除现有持仓
-    市值计算剩余空间。
+    补仓允许已有持仓；单票预算扣除其当前市值，未分配金额继续留池。
     """
     if not config.enabled or pool <= 0 or not candidates:
         return {}
-    available = max(0.0, pool)
+    available = min(max(0.0, pool), max(0.0, account.available_cash))
+    if config.total_position_limit_pct > 0:
+        remaining = account.total_assets * config.total_position_limit_pct - account.market_value
+        available = min(available, max(0.0, remaining))
     if config.cash_reserve_pct > 0:
         available *= 1 - config.cash_reserve_pct
     if available <= 0:
@@ -384,18 +447,21 @@ def filter_deployable_topup_budgets(
     *,
     min_price_margin: float = _TOPUP_WAVE_MIN_PRICE_MARGIN,
     lot_size: int = _TOPUP_WAVE_LOT_SIZE,
+    min_lots: int = 1,
 ) -> dict[str, float]:
-    """过滤出本波至少能买到一手的补仓预算; 其余资金留池累积。
+    """过滤出本波至少能买到 min_lots 手的补仓预算; 其余资金留池累积。
 
     纯函数: 输入预算与最新价, 输出可部署子集。多波次补仓用——波次内不足
-    一手的候选不提交(执行端会把预算向下取整到 0 股白占一波信号), 而是把
-    钱留在池子里等下一 tick 与新增回款合并后再分配。
+    一手(或 min_lots 手)的候选不提交(执行端会把预算向下取整到 0 股白占
+    一波信号), 而是把钱留在池子里等下一 tick 与新增回款合并后再分配。
+    2026-09-09 复盘: min_lots>1 时, 单票上限接近饱和的小账户不再每个
+    tick 买 100 股碎单(见缝插针), 留池安静等待, 直到凑够一个像样的波次。
     """
     deployable: dict[str, float] = {}
     for code, budget in budgets.items():
         price = last_prices.get(code, 0.0)
         if price <= 0:
             continue
-        if budget >= price * lot_size * (1 + min_price_margin):
+        if budget >= price * lot_size * min_lots * (1 + min_price_margin):
             deployable[code] = budget
     return deployable

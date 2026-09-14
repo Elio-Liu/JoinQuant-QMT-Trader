@@ -18,6 +18,7 @@ import hashlib
 import logging
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -46,6 +47,21 @@ logger = logging.getLogger(__name__)
 # 全局 TTL 只兜底"静默挂单没有回调"的成交观察, 放宽到 0.10s 把全量扫描频率
 # 减半, 同时撤单路径靠 _invalidate_order_cache 强制穿透, 不牺牲撤单确认时效。
 _ORDERS_CACHE_TTL = 0.10
+
+# 行情断连告警限流(2026-09-09 复盘): 断连期间每秒都会撞一次取数异常,
+# 30s 只报一条, 其余交给调用方(策略引擎已对单票取数失败做静默跳过)。
+_MARKET_DISCONNECT_WARN_INTERVAL_SEC = 30.0
+
+
+def _looks_like_connection_loss(exc: Exception) -> bool:
+    """判断异常是否是 xtquant 行情服务断连(而非取数结果为空等业务问题)。"""
+    text = str(exc).lower()
+    return (
+        "无法连接" in text
+        or "connection" in text
+        or "connect" in text
+        or "服务" in text and "连接" in text
+    )
 
 _HARD_STOP_REJECTION_KEYWORDS = (
     "停牌",
@@ -267,6 +283,16 @@ class QmtMarketDataAdapter:
         # 涨跌停价和证券中文名都从这里取, 避免同一只票一天重复请求。
         self._instrument_detail_cache: dict[str, dict[str, Any]] = {}
         self._instrument_detail_cache_day: str = ""
+        # 最近两根已完成日线收盘价缓存 (开盘退出"涨停豁免"的昨日封板判定):
+        # 每代码每天只查一次日线, 日期翻转清空。
+        self._daily_close_cache: dict[str, tuple[float | None, float | None]] = {}
+        self._daily_close_cache_day: str = ""
+        # 日线取数的在途后台任务(2026-09-09 复盘): 补下载可能阻塞数百秒
+        # (当日楚天龙 296s), 同步等待会卡死 09:25 决策热路径 —— 改为后台
+        # 线程 + Future, 调用方给 wait_sec 预算, 拿不到立即按无数据处理。
+        self._daily_close_futures: dict[str, Future] = {}
+        self._daily_close_lock = threading.Lock()
+        self._daily_close_slow_warned: set[str] = set()
         # 每票最近一帧行情推送的到达时间(墙钟): tick 自带的 time 是"最后一笔
         # 成交时间", 盘口随挂撤单更新但不刷新它 —— 用到达时间做时效门控才能
         # 反映数据新鲜度。xtquant 回调线程写, 取价线程读, 日期翻转清空。
@@ -307,9 +333,10 @@ class QmtMarketDataAdapter:
     def _freshness_time(
         self, qmt_code: str, tick: dict[str, Any]
     ) -> dt.datetime | None:
-        """行情快照的新鲜度时间: 取 max(最后一笔成交时间, 最近推送到达时间)。
+        """策略快照沿用的新鲜度时间: 取 max(源时间, 最近推送到达时间)。
 
-        无推送记录(订阅失败或尚未收到任何帧)时回退成交时间, 与旧版一致。
+        执行 Quote 不使用该混合时间, 避免用另一帧的到达时间替换源时间。
+        无推送记录时策略快照回退源时间, 与旧版一致。
         """
         tick_time = _quote_datetime(
             tick.get("time") or tick.get("timetag") or tick.get("stime")
@@ -360,7 +387,9 @@ class QmtMarketDataAdapter:
         qmt_code, tick = self._latest_tick(code)
         last_price = float(tick.get("lastPrice") or tick.get("last_price"))
         high_limit, low_limit = self._limit_prices_of(qmt_code)
-        quote_time = self._freshness_time(qmt_code, tick)
+        quote_time = _quote_datetime(
+            tick.get("time") or tick.get("timetag") or tick.get("stime")
+        )
         return Quote(
             last_price=last_price,
             ask1=_first_book_level(tick.get("askPrice")),
@@ -383,10 +412,20 @@ class QmtMarketDataAdapter:
         )
 
     def _latest_tick(self, code: str) -> tuple[str, dict[str, Any]]:
-        """订阅后取单只 tick；无数据时抛错，让调用方走重试/兜底而非静默拿空。"""
+        """订阅后取单只 tick；无数据时抛错，让调用方走重试/兜底而非静默拿空。
+
+        2026-09-09 复盘: QMT/miniQMT 断连时 get_full_tick 会抛"无法连接
+        xtquant 服务"—— 此时清空订阅账本, 恢复后第一次取数自动重新订阅
+        (QMT 重启后进程内订阅关系已失效, 不重订阅就只能永远读到空 tick)。
+        """
         qmt_code = jq_code_to_qmt_code(code)
         self._ensure_subscribed(qmt_code)
-        ticks = self.xtdata.get_full_tick([qmt_code])
+        try:
+            ticks = self.xtdata.get_full_tick([qmt_code])
+        except Exception as exc:
+            if _looks_like_connection_loss(exc):
+                self._reset_subscriptions_on_disconnect(exc)
+            raise
         tick = ticks.get(qmt_code)
         if not tick:
             raise RuntimeError(
@@ -394,9 +433,176 @@ class QmtMarketDataAdapter:
             )
         return qmt_code, tick
 
+    def _reset_subscriptions_on_disconnect(self, exc: Exception) -> None:
+        """行情连接中断: 清空订阅账本, 恢复后自动重订阅; 限流告警。"""
+        now_mono = time.monotonic()
+        last = getattr(self, "_disconnect_warned_mono", 0.0)
+        with self._subscribe_lock:
+            self._subscribed.clear()
+            self._subscribe_retry_after = {}
+        if now_mono - last >= _MARKET_DISCONNECT_WARN_INTERVAL_SEC:
+            self._disconnect_warned_mono = now_mono
+            logger.warning(
+                "【行情】⚠️ QMT行情连接中断, 订阅已重置 | 恢复后自动重订阅 | %s",
+                exc,
+            )
+
     def latest_price(self, code: str) -> float:
         """返回最新成交价（latest_quote 的便捷封装）。"""
         return self.latest_quote(code).last_price
+
+    def previous_two_daily_closes(
+        self, code: str, *, wait_sec: float | None = None
+    ) -> tuple[float | None, float | None]:
+        """最近两根已完成日线的收盘价, 返回 (T-1收盘, T-2收盘)。
+
+        开盘退出规则的"涨停豁免"用它判定昨日是否封板 —— tick 快照没有 T-2 收盘,
+        必须补一次日线查询。按 (代码, 自然日) 缓存, 开盘前每票首查一次;
+        查询失败返回 (None, None), 上层退化为"不豁免" (fail-closed)。
+
+        wait_sec: 本次调用最多等待的秒数; None=一直等到取数完成(预热/测试用)。
+        2026-09-09 复盘: 本地日线缺失时的 download_history_data 可能阻塞数百秒
+        (当日楚天龙 296s, 把 09:25 决策锁卡死、止损晚 5 分钟)。现在取数在后台
+        线程执行, 调用方给 2s 预算 —— 拿不到立即返回 (None, None) 让决策
+        fail-closed 先走, 后台结果落当日缓存, 后续调用直接命中。
+
+        2026-09-07 楚天龙复盘加固:
+        - QMT 本地 1d 库盘中会实时写入当日未收盘 bar (close=最新价), 与聚宽
+          日线"收盘后才落当日 bar"语义不同 —— 必须排除当日 bar, 否则 T-2 错位
+          成 T-1, 封板判定恒 False (豁免永远不生效);
+        - get_market_data_ex 只读本地缓存, 本地没下过日线时补一次
+          download_history_data (近 15 天窗口, 每代码每天至多一次);
+        - 空结果/降级必须打告警 (旧版空结果完全静默, 出了事无从查起)。
+        """
+        qmt_code = jq_code_to_qmt_code(code)
+        today = dt.date.today()
+        with self._daily_close_lock:
+            if today.isoformat() != self._daily_close_cache_day:
+                self._daily_close_cache = {}
+                self._daily_close_futures = {}
+                self._daily_close_slow_warned = set()
+                self._daily_close_cache_day = today.isoformat()
+            cached = self._daily_close_cache.get(qmt_code)
+            if cached is not None:
+                return cached
+            future = self._daily_close_futures.get(qmt_code)
+            if future is None:
+                future = Future()
+                self._daily_close_futures[qmt_code] = future
+                threading.Thread(
+                    target=self._run_daily_close_fetch,
+                    args=(qmt_code, today, future),
+                    name=f"qmt-daily-close-{qmt_code}",
+                    daemon=True,
+                ).start()
+        if wait_sec is None:
+            return future.result()
+        try:
+            return future.result(timeout=max(0.0, wait_sec))
+        except TimeoutError:
+            if qmt_code not in self._daily_close_slow_warned:
+                self._daily_close_slow_warned.add(qmt_code)
+                logger.warning(
+                    "【行情】⏳ %s | 日线收盘取数未在 %.1fs 预算内完成 | "
+                    "本轮按无数据处理(fail-closed), 后台继续补",
+                    format_stock_label(qmt_code),
+                    wait_sec,
+                )
+            return (None, None)
+
+    def _run_daily_close_fetch(
+        self, qmt_code: str, today: dt.date, future: Future
+    ) -> None:
+        """后台线程: 完成取数(含补下载), 结果落当日缓存并 set Future。"""
+        try:
+            result = self._fetch_daily_closes_sync(qmt_code, today)
+        except Exception as exc:  # 防御: 后台线程绝不让异常无声吞掉 Future
+            logger.warning(
+                "【行情】⚠️ %s | 日线收盘后台取数异常 | %s",
+                format_stock_label(qmt_code), exc,
+            )
+            result = (None, None)
+        with self._daily_close_lock:
+            self._daily_close_cache[qmt_code] = result
+            future.set_result(result)
+
+    def _fetch_daily_closes_sync(
+        self, qmt_code: str, today: dt.date
+    ) -> tuple[float | None, float | None]:
+        """同步取数主体(在后台线程执行): 查本地 → 缺则补下载 → 重查。"""
+        label = format_stock_label(qmt_code)
+        result: tuple[float | None, float | None] = (None, None)
+        try:
+            frame = self._query_daily_close_frame(qmt_code, today, count=3)
+            if frame is not None:
+                result = _completed_daily_closes(frame, today)
+            if result[0] is None or result[1] is None:
+                # 本地日线缺失或不足两根完成线: 补下载后重查一次。
+                self._download_daily_history(qmt_code, today)
+                frame = self._query_daily_close_frame(qmt_code, today, count=3)
+                if frame is not None:
+                    result = _completed_daily_closes(frame, today)
+        except Exception as exc:
+            logger.warning(
+                "【行情】⚠️ %s | 日线收盘查询失败(涨停豁免退化为不豁免) | %s",
+                label,
+                exc,
+            )
+        if result[0] is None or result[1] is None:
+            logger.warning(
+                "【行情】⚠️ %s | 日线收盘查询为空 | T-1=%s T-2=%s | "
+                "涨停豁免退化为不豁免 (fail-closed)",
+                label,
+                result[0],
+                result[1],
+            )
+        else:
+            logger.info(
+                "【行情】📅 %s | 日线收盘 | T-1=%.2f T-2=%.2f | 涨停豁免数据就绪",
+                label,
+                result[0],
+                result[1],
+            )
+        return result
+
+    def _query_daily_close_frame(self, qmt_code: str, today: dt.date, count: int):
+        """查 1d 收盘 DataFrame: end_time=昨日, 从源头排除当日未收盘 bar。"""
+        data = self.xtdata.get_market_data_ex(
+            field_list=["close"],
+            stock_list=[qmt_code],
+            period="1d",
+            start_time="",
+            end_time=(today - dt.timedelta(days=1)).strftime("%Y%m%d"),
+            count=count,
+        )
+        frame = (data or {}).get(qmt_code)
+        if frame is None or not len(frame):
+            return None
+        return frame
+
+    def _download_daily_history(self, qmt_code: str, today: dt.date) -> None:
+        """本地日线缺失时补下载近 15 天 (盘前首查每票至多一次, 失败打告警)。"""
+        started = time.perf_counter()
+        try:
+            self.xtdata.download_history_data(
+                qmt_code,
+                period="1d",
+                start_time=(today - dt.timedelta(days=15)).strftime("%Y%m%d"),
+                end_time=today.strftime("%Y%m%d"),
+            )
+            logger.debug(
+                "【行情】⬇️ %s | 日线历史补下载完成 | %.0fms",
+                format_stock_label(qmt_code),
+                (time.perf_counter() - started) * 1000,
+            )
+        except Exception as exc:
+            logger.warning(
+                "【行情】⚠️ %s | 日线历史补下载失败(涨停豁免可能退化为不豁免)"
+                " | %.0fms | %s",
+                format_stock_label(qmt_code),
+                (time.perf_counter() - started) * 1000,
+                exc,
+            )
 
     def instrument_name(self, code: str) -> str | None:
         """返回证券中文名; 合约信息不可得时返回 None, 日志回退为只显示代码。"""
@@ -495,6 +701,45 @@ def _optional_positive_price(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if result > 0 else None
+
+
+def _completed_daily_closes(
+    frame: Any, today: dt.date
+) -> tuple[float | None, float | None]:
+    """从 1d 收盘 DataFrame 抽最近两根"已完成"日线收盘, 返回 (T-1, T-2)。
+
+    QMT 本地 1d 库盘中会实时写入当日未收盘 bar (close=最新价), 与聚宽日线
+    "收盘后才落当日 bar"的语义不同; 这里按 bar 日期排除当日及以后的 bar,
+    避免 T-2 错位成 T-1 导致封板判定恒 False (2026-09-07 楚天龙复盘)。
+    """
+    closes: list[float] = []
+    for i in range(len(frame)):
+        bar_date = _index_date(frame.index[i])
+        if bar_date is not None and bar_date >= today:
+            continue
+        try:
+            closes.append(float(frame.iloc[i, 0]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return (
+        closes[-1] if closes else None,
+        closes[-2] if len(closes) > 1 else None,
+    )
+
+
+def _index_date(index_element: Any) -> dt.date | None:
+    """pandas Timestamp / datetime / date 索引元素 → 其自然日; 识别不出返回 None。"""
+    value = getattr(index_element, "date", None)
+    if value is not None:
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                return None
+        if isinstance(value, dt.date):
+            return value
+        return None
+    return index_element if isinstance(index_element, dt.date) else None
 
 
 def _quote_datetime(raw: Any) -> dt.datetime | None:
@@ -641,6 +886,10 @@ class QmtBrokerAdapter:
         self._owned_order_remarks: dict[str, str] = {}
         self._owned_trade_ids: dict[str, set[str]] = {}
         self._owned_trade_filled_qty: dict[str, int] = {}
+        # 本进程主动发起过撤单的订单号(2026-09-09 复盘): 自有单走到 canceled
+        # 终态但不在本集合 = 被外部撤掉(人工/其他程序), 打告警留痕。
+        self._cancel_requested_ids: set[str] = set()
+        self._external_cancel_warned: set[str] = set()
         # 报单/成交/错误回调账本只对当日订单有意义: 日期翻转时整本清空,
         # 进程连跑数月不会缓慢泄漏内存。
         self._bookkeeping_date: str = dt.date.today().isoformat()
@@ -865,10 +1114,14 @@ class QmtBrokerAdapter:
         qmt_code = jq_code_to_qmt_code(signal.code)
         order_type = self._STOCK_BUY if signal.action == Action.BUY else self._STOCK_SELL
         order_remark = _order_remark_for_signal_id(signal.signal_id)
+        # 报单日志用实际提交数量打标签: signal.amount 可能已被执行端资金/
+        # 持仓复核削量, 沿用信号量会让日志与真实委托数量对不上。
+        submitted_label = f"{signal.display_code} {signal.action.value} {quantity}股"
 
         started = time.monotonic()
         try:
             with self._trading_lock:
+                locked_at = time.monotonic()
                 order_id = self._trader.order_stock(
                     self._account,
                     qmt_code,
@@ -879,16 +1132,17 @@ class QmtBrokerAdapter:
                     self._strategy_name,
                     order_remark,
                 )
+                returned_at = time.monotonic()
         except Exception as exc:
             logger.debug(
                 "⏱️ QMT报单调用失败 | %s | %.1fms | %s",
-                signal.label, (time.monotonic() - started) * 1000, exc,
+                submitted_label, (time.monotonic() - started) * 1000, exc,
             )
             raise BrokerSubmissionUncertain(
                 f"QMT order submission state is uncertain: {exc}"
             ) from exc
 
-        _log_slow_call(f"QMT报单调用耗时 {signal.label}", started)
+        _log_slow_call(f"QMT报单调用耗时 {submitted_label}", started)
 
         if order_id is None or (isinstance(order_id, int) and order_id < 0):
             rejection = self._take_order_error_by_remark(
@@ -917,12 +1171,16 @@ class QmtBrokerAdapter:
             self._owned_order_submitted_mono[oid] = now_mono
 
         logger.debug(
-            "📤 委托已提交 | QMT单号=%s 信号=%s 代码=%s 数量=%s 价格=%.3f",
+            "📤 委托已提交 | QMT单号=%s 信号=%s 代码=%s 数量=%s 价格=%.3f | "
+            "signal_id=%s lock_wait_ms=%.3f sdk_ms=%.3f",
             order_id,
-            signal.label,
+            submitted_label,
             signal.display_code,
             quantity,
             price,
+            signal.signal_id,
+            (locked_at - started) * 1000,
+            (returned_at - locked_at) * 1000,
         )
         return oid
 
@@ -1001,6 +1259,20 @@ class QmtBrokerAdapter:
                     order_id, current.status.value, snapshot.status.value,
                 )
                 return
+            if (
+                snapshot.status == BrokerOrderStatus.CANCELED
+                and order_id not in self._cancel_requested_ids
+                and order_id not in self._external_cancel_warned
+            ):
+                # 2026-09-09 复盘: 金健米业盘前卖单两次被人工在 QMT 客户端撤掉,
+                # 本进程无任何撤单日志, 出了事无从查起 —— 现在自有单被外部
+                # 撤掉时打告警留痕(每单一次)。
+                self._external_cancel_warned.add(order_id)
+                logger.warning(
+                    "【QMT】⚠️ 订单被外部撤单 | QMT单号=%s | 非本服务发起"
+                    " (人工/其他程序/柜台风控?)",
+                    order_id,
+                )
             self._orders_cache[order_id] = snapshot
             self._orders_updated_mono[order_id] = time.monotonic()
         logger.debug(
@@ -1043,10 +1315,19 @@ class QmtBrokerAdapter:
                 self._orders_updated_mono[order_id] = time.monotonic()
         if current is None:
             return
-        logger.debug(
-            "📬 已采信成交回调 | QMT单号=%s | 本次=%s | 累计=%s",
-            order_id, filled_qty, cumulative,
-        )
+        # 2026-09-09 复盘: 成交回调只记股数不记价格, 盘后复盘"买在什么价位"
+        # 只能翻券商对账单 —— 补上成交价(缺失时维持旧格式)。
+        traded_price = getattr(trade, "traded_price", None)
+        if traded_price is None:
+            logger.debug(
+                "📬 已采信成交回调 | QMT单号=%s | 本次=%s | 累计=%s | 成交ID=%s",
+                order_id, filled_qty, cumulative, trade_id,
+            )
+        else:
+            logger.debug(
+                "📬 已采信成交回调 | QMT单号=%s | 本次=%s @%.3f | 累计=%s | 成交ID=%s",
+                order_id, filled_qty, float(traded_price), cumulative, trade_id,
+            )
 
     def _orders_cache_is_stale(self) -> bool:
         with self._orders_cache_lock:
@@ -1225,6 +1506,8 @@ class QmtBrokerAdapter:
         只有"复查后仍非终态、撤单又失败"才是真的不确定，那时才抛。
         """
         started = time.monotonic()
+        with self._orders_cache_lock:
+            self._cancel_requested_ids.add(order_id)
         with self._trading_lock:
             cancel_result: int = self._trader.cancel_order_stock(self._account, int(order_id))
         _log_slow_call(f"QMT撤单调用耗时 QMT单号={order_id} 返回={cancel_result}", started)
@@ -1269,6 +1552,8 @@ class QmtBrokerAdapter:
             self._owned_order_submitted_mono.clear()
             self._owned_trade_ids.clear()
             self._owned_trade_filled_qty.clear()
+            self._cancel_requested_ids.clear()
+            self._external_cancel_warned.clear()
         with self._order_error_lock:
             self._order_errors_by_remark.clear()
             self._order_errors_by_id.clear()

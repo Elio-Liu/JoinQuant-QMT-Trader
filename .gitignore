@@ -45,6 +45,9 @@ tests/
 # 交易机本地手动实盘信号脚本；参数与 signal_id 不进版本库。
 /send_manual_trade_signal.py
 
+# 本地 Redis 连通性诊断脚本；连接参数写在文件内，不进版本库。
+/check_redis_connection.py
+
 # 链路图产物(含私有规则时点, 仅本机)
 docs/diagrams/
 
