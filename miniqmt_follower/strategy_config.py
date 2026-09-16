@@ -246,8 +246,17 @@ class LimitDetectionConfig:
 
 @dataclass(frozen=True)
 class DataSafetyConfig:
-    """行情数据安全校验约束。"""
+    """行情数据安全校验约束。
+
+    时效门控分三档(2026-09-15 elio_hx 复盘): 基准 max_tick_age_sec 对活跃票
+    自然收紧(有成交即推帧); 普通规则按 normal_rule_age_slack 放宽 —— 低成交票
+    自然 tick 节奏约 3s, 基准 3s 恰好卡在刀口上导致决策掷硬币; 封板(涨停/跌停)
+    快照价格钉死在限价、超龄不携带信息, 按 sealed_quote_age_slack 再放宽。
+    硬止损在 strategy_rules 内另有 5 倍专属放宽(保命规则宁用稍旧价砍仓)。
+    """
     max_tick_age_sec: float
+    normal_rule_age_slack: float
+    sealed_quote_age_slack: float
     require_current_trade_date: bool
     require_open_and_previous_close: bool
     invalid_data_action: str
@@ -804,15 +813,28 @@ def _load_data_safety(raw: object) -> DataSafetyConfig:
     data = _mapping(
         raw,
         field,
-        {"max_tick_age_sec", "require_current_trade_date", "require_open_and_previous_close", "invalid_data_action"},
+        {"max_tick_age_sec", "normal_rule_age_slack", "sealed_quote_age_slack", "require_current_trade_date", "require_open_and_previous_close", "invalid_data_action"},
     )
     action = _string(data["invalid_data_action"], f"{field}.invalid_data_action")
     if action != "block_rule":
         raise ValueError(f'{field}.invalid_data_action 只支持 "block_rule"')
+    normal_slack = _positive_float(
+        data["normal_rule_age_slack"], f"{field}.normal_rule_age_slack"
+    )
+    sealed_slack = _positive_float(
+        data["sealed_quote_age_slack"], f"{field}.sealed_quote_age_slack"
+    )
+    if sealed_slack < normal_slack:
+        # 封板豁免必须在普通放宽之上才有意义; 想关闭封板豁免就让它等于普通档。
+        raise ValueError(
+            f"{field}.sealed_quote_age_slack 不得小于 normal_rule_age_slack"
+        )
     return DataSafetyConfig(
         max_tick_age_sec=_positive_float(
             data["max_tick_age_sec"], f"{field}.max_tick_age_sec"
         ),
+        normal_rule_age_slack=normal_slack,
+        sealed_quote_age_slack=sealed_slack,
         require_current_trade_date=_bool(
             data["require_current_trade_date"], f"{field}.require_current_trade_date"
         ),

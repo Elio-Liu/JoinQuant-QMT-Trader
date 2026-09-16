@@ -52,6 +52,9 @@ _ORDERS_CACHE_TTL = 0.10
 # 30s 只报一条, 其余交给调用方(策略引擎已对单票取数失败做静默跳过)。
 _MARKET_DISCONNECT_WARN_INTERVAL_SEC = 30.0
 
+# 合约静态信息缺中文名的告警限流(2026-09-15 elio_hx 复盘): 每代码 30s 一条。
+_EMPTY_NAME_WARN_INTERVAL_SEC = 30.0
+
 
 def _looks_like_connection_loss(exc: Exception) -> bool:
     """判断异常是否是 xtquant 行情服务断连(而非取数结果为空等业务问题)。"""
@@ -283,6 +286,10 @@ class QmtMarketDataAdapter:
         # 涨跌停价和证券中文名都从这里取, 避免同一只票一天重复请求。
         self._instrument_detail_cache: dict[str, dict[str, Any]] = {}
         self._instrument_detail_cache_day: str = ""
+        # 合约信息缺中文名的告警限流账本(2026-09-15 elio_hx 复盘: 603090 订阅/
+        # 登记日志全天裸代码, 排查发现 get_instrument_detail 成功但名字字段为空,
+        # 旧代码静默缓存空名、无可观测性)。
+        self._empty_name_warned: dict[str, float] = {}
         # 最近两根已完成日线收盘价缓存 (开盘退出"涨停豁免"的昨日封板判定):
         # 每代码每天只查一次日线, 日期翻转清空。
         self._daily_close_cache: dict[str, tuple[float | None, float | None]] = {}
@@ -656,6 +663,17 @@ class QmtMarketDataAdapter:
             if not detail:
                 logger.warning("【行情】⚠️ %s | 合约静态信息为空", format_stock_label(qmt_code))
                 return None
+            name = detail.get("InstrumentName") or detail.get("instrument_name")
+            if not name or not str(name).strip():
+                # 名字字段缺失: detail 仍缓存(涨跌停价等字段可用), 但名称查询
+                # 不算成功 —— 限流告警一次, 让"日志裸代码"的原因显式可见。
+                now_mono = time.monotonic()
+                if now_mono - self._empty_name_warned.get(qmt_code, 0.0) >= _EMPTY_NAME_WARN_INTERVAL_SEC:
+                    self._empty_name_warned[qmt_code] = now_mono
+                    logger.warning(
+                        "【行情】⚠️ %s | 合约静态信息缺中文名, 日志将以代码显示",
+                        format_stock_label(qmt_code),
+                    )
             self._instrument_detail_cache[qmt_code] = detail
             return detail
 

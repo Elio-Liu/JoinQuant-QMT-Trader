@@ -49,6 +49,7 @@ from miniqmt_follower.strategy_rules import (
     decide_opening_exit,
     decide_trailing_exit,
     filter_deployable_topup_budgets,
+    price_sealed_at_limit,
     yesterday_sealed_limit_up,
 )
 
@@ -256,6 +257,8 @@ class LocalStrategyEngine:
         # 补仓波间最小间隔的逐票最近提交时刻(按引擎时钟, 自然日翻转清空)。
         self._topup_last_submit: dict[str, dt.datetime] = {}
         self._topup_last_submit_day: str = ""
+        # 回款补仓整体停滞(全候选被行情拦截)的起始时刻, 用于聚合告警时长; 恢复即清。
+        self._topup_stall_since: dt.datetime | None = None
         # 候选数量闸门: 当日已打过闸门拦截日志的自然日(按日只打一次)。
         self._min_candidates_gate_logged_day: str = ""
         # 数据 BLOCK 日志限流账本 (key=(code, issue) → 上次打日志的 monotonic 时刻)。
@@ -567,6 +570,20 @@ class LocalStrategyEngine:
                 stored = self.store.get_signal_optional(event.signal_id)
                 if stored is not None:
                     total_filled += stored.filled_qty
+        # 行情数据 BLOCK 汇总(2026-09-15 elio_hx 复盘): 逐票限流的"行情超龄"日志
+        # 散落在全天内, 日结按规则聚成一行, 行情源问题一眼可见。
+        stale_blocks: dict[str, int] = {}
+        for event in events:
+            if (
+                event.status == StrategyEventStatus.BLOCKED_DATA
+                and event.reason.startswith("行情")
+            ):
+                stale_blocks[event.rule_name] = stale_blocks.get(event.rule_name, 0) + 1
+        if stale_blocks:
+            logger.warning(
+                "【策略】📊 当日行情数据 BLOCK 汇总 | %s",
+                stale_blocks,
+            )
         logger.info(
             "【策略】📊 QMT真实账户日结 | 日期=%s | 计划=%s | 事件=%s | "
             "成交股数=%s | 持仓=%s只 | 市值=%.2f | 可用资金=%.2f",
@@ -1164,20 +1181,27 @@ class LocalStrategyEngine:
             return
         pool = max(0.0, account.available_cash - baseline)
         if pool <= 0:
+            self._topup_stall_since = None
             return
         account = replace(account, market_value=account.market_value + queued_principal)
         candidates = tuple(code for code in plan.candidates if code not in excluded)
         if not candidates:
+            self._topup_stall_since = None
             return
         # 逐候选行情门控: 不过者仅跳过该候选(记 BLOCKED_DATA), 不再整批返回。
         # 行情源异常(QMT 断连)同样只跳过该票, 不炸调度周期。
         markets: dict[str, MarketSnapshot] = {}
+        stale_skips = 0
+        failed_skips = 0
         for code in candidates:
             market = self._strategy_snapshot_safe(code)
             if market is None:
+                failed_skips += 1
                 continue
             issue = self._buy_market_issue(market, now)
             if issue is not None:
+                if issue.startswith("行情超龄"):
+                    stale_skips += 1
                 self._throttled_error(
                     ("topup_data", code),
                     "【策略】⛔ 补仓候选本轮跳过 | %s | %s | 下 tick 重试",
@@ -1187,7 +1211,24 @@ class LocalStrategyEngine:
                 continue
             markets[code] = market
         if not markets:
+            # 聚合告警(2026-09-15 elio_hx 复盘): 逐票限流的细碎 ERROR 淹没不了
+            # "补仓规则整体瘫痪"这一事实 —— 回款池有钱但全候选被行情拦截时,
+            # 单独打一条规则级告警并计时, 恢复(任一候选通过或池子耗尽)即清零。
+            if stale_skips + failed_skips >= len(candidates) and stale_skips > 0:
+                if (
+                    self._topup_stall_since is None
+                    or self._topup_stall_since.date() != now.date()
+                ):
+                    self._topup_stall_since = now
+                self._throttled_warning(
+                    ("topup_stall", str(now.date())),
+                    "【策略】⚠️ 回款补仓整体停滞 | 候选 %d 只全部被行情拦截"
+                    "(超龄 %d/取数失败 %d) | 回款池 %.0f 元暂挂 | 已持续 %.0fs",
+                    len(candidates), stale_skips, failed_skips, pool,
+                    (now - self._topup_stall_since).total_seconds(),
+                )
             return
+        self._topup_stall_since = None
         budgets = calculate_topup_budgets(
             tuple(markets), account, pool, cfg.capital_allocation,
             single_position_limit_pct=self._single_position_limit_pct,
@@ -1327,7 +1368,21 @@ class LocalStrategyEngine:
         if market.quote_time is None or market.trading_date != now.date():
             return "行情日期或时间缺失"
         age = (now - market.quote_time).total_seconds()
-        if age < -1 or age > self.config.data_safety.max_tick_age_sec:
+        # 时效门控分层(2026-09-15 elio_hx 复盘): 普通规则按 normal_rule_age_slack
+        # 放宽(低成交票自然 tick 节奏约 3s, 基准 3s 卡刀口); 封板快照价格钉死在
+        # 限价、超龄无信息量, 再取 sealed 档。与 strategy_rules._market_data_issue
+        # 同口径, 保证买入侧(整批接纳/回款补仓)与卖出侧规则一致。
+        max_age = (
+            self.config.data_safety.max_tick_age_sec
+            * self.config.data_safety.normal_rule_age_slack
+        )
+        if price_sealed_at_limit(market):
+            max_age = max(
+                max_age,
+                self.config.data_safety.max_tick_age_sec
+                * self.config.data_safety.sealed_quote_age_slack,
+            )
+        if age < -1 or age > max_age:
             return f"行情超龄 {age:.3f}s"
         if market.last_price <= 0:
             return "最新价无效"

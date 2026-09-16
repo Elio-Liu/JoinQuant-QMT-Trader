@@ -30,6 +30,7 @@ from miniqmt_follower.strategy_models import (
     StrategyAction,
     StrategyDecision,
 )
+from miniqmt_follower.pricing import tick_size_for
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,35 @@ def _blocked(reason: str) -> StrategyDecision:
     return StrategyDecision(StrategyAction.BLOCK, reason)
 
 
+def price_sealed_at_limit(market: MarketSnapshot) -> bool:
+    """价格是否钉死在涨跌停价且对方盘口为空(封板冻结)。
+
+    涨停封死 = 价格贴在涨停价且卖一为空; 跌停封死 = 价格贴在跌停价且买一为空。
+    封板期间没有成交、价格不会离开限价; 一旦开板, 首笔成交产生新 tick,
+    时效自然恢复 —— 封板快照的"超龄"不携带信息量, 时效门控可放宽
+    (2026-09-15 elio_hx 复盘: 涨停票 tick 节奏 10s+, 3s 门控下决策掷硬币)。
+
+    判定要点:
+    - 对方盘口为空是强信号: 普通清淡票价格不在限价上, 不会命中;
+    - 价格容差取 0.5 tick: 吸收浮点噪声, 同时保证距限价 1 tick 的非封板价不豁免;
+    - 涨跌停价缺失(静态信息查询失败)时返回 False, 门控走常规路径(fail-closed)。
+    """
+    half_tick = tick_size_for(market.code) / 2
+    if (
+        market.high_limit is not None
+        and market.last_price >= market.high_limit - half_tick
+        and market.ask1 is None
+    ):
+        return True
+    if (
+        market.low_limit is not None
+        and market.last_price <= market.low_limit + half_tick
+        and market.bid1 is None
+    ):
+        return True
+    return False
+
+
 def _market_data_issue(
     market: MarketSnapshot,
     safety: DataSafetyConfig,
@@ -59,16 +89,25 @@ def _market_data_issue(
 ) -> str | None:
     """校验行情数据有效性，返回问题描述字符串；无问题返回 None。
 
-    max_age_override: 覆盖 safety.max_tick_age_sec 的时效门控(秒)。
-    保护类规则(硬止损)用它放宽容忍度 —— 行情源系统性滞后几秒时,
-    保命决策宁可用稍旧的价格判断, 也不能被"行情超龄"整体 BLOCK。
+    时效门控分层(2026-09-15 elio_hx 复盘):
+    - 默认(普通规则) = max_tick_age_sec × normal_rule_age_slack —— 低成交票
+      自然 tick 节奏约 3s, 基准 3s 恰好卡刀口, 普通规则给 2 倍余量防掷硬币;
+    - max_age_override: 保护类规则(硬止损)用它放宽容忍度 —— 保命决策宁可用
+      稍旧的价格判断, 也不能被"行情超龄"整体 BLOCK;
+    - 封板快照(price_sealed_at_limit)在两者之上再取 max(sealed 档): 价格钉死
+      在限价, 超龄无信息量, 涨停/跌停票的慢节奏不应让规则空转。
     """
     if market.last_price <= 0:
         return "行情最新价无效"
     if market.quote_time is None:
         return "行情时间缺失"
     age = (now - market.quote_time).total_seconds()
-    max_age = safety.max_tick_age_sec if max_age_override is None else max_age_override
+    if max_age_override is None:
+        max_age = safety.max_tick_age_sec * safety.normal_rule_age_slack
+    else:
+        max_age = max_age_override
+    if price_sealed_at_limit(market):
+        max_age = max(max_age, safety.max_tick_age_sec * safety.sealed_quote_age_slack)
     if age < -1 or age > max_age:
         return f"行情已过期或时钟异常: age={age:.3f}s"
     if safety.require_current_trade_date and market.trading_date != now.date():

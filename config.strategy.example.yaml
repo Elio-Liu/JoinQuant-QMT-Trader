@@ -185,6 +185,16 @@ strategy_engine:
   data_safety:
     # 行情快照最大允许年龄, 单位秒。
     max_tick_age_sec: 3
+    # 普通规则时效放宽倍数(2026-09-15 复盘): 普通规则(开盘/上午/下午
+    # 退出、回落止盈、回款补仓、整批买入接纳)的实际门控 = max_tick_age_sec ×
+    # 本值。低成交票自然 tick 节奏约 3s(交易机探测实测), 基准 3s 恰卡刀口导致
+    # 决策掷硬币 → 2 倍余量; 活跃票有成交即推帧, 门控自然收紧。硬止损在
+    # strategy_rules 另有 5 倍专属放宽, 不受本值影响。
+    normal_rule_age_slack: 2.0
+    # 封板快照时效放宽倍数: 涨停(卖一空)/跌停(买一空)时价格钉死在限价、超龄
+    # 不携带信息量(封板票 tick 节奏 10s+), 门控再放宽到本档; 开板首笔成交即
+    # 恢复严格门控。设为与 normal_rule_age_slack 相等 = 关闭封板额外放宽。
+    sealed_quote_age_slack: 10.0
     # 快照必须属于当前交易日。
     require_current_trade_date: true
     # 开盘价和昨收价必须同时可用。
